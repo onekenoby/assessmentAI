@@ -1,0 +1,5315 @@
+
+"""
+set EMBED_BATCH_SIZE=16
+set DB_FLUSH_SIZE=96
+set VISION_PARALLEL_WORKERS=1
+s1300
+set MAX_KG_CHUNKS_PER_DOC=10
+
+set PG_COMMIT_EVERY_N_PAGES=25
+"""
+
+"""
+Ingestion Engine - v2.4 HYPER-FAST (Virtual Markdown + Asset Parking)
+✅ Strategy: PDF -> Virtual MD + Image Asset Park (RAM)
+✅ Vision: Surgical AI on parked assets only (Gemma 3 12B)
+✅ Value Hunter: Tier-based selective KG + AI Gatekeeper (num_predict: 2)
+✅ Hardware: Optimized for P5000 (16GB VRAM, num_ctx: 3072)
+"""
+
+
+
+import os
+
+import sys
+
+# --- FIX ANTI-BLOCCO ---
+# Impostiamo queste variabili PRIMA di importare altre librerie pesanti.
+# Questo risolve il freeze quando si calcolano gli embeddings mentre Ollama è attivo.
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# valori "safe" (evitano oversubscription e spesso evitano freeze)
+CPU_THREADS = os.environ.get("EMBED_CPU_THREADS", "4")
+os.environ["OMP_NUM_THREADS"] = CPU_THREADS
+os.environ["MKL_NUM_THREADS"] = CPU_THREADS
+os.environ["OPENBLAS_NUM_THREADS"] = CPU_THREADS
+os.environ["NUMEXPR_NUM_THREADS"] = CPU_THREADS
+
+import re
+import json
+import time
+import uuid
+import shutil
+import hashlib
+import base64
+from typing import List, Dict, Tuple, Optional, Any, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent.futures as cf
+import subprocess
+import requests
+from threading import Lock
+import gc
+import queue
+import threading
+
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
+import unicodedata
+import shutil 
+import fitz  # PyMuPDF
+import psycopg2
+from psycopg2.extras import Json, execute_values
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2 import errors as pg_errors
+
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient, models
+from neo4j import GraphDatabase
+from openai import OpenAI
+
+# OLLAMA
+from ollama import chat
+from ollama import ChatResponse
+
+from pdfminer.layout import LAParams
+
+try:
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTTextContainer
+except Exception:
+    extract_pages = None
+    LTTextContainer = None
+
+from sentence_transformers import util
+import torch
+
+
+
+# =========================
+# TIERS / TAXONOMY (DOC ORGANIZATION) - NEW
+# =========================
+
+# File: core/taxonomy.py
+
+TIER_FOLDERS = {
+    # ==========================================
+    # TIER A: NORMATIVE (Verità Nominale)
+    # ==========================================
+    "norm_frameworks_intl":    {"tier": "A", "content_type": "framework",   "source_kind": "global_standard"},
+    "norm_regulations_local":  {"tier": "A", "content_type": "regulation",  "source_kind": "legal_requirement"},
+    "norm_audit_guidelines":   {"tier": "A", "content_type": "guideline",   "source_kind": "best_practice"},
+
+    # ==========================================
+    # TIER B: GOVERNANCE (Attuazione Dichiarata)
+    # ==========================================
+    "gov_infosec_policies":    {"tier": "B", "content_type": "policy",      "source_kind": "internal_governance"},
+    "gov_it_procedures":       {"tier": "B", "content_type": "procedure",   "source_kind": "internal_governance"},
+    "gov_bcdr_plans":          {"tier": "B", "content_type": "bcdr_plan",   "source_kind": "internal_governance"},
+    "gov_hr_policies":         {"tier": "B", "content_type": "hr_policy",   "source_kind": "internal_governance"},
+    "gov_org_charts_roles":    {"tier": "B", "content_type": "org_chart",   "source_kind": "internal_governance"},
+
+    # ==========================================
+    # TIER C: EVIDENCES (Prova di Conformità)
+    # ==========================================
+    # 1. Technical Evidences
+    "tech_evidence_sys_config":     {"tier": "C", "content_type": "sys_config",     "source_kind": "technical_evidence"},
+    "tech_evidence_audit_logs":     {"tier": "C", "content_type": "audit_log",      "source_kind": "technical_evidence"},
+    "tech_evidence_vuln_patching":  {"tier": "C", "content_type": "vuln_report",    "source_kind": "technical_evidence"},
+    "tech_evidence_backup_restore": {"tier": "C", "content_type": "backup_log",     "source_kind": "technical_evidence"},
+    "tech_evidence_net_access":     {"tier": "C", "content_type": "network_config", "source_kind": "technical_evidence"},
+
+    # 2. Organizational Evidences
+    "org_evidence_mgmt_reviews":    {"tier": "C", "content_type": "mgmt_review",    "source_kind": "organizational_evidence"},
+    "org_evidence_training_aware":  {"tier": "C", "content_type": "training_log",   "source_kind": "organizational_evidence"},
+    "org_evidence_incident_rep":    {"tier": "C", "content_type": "incident_ticket","source_kind": "organizational_evidence"},
+    "org_evidence_risk_mgmt":       {"tier": "C", "content_type": "risk_register",  "source_kind": "organizational_evidence"},
+
+    # 3. Legal & Vendor Evidences
+    "legal_evidence_vendor_contracts":{"tier": "C","content_type":"vendor_contract","source_kind": "legal_evidence"},
+    "legal_evidence_data_privacy":    {"tier": "C","content_type":"privacy_record", "source_kind": "legal_evidence"},
+    "legal_evidence_nda_clauses":     {"tier": "C","content_type":"nda_agreement",  "source_kind": "legal_evidence"},
+
+    # 4. Physical Evidences
+    "phys_evidence_env_controls":   {"tier": "C", "content_type": "env_control",    "source_kind": "physical_evidence"},
+    "phys_evidence_access_logs":    {"tier": "C", "content_type": "access_log",     "source_kind": "physical_evidence"},
+}
+
+
+
+
+DEFAULT_TIER_META = {"tier": "B", "content_type": "reference", "source_kind": "internal"}
+
+# Ontology layer (2° livello cartella): esempi -> normative, governance, evidences, risk, legal, technical, generic...
+DEFAULT_ONTOLOGY = "generic"
+
+# opzionale: topic keyword -> topics (solo best-effort su filename; puoi estendere più avanti)
+
+# File: core/taxonomy.py
+
+TOPIC_PATTERNS = {
+    "Governance_Policies": [
+        "policy", "procedura", "standard", "guideline", "linea guida", 
+        "regolamento", "direttiva", "manuale", "organigramma", "ruoli e responsabilità",
+        "segregation of duties", "sod"
+    ],
+    
+    "Risk_Management": [
+        "rischio", "risk", "minaccia", "threat", "vulnerabilità", "vulnerability", 
+        "mitigazione", "risk assessment", "trattamento del rischio", "risk register", 
+        "matrice dei rischi"
+    ],
+    
+    "Compliance_Audit": [
+        "iso 27001", "iso 27002", "gdpr", "nis2", "dora", "nist", 
+        "audit", "assessment", "conformità", "compliance", "non-conformità", 
+        "certificazione", "ispezione", "evidenza"
+    ],
+    
+    "Business_Continuity_DR": [
+        "business continuity", "disaster recovery", "bcp", "drp", "backup", 
+        "ripristino", "restore", "rto", "rpo", "resilienza", "copia di sicurezza",
+        "continuità operativa"
+    ],
+    
+    "Incident_Management": [
+        "incidente", "incident", "data breach", "violazione", "anomalia", 
+        "segnalazione", "incident response", "triage", "compromissione"
+    ],
+    
+    "Access_Identity_Control": [
+        "accesso", "access control", "autenticazione", "mfa", "password", 
+        "identità", "iam", "credenziali", "privilegi", "active directory", 
+        "logon", "sso"
+    ],
+    
+    "Technical_Network_Security": [
+        "firewall", "crittografia", "encryption", "siem", "log", "monitoraggio", 
+        "patch", "endpoint", "antivirus", "malware", "rete", "vlan", "vpn", 
+        "vulnerability scan", "penetration test", "pt"
+    ],
+    
+    "HR_Awareness_Security": [
+        "formazione", "training", "awareness", "consapevolezza", "assunzione", 
+        "onboarding", "offboarding", "nda", "codice etico", "dipendente", 
+        "phishing", "risorse umane"
+    ],
+    
+    "Vendor_SupplyChain_Security": [
+        "fornitore", "vendor", "supply chain", "terze parti", "sla", "provider","supply chain security","third-party risk",
+        "contratto", "outsourcing", "subfornitore", "cloud provider", "dpa", "data processing agreement","soc 2", "audit fornitore"
+    ],
+    
+    "Physical_Environmental_Security": [
+        "sicurezza fisica", "controlli ambientali", "badge", "videosorveglianza", 
+        "cctv", "sala server", "datacenter", "estintori", "ups", "condizionamento"
+    ]
+}
+
+def infer_topics_regex(text: str, max_topics: int = 6) -> list[str]:
+    """
+    Tag 'regex-safe': conta i match per topic e ritorna i top N.
+    - Usa IGNORECASE
+    - Evita falsi positivi (word boundary)
+    """
+    if not text:
+        return []
+
+    # Normalizzazione leggera (non distruttiva)
+    t = text
+
+    scores = {}
+    for topic, patterns in TOPIC_PATTERNS.items():
+        topic_score = 0
+        for pat in patterns:
+            try:
+                topic_score += len(re.findall(pat, t, flags=re.IGNORECASE))
+            except re.error:
+                # pattern sbagliato non deve rompere ingestion
+                continue
+        if topic_score > 0:
+            scores[topic] = topic_score
+
+    if not scores:
+        return []
+
+    # Ordina per score decrescente
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [k for k, _ in ranked[:max_topics]]
+
+
+def _safe_read_json(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+def read_sidecar_meta(file_path: str) -> dict:
+    """
+    Supporta: <file>.meta.json affiancato (override puntuale, consigliato per casi speciali).
+    """
+    sidecar = file_path + ".meta.json"
+    if os.path.exists(sidecar):
+        return _safe_read_json(sidecar)
+    return {}
+
+def dispatch_document(file_path: str, root_dir: str) -> dict:
+    """
+    Classifica il documento in modo coerente con l'alberatura Assessment:
+
+    INBOX/
+      TIER_A_NORMATIVE/<categoria>/file
+      TIER_B_GOVERNANCE/<categoria>/file
+      TIER_C_EVIDENCES/<macro_area>/<categoria>/file
+
+    Regola importante:
+    - parts[0] identifica il macro-tier fisico.
+    - l'ultima cartella riconosciuta in TIER_FOLDERS identifica content_type/source_kind.
+    - il macro-tier fisico prevale sul default, così i documenti normativi non ricadono
+      accidentalmente nel DEFAULT_TIER_META (Tier B).
+    """
+    rel = os.path.relpath(root_dir, INBOX_DIR).replace("\\", "/")
+    parts = [p for p in rel.split("/") if p and p != "."]
+
+    macro_tier_folder = parts[0].upper() if parts else ""
+
+    # Cerca la cartella più specifica censita in TIER_FOLDERS.
+    # Esempi:
+    # - TIER_A_NORMATIVE/norm_frameworks_intl -> norm_frameworks_intl
+    # - TIER_C_EVIDENCES/1_technical_evidences/tech_evidence_sys_config -> tech_evidence_sys_config
+    category_key = ""
+    for p in reversed(parts):
+        p_norm = p.strip()
+        if p_norm in TIER_FOLDERS:
+            category_key = p_norm
+            break
+
+    base = dict(TIER_FOLDERS.get(category_key, DEFAULT_TIER_META))
+
+    # Macro-tier fisico: fonte primaria per la gerarchia del RAG.
+    if macro_tier_folder == "TIER_A_NORMATIVE":
+        base["tier"] = "A"
+    elif macro_tier_folder == "TIER_B_GOVERNANCE":
+        base["tier"] = "B"
+    elif macro_tier_folder == "TIER_C_EVIDENCES":
+        base["tier"] = "C"
+
+    # Ontology coerente con assessment.
+    # Per Tier C manteniamo la macro-area evidenziale (technical / organizational / legal / physical).
+    # Per Tier A/B, se non c'è un vero secondo livello ontologico, usiamo il content_type.
+    if macro_tier_folder == "TIER_C_EVIDENCES" and len(parts) >= 2:
+        ontology = parts[1].lower()
+    elif len(parts) >= 3:
+        ontology = parts[1].lower()
+    else:
+        ontology = str(base.get("content_type") or DEFAULT_ONTOLOGY).lower()
+
+    base["ontology"] = ontology
+
+    # Topics: usa filename + cartelle per migliorare il tagging su assessment.
+    fname = os.path.basename(file_path)
+    topic_seed = " ".join([fname] + parts)
+    base["topics"] = infer_topics_regex(topic_seed)[:6]
+
+    # Le evidenze hanno una data effettiva utile per audit/assessment.
+    if base.get("tier") == "C" and not base.get("effective_date"):
+        base["effective_date"] = time.strftime("%Y-%m-%d")
+
+    # Sidecar meta JSON: override finale e puntuale.
+    side = read_sidecar_meta(file_path)
+    if isinstance(side, dict) and side:
+        base.update(side)
+
+    return base
+
+def ensure_inbox_structure(inbox_dir: str):
+    """
+    Crea automaticamente l'alberatura fisica per l'Assessment (Cybersecurity & Compliance).
+    """
+    structure = {
+        "TIER_A_NORMATIVE": [
+            "norm_frameworks_intl",
+            "norm_regulations_local",
+            "norm_audit_guidelines"
+        ],
+        "TIER_B_GOVERNANCE": [
+            "gov_infosec_policies",
+            "gov_it_procedures",
+            "gov_bcdr_plans",
+            "gov_hr_policies",
+            "gov_org_charts_roles"
+        ],
+        "TIER_C_EVIDENCES": [
+            "1_technical_evidences/tech_evidence_sys_config",
+            "1_technical_evidences/tech_evidence_audit_logs",
+            "1_technical_evidences/tech_evidence_vuln_patching",
+            "1_technical_evidences/tech_evidence_backup_restore",
+            "1_technical_evidences/tech_evidence_net_access",
+            "2_organizational_evidences/org_evidence_mgmt_reviews",
+            "2_organizational_evidences/org_evidence_training_aware",
+            "2_organizational_evidences/org_evidence_incident_rep",
+            "2_organizational_evidences/org_evidence_risk_mgmt",
+            "3_legal_vendor_evidences/legal_evidence_vendor_contracts",
+            "3_legal_vendor_evidences/legal_evidence_data_privacy",
+            "3_legal_vendor_evidences/legal_evidence_nda_clauses",
+            "4_physical_security_evidences/phys_evidence_env_controls",
+            "4_physical_security_evidences/phys_evidence_access_logs"
+        ]
+    }
+
+    for tier_folder, subfolders in structure.items():
+        for sub in subfolders:
+            # os.path.join gestisce automaticamente i path annidati (es. 1_technical_evidences/...)
+            tier_path = os.path.join(inbox_dir, tier_folder, sub)
+            os.makedirs(tier_path, exist_ok=True)
+
+# =========================# =========================# =========================# 
+
+# -------------------------
+# KG LIMITS (coherent names)
+# -------------------------
+# These are the ONLY canonical names used by the pipeline.
+# A few aliases are kept for backward-compat with older snippets.
+MIN_ENTITY_DENSITY = int(os.getenv("MIN_ENTITY_DENSITY", "1"))
+MIN_FIN_KEYWORDS = int(os.getenv("MIN_FIN_KEYWORDS", "1"))
+
+KG_TEXT_MAX_CHARS = int(os.getenv("KG_TEXT_MAX_CHARS", "2600"))   # chars sent to KG model per page
+KG_MAX_TRIPLES = int(os.getenv("KG_MAX_TRIPLES", "50"))           # 10 soft cap (sanitize already caps)
+KG_TIMEOUT = int(os.getenv("KG_TIMEOUT", "180"))                   # seconds per KG task/page
+
+# Backward-compat aliases (do NOT use in new code)
+KG_CHARS_LIMIT = KG_TEXT_MAX_CHARS
+KG_MAX_CHARS = KG_TEXT_MAX_CHARS
+KG_MAX_TRIPLES_PER_PAGE = KG_MAX_TRIPLES
+MAX_TRIPLES_KG = KG_MAX_TRIPLES
+KG_TASK_TIMEOUT = KG_TIMEOUT
+KG_TASK_TIMEOUT_PER_PAGE = KG_TIMEOUT
+KG_TIMEOUT_PER_PAGE = KG_TIMEOUT
+
+
+
+
+
+BASE_DATA_DIR = os.getenv("BASE_DIR", "./data/assessment")
+INBOX_DIR = os.path.join(BASE_DATA_DIR, "INBOX")
+PROCESSED_DIR = os.getenv("PROCESSED_DIR", "./data/assessment/processed")
+FAILED_DIR = os.getenv("FAILED_DIR", "./data/assessment/failed")
+
+CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "800"))
+CHUNK_OVERLAP_CHARS = int(os.getenv("CHUNK_OVERLAP_CHARS", "200"))
+MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "40"))
+
+CONTEXT_WINDOW_CHARS = int(os.getenv("CONTEXT_WINDOW_CHARS", "260"))
+INCLUDE_CONTEXT_IN_KG = os.getenv("INCLUDE_CONTEXT_IN_KG", "1") == "1"
+
+DB_FLUSH_SIZE = int(os.getenv("DB_FLUSH_SIZE", "200"))          # un po' più alto per meno flush - 
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16"))    # se la tua VRAM regge, aumenta velocità
+
+# Vision switches
+PDF_VISION_ENABLED = os.getenv("PDF_VISION_ENABLED", "1") == "1"
+PDF_VISION_ONLY_IF_TEXT_SCARSO = False #= os.getenv("PDF_VISION_ONLY_IF_TEXT_SCARSO", "0") == "1"
+PDF_MIN_TEXT_LEN_FOR_NO_VISION = 0 #= int(os.getenv("PDF_MIN_TEXT_LEN_FOR_NO_VISION", "450"))
+
+VISION_DPI = int(os.getenv("VISION_DPI", "130"))
+VISION_MAX_IMAGE_BYTES = int(os.getenv("VISION_MAX_IMAGE_BYTES", "2000000"))
+
+VISION_MAX_FORMULAS_PER_PAGE = int(os.getenv("VISION_MAX_FORMULAS_PER_PAGE", "10"))
+
+# --- SOGLIE ASSET VISUALI ---
+# Immagini più piccole di questo valore (in byte) verranno ignorate.
+# 7000 = icone/loghi | 2000 = molto permissivo | 15000 = molto sever
+PDF_EXTRACT_EMBEDDED_IMAGES = True #= os.getenv("PDF_EXTRACT_EMBEDDED_IMAGES", "1") == "1"
+PDF_VISION_ON_EMBEDDED_IMAGES = True # = os.getenv("PDF_VISION_ON_EMBEDDED_IMAGES", "1") == "1"
+PDF_MAX_IMAGES_PER_PAGE = int(os.getenv("PDF_MAX_IMAGES_PER_PAGE", "8"))
+MIN_IMAGE_BYTES = int(os.getenv("MIN_IMAGE_BYTES", "1"))
+MIN_ASSET_SIZE = int(os.getenv("MIN_ASSET_SIZE", "2000"))
+
+
+# Speed: Vision parallel + cache
+VISION_PARALLEL_WORKERS = 1 #int(os.getenv("VISION_PARALLEL_WORKERS", "4"))  # 4-6 di solito ok
+OLLAMA_NUM_PARALLEL=1
+VISION_CACHE_MAX = int(os.getenv("VISION_CACHE_MAX", "5000"))             # entries in-memory
+
+# Commit policy
+PG_COMMIT_EVERY_N_PAGES = int(os.getenv("PG_COMMIT_EVERY_N_PAGES", "25"))
+
+# KG extraction (solo dove serve)
+KG_ENABLED = os.getenv("KG_ENABLED", "1") == "1"
+KG_MIN_LEN = int(os.getenv("KG_MIN_LEN", "300")) #
+MAX_KG_CHUNKS_PER_DOC = int(os.getenv("MAX_KG_CHUNKS_PER_DOC", "50")) #30
+
+
+
+PDF_TEXT_EXTRACTOR = "fitz"
+#PDF_TEXT_EXTRACTOR = os.getenv("PDF_TEXT_EXTRACTOR", "pdfminer").lower()
+#PDF_TEXT_EXTRACTOR = os.getenv("PDF_TEXT_EXTRACTOR", "fitz").lower() #<--- OPZIONALE PIù VELOCE
+#PDF_TEXT_EXTRACTOR = os.getenv("PDF_TEXT_EXTRACTOR", "fitz").lower()  # fitz | pdfminer
+
+# --- Nella sezione A. GESTIONE FORMULE ---
+FULLPAGE_DPI = 110 
+CROP_DPI = 160 
+KG_WORKERS = 1  # Forza l'elaborazione seriale per non saturare la VRAM
+kg_executor = ThreadPoolExecutor(max_workers=KG_WORKERS)
+
+CID_RE = re.compile(r"\(cid:\d+\)")
+
+REL_CANON_CACHE_PATH = os.getenv("REL_CANON_CACHE_PATH", "relation_canon_cache.json")
+REL_CANON_MAX_TOKENS = int(os.getenv("REL_CANON_MAX_TOKENS", "700"))
+
+RELTYPE_OK = re.compile(r"^[A-Z][A-Z_]{2,60}$")
+
+
+KG_KEYWORDS = [
+    "policy", "procedura", "procedure", "guideline", "standard", "normativa", "framework",
+    "rischio", "risk", "vulnerabilità", "minaccia", "threat", "mitigazione",
+    "incidente", "incident", "breach", "data breach", "violazione",
+    "accesso", "access", "autenticazione", "mfa", "password", "crittografia", "encryption",
+    "backup", "restore", "ripristino", "disaster recovery", "business continuity",
+    "audit", "assessment", "conformità", "compliance", "non-conformità",
+    "asset", "server", "network", "firewall", "log", "monitoraggio",
+    "formazione", "training", "awareness", "dipendente", "fornitore", "vendor"
+]
+
+
+# =========================================================
+# SEMANTIC GATEKEEPER CONFIG - ASSESSMENT / CYBERSECURITY EDITION
+# =========================================================
+# Centroidi semantici per catturare lo spettro assessment, compliance e cybersecurity
+GATEKEEPER_CONCEPTS = [
+    "Information security, ISO 27001, cybersecurity, data protection, confidentiality, integrity, availability, risk assessment, risk treatment, asset management, access control",
+    "Compliance, GDPR, NIS2, DORA, regulatory requirements, legal obligations, data privacy, personal data, data breaches, incident response, reporting obligations",
+    "IT Governance, policies, procedures, standards, guidelines, organizational structure, roles and responsibilities, segregation of duties, management review",
+    "Business Continuity, Disaster Recovery, BCP, DRP, backup strategies, RTO, RPO, resilience, crisis management, redundancy",
+    "Technical controls, firewalls, encryption, cryptography, MFA, multi-factor authentication, vulnerability management, patch management, SIEM, logging, monitoring",
+    "Physical security, environmental controls, access badges, CCTV, secure areas, clear desk policy, clean screen policy",
+    "Human resources security, awareness training, onboarding, offboarding, phishing simulations, NDA, non-disclosure agreements, background checks",
+    "Vendor management, third-party risk, SLA, supply chain security, cloud security, SOC 2, audits, continuous monitoring"
+]
+# Cache per gli embedding delle ancore (calcolati una volta sola all'avvio)
+_GK_ANCHOR_EMBEDDINGS = None
+
+
+
+###################
+# --- NUOVO: Filtro Pagine Strutturali (Junk Filter) ---
+STRUCTURAL_PAT = re.compile(
+    r"\b(Contents|Index|Bibliography|Acknowledgements|Glossary|Appendix|Reference|Table of Contents|"
+    r"Indice|Sommario|Bibliografia|Ringraziamenti|Appendice|Riferimenti)\b",
+    re.IGNORECASE
+)
+
+def is_structural_page(text: str, p_no: int = 1) -> bool:
+    """Rileva se la pagina è junk (indice/sommario), ma risparmia la Pagina 1."""
+    if not text: return False
+    # La Pagina 1 non è MAI considerata puramente strutturale (contiene il titolo/intro)
+    if p_no == 1: return False
+    return bool(STRUCTURAL_PAT.search(text[:400]))
+
+def get_entity_density(text: str) -> int:
+    """
+    Heuristica semplice: conta "candidate entità" (Title Case) che non risultano
+    essere parole comuni (lowercase) presenti nello stesso testo.
+
+    Serve solo come gating, quindi deve essere:
+    - veloce
+    - deterministica
+    - stabile
+    """
+    if not text or len(text) < 20:
+        return 0
+
+    clean_text = re.sub(r'# PAGE \d+', '', text)
+
+    # Parole in Title Case (min 3 char)
+    potential_entities = re.findall(r'\b[A-ZÀ-Ú][a-zà-ú]{2,}\b', clean_text)
+
+    # Vocabolario "comune" in lowercase (min 3 char)
+    common_vocab = set(re.findall(r'\b[a-zà-ú]{3,}\b', clean_text))
+
+    true_entities = {w for w in set(potential_entities) if w.lower() not in common_vocab}
+    return len(true_entities)
+
+
+def count_unique_keywords(text: str) -> int:
+    """Conta quanti concetti assessment/compliance diversi sono presenti nel chunk."""
+    found = set(_KG_PAT.findall(text))
+    return len(found)
+
+# ---- FAST KG GATEKEEPER (NO LLM) ----
+_KG_GK_CACHE = {}
+_KG_GK_CACHE_MAX = 50000
+_PROPER_NOUN_FAST = re.compile(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})*\b")
+
+
+# def con pytorch
+def ai_gatekeeper_decision(text: str) -> bool:
+    """
+    Gatekeeper Semantico (V2):
+    Invece di contare keyword, calcola quanto il testo è vicino ai concetti assessment/compliance/cybersecurity.
+    """
+    if not text or len(text) < KG_MIN_LEN: # Filtro lunghezza minima (es. 250-300 char)
+        return False
+
+    global _GK_ANCHOR_EMBEDDINGS
+    embedder = get_embedder() # Recupera il modello bge-m3 già caricato
+
+    # 1. Inizializzazione Lazy delle ancore (fatta solo alla prima chiamata)
+    if _GK_ANCHOR_EMBEDDINGS is None:
+        # print("   🧠 Inizializzazione Semantic Gatekeeper...")
+        _GK_ANCHOR_EMBEDDINGS = embedder.encode(GATEKEEPER_CONCEPTS, convert_to_tensor=True)
+
+    # 2. Embedding del Chunk corrente
+    # Nota: bge-m3 è molto veloce, su CPU impiega pochi millisecondi per 1000 char
+    chunk_embedding = embedder.encode(text, convert_to_tensor=True)
+
+    # 3. Calcolo Similarità (Coseno)
+    # Confronta il chunk con TUTTI i concetti e prende il punteggio massimo
+    scores = util.cos_sim(chunk_embedding, _GK_ANCHOR_EMBEDDINGS)
+    max_score = float(torch.max(scores))
+
+    # 4. Soglia di Decisione
+    # 0.35 è solitamente una buona soglia per "vagamente correlato".
+    # 0.50 è "molto correlato".
+    # Se il testo parla di "cucinare la pasta", lo score sarà < 0.20.
+    THRESHOLD = 0.20 
+
+    # Debug (opzionale: scommenta per calibrare la soglia)
+    if max_score > 0.3:
+       print(f"   [GK] Score: {max_score:.3f} | Text: {text[:50]}...")
+
+    return max_score >= THRESHOLD
+
+
+def ai_gatekeeper_decision_from_vec(vec, threshold: float = 0.38) -> bool:
+    """
+    Gatekeeper Semantico (V2) ma usando un embedding già calcolato (NO re-encode).
+    vec: np.ndarray | list[float] | torch.Tensor
+    """
+    global _GK_ANCHOR_EMBEDDINGS
+
+    if vec is None:
+        return False
+
+    embedder = get_embedder()
+
+    # Lazy init ancore (una sola volta)
+    if _GK_ANCHOR_EMBEDDINGS is None:
+        _GK_ANCHOR_EMBEDDINGS = embedder.encode(GATEKEEPER_CONCEPTS, convert_to_tensor=True)
+
+    # vec -> torch tensor (1, dim)
+    if not isinstance(vec, torch.Tensor):
+        vec_t = torch.tensor(vec, dtype=torch.float32)
+    else:
+        vec_t = vec.float()
+
+    if vec_t.dim() == 1:
+        vec_t = vec_t.unsqueeze(0)
+
+    scores = util.cos_sim(vec_t, _GK_ANCHOR_EMBEDDINGS)
+    max_score = float(torch.max(scores))
+
+    if max_score > 0.3:
+        print(f"   [GK] Score(vec): {max_score:.3f}")
+
+    return max_score >= threshold
+
+
+
+#---------------------
+
+# Compilazione Regex per KG_KEYWORDS (massima efficienza)
+# Il prefisso \b assicura il match di parole intere (es. "rate" non matcha "pirate")
+_KG_PAT = re.compile(r'\b(' + '|'.join(KG_KEYWORDS) + r')\b', re.IGNORECASE)
+
+
+
+
+# Qdrant
+QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6334"))
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "assessment_docs")
+
+# Postgres
+PG_HOST = os.getenv("PG_HOST", "127.0.0.1")
+PG_PORT = int(os.getenv("PG_PORT", "5433"))
+PG_DB = os.getenv("PG_DB", "assessment_ingestion")
+
+PG_USER = os.getenv("PG_USER", "admin")
+PG_PASS = os.getenv("PG_PASS", "admin_password")
+PG_MIN_CONN = int(os.getenv("PG_MIN_CONN", "1"))
+PG_MAX_CONN = int(os.getenv("PG_MAX_CONN", "8"))
+
+# Neo4j
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7688")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASS = os.getenv("NEO4J_PASS", "admin_password")
+NEO4J_ENABLED = os.getenv("NEO4J_ENABLED", "1") == "1"
+
+# LM Studio / OpenAI-compatible
+#LM_BASE_URL = os.getenv("LM_BASE_URL", "http://127.0.0.1:1234/v1")
+#LM_API_KEY = os.getenv("LM_API_KEY", "lm-studio")
+
+
+#qwen3-8b-gguf:latest
+#LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen3-vl-8b-instruct")
+
+# LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemma2:9b") 
+# LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen2.5:7b") 
+# LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen2.5:14b") 
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama3.1:8b") 
+
+#VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "llama3.1:8b")
+VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "ministral-3:8b")
+#VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "qwen3.5:9b")
+
+
+
+# Embeddings
+#EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
+EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
+
+QDRANT_TEXT_MAX_CHARS = int(os.getenv("QDRANT_TEXT_MAX_CHARS", "2500"))
+
+# LLM reliability
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1300"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+LLM_RETRIES = int(os.getenv("LLM_RETRIES", "2"))
+
+
+# =========================
+# CLIENTS INIT (LAZY)
+# =========================
+openai_client = None
+embedder = None
+qdrant_client = None
+
+def get_embedder():
+    global embedder
+    if embedder is None:
+        # device="cpu" evita conflitti di memoria con Ollama
+        embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
+    return embedder
+
+def get_qdrant_client():
+    global qdrant_client
+    if qdrant_client is None:
+        qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    return qdrant_client
+
+neo4j_driver = None
+if NEO4J_ENABLED:
+    try:
+        neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+    except Exception as e:
+        print(f"⚠️ Neo4j disabled (driver init failed): {e}")
+        NEO4J_ENABLED = False
+
+pg_pool = ThreadedConnectionPool(
+    PG_MIN_CONN, PG_MAX_CONN,
+    host=PG_HOST, port=PG_PORT, dbname=PG_DB,
+    user=PG_USER, password=PG_PASS
+)
+
+# ==============================================================================
+# PROMPT VISIONE UNIVERSALE (Vision Supremacy)
+# ==============================================================================
+FORMULA_VISION_PROMPT = """
+You are a Scientific OCR Engine.
+Your task is to transcribe mathematical content from the image into structured JSON with LaTeX.
+
+### INPUT SOURCE HANDLING:
+- **Text Layer**: If you see garbled text, reconstruction it into valid math.
+- **Vector/Image**: Transcribe graphical formulas exactly as they appear.
+
+### RULES:
+1. **LATEX MANDATORY**: Use standard LaTeX for all math (e.g., `\\frac{a}{b}`, `\\int`, `\\sum`, `\\sigma`).
+2. **FIDELITY**: Transcribe EXACTLY symbols found in the image. Do not hallucinate formulas not present.
+3. **NO ASCII MATH**: Do not use "x^2". Use "$x^2$".
+
+### OUTPUT FORMAT (JSON ONLY):
+{
+  "summary_it": "Breve descrizione del contenuto matematico (es. 'Equazione differenziale', 'Modello statistico').",
+  "formulas": [
+    {
+      "description_it": "Nome o etichetta visibile (es. 'Eq. 1.2' o 'Definizione')",
+      "latex": " ... write here the LaTeX code inside dollars, e.g. $a + b = c$ ... ", 
+      "variables": [
+        {"name": "symbol", "meaning": "variable meaning (if context allows) or 'unknown'"}
+      ]
+    }
+  ]
+}
+"""
+
+CHART_VISION_PROMPT = """
+You are a SENIOR COMPLIANCE & CYBERSECURITY AUDITOR AI.
+Your goal: Extract precise data and strategic insights from charts, tables, screenshots, risk matrices, control matrices, diagrams, dashboards, and evidence artifacts in audit reports and security assessments.
+
+CONTEXT: The user is performing an assessment and needs evidence about risks, controls, compliance status, incidents, vulnerabilities, assets, owners, dates, remediation status, and security KPIs.
+
+ABSOLUTE PROHIBITIONS:
+- Do NOT invent numbers. If a value is not explicitly labeled or readable, write "NOT READABLE".
+- Do NOT infer compliance status unless it is visible or explicitly stated.
+- Do NOT ignore negative signs, percentages, dates, severity labels, SLA labels, or open/closed status.
+- Do NOT use terminology from unrelated domains unless it is explicitly present in the document.
+
+Return ONLY valid JSON (no markdown), EXACT schema:
+
+{
+  "kind": "line_chart|bar_chart|pie|table|heatmap|risk_matrix|control_matrix|network_diagram|process_flow|dashboard|screenshot|other",
+  "title": "Exact chart/table/diagram title if visible, e.g., 'Vulnerability Remediation Status'",
+  "subtitle": "Subtitle including scope, unit, population, or assessment period if visible",
+  "source": "Source if visible, e.g., 'Internal Audit', 'SIEM Export', 'Vulnerability Scanner', 'GRC Tool', or 'NOT READABLE'",
+  "timeframe": "Explicit period, date, quarter, audit window, or 'NOT READABLE'",
+
+  "what_is_visible_it": "Descrizione in ITALIANO della struttura visuale: matrice rischi, tabella controlli, dashboard KPI, diagramma di rete, flusso di processo, screenshot di evidenza, ecc.",
+  
+  "analysis_it": "Sintesi professionale in 3 frasi in ITALIANO. Concentrati su severità del rischio, efficacia dei controlli, gap di conformità, finding aperti/chiusi, asset coinvolti, trend incidenti/vulnerabilità e priorità di remediation.",
+  
+  "data_table_md": "| Category | Metric | Value | Status |\n|---|---:|---:|---|\n| Access Control | MFA Coverage | 78% | Partial |\n| Vulnerability Management | Critical Open Findings | 12 | High Risk |",
+
+  "observations_it": [
+    "Fact 1: identifica valori massimi/minimi, severità, controlli scoperti, finding aperti o asset più esposti.",
+    "Fact 2: annota percentuali, conteggi, SLA, date, owner, stato di remediation o maturity level se visibili.",
+    "Fact 3: segnala se l'evidenza è incompleta, non leggibile o non sufficiente a dimostrare conformità."
+  ],
+  
+  "visual_trends_it": ["Descrivi trend o distribuzioni: aumento/diminuzione incidenti, concentrazione per severità, copertura controlli, stato remediation, heatmap rischio."],
+
+  "legend_it": {
+    "is_readable": true,
+    "mapping": [{"label": "Critical", "color_or_style": "Red"}, {"label": "Implemented", "color_or_style": "Green"}]
+  },
+  
+  "numbers": [
+    {
+      "label": "Control/Risk/Asset/Process category, e.g., 'Access Control'",
+      "value": "Exact value read, e.g., '78%' or '12'",
+      "unit": "Count, %, score, severity, maturity level, SLA days, or textual status",
+      "period": "Date, audit period, or time reference if visible"
+    }
+  ],
+  "confidence": 0.0
+}
+"""
+
+# ==============================================================================
+# PROMPT: VISION-FIRST (PAGE-TO-MARKDOWN)
+# ==============================================================================
+# Questo prompt istruisce Ministral a trascrivere tutto in un unico flusso Markdown.
+# È cruciale per catturare grafici e tabelle nel contesto del testo.
+# ==============================================================================
+# PROMPT VISIONE (Vision-First v2 - ASSESSMENT VISUAL HUNTER)
+# ==============================================================================
+VISION_FIRST_PROMPT = r"""
+You are a Compliance and IT Security Analyst with Computer Vision capabilities.
+Your goal is to transcribe text AND deeply analyze visual evidence used in cybersecurity, compliance, privacy, and IT audit assessments.
+
+PAGE ANALYSIS PROTOCOL:
+
+1. **SCAN FOR ASSESSMENT VISUALS FIRST**: Look immediately for risk heatmaps, control matrices, audit finding tables, compliance dashboards, maturity charts, incident timelines, vulnerability charts, network diagrams, architecture diagrams, process flows, asset inventories, screenshots of configurations/logs, and organizational charts.
+   - If found, you MUST insert a detailed description block using this EXACT format:
+   
+   > **### 🖼️ VISUAL ANALYSIS: [Title/Type of Assessment Visual]**
+   > *Visual Elements:* Describe matrices, columns, rows, nodes, arrows, colors, severities, statuses, owners, dates, controls, risks, assets, or systems.
+   > *Data Insights:* Describe risk levels, severity distributions, control coverage, compliance gaps, open/closed findings, maturity levels, affected assets, dates, owners, and evidence status.
+   > *Context:* Relate the visual to surrounding text labels, captions, page titles, control IDs, framework references, or figure numbers.
+
+2. **TEXT TRANSCRIPTION**: After looking for visuals, transcribe all text headers and paragraphs exactly.
+3. **TABLES**: Transcribe tables using Markdown pipes (|), preserving control IDs, owners, status, risk rating, evidence, dates, and remediation fields when visible.
+4. **FORMULAS / METRICS**: Use Unicode symbols or LaTeX-like notation only when formulas or scoring rules are explicitly visible.
+
+STRICT RULES:
+- **DO NOT IGNORE IMAGES**: Even if they contain text labels, treat them as assessment evidence to describe.
+- **DO NOT INVENT COMPLIANCE**: If a control, owner, date, risk level, or evidence status is not visible, state that it is not readable/available.
+- **Merge** the visual description naturally into the reading order where the image appears.
+- Output ONLY Markdown.
+"""
+
+
+
+CHART_ANALYST_PROMPT = """
+You are an expert compliance, cybersecurity, privacy, and IT risk analyst for a RAG system.
+Your task is to analyze structured data (JSON) from a chart/table/diagram/screenshot and the surrounding page context to generate a discursive description in ENGLISH for semantic retrieval.
+
+INPUT:
+A JSON object containing:
+1. "vision_json": Visually extracted data (title, values, trends, data table, risk/control/evidence details).
+2. "page_text": The surrounding PDF page text (for context).
+
+INSTRUCTIONS:
+1. Synthesize in ITALIAN what the visual artifact demonstrates for the assessment.
+2. Explicitly integrate visible numbers, dates, statuses, severities, controls, risks, owners, assets, and evidence references found in "vision_json" (e.g., "MFA coverage is 78% and status is Partial").
+3. If "data_table_md" is present, use it to describe key data points.
+4. Describe visual trends such as risk concentration, vulnerability severity distribution, control coverage, remediation progress, incident trend, maturity level, or compliance gap.
+5. Be concise but information-dense to facilitate semantic search.
+
+DO NOT invent numbers, assets, controls, owners, dates, or compliance conclusions. If data is scarce, write: "Visual analysis limited due to low resolution."
+"""
+
+
+CHART_RECONCILE_PROMPT = """
+You receive:
+(A) PAGE_TEXT (raw text from PDF layer)
+(B) VISION_JSON (chart/table extraction)
+
+Task:
+- Merge ONLY factual, consistent information.
+- Never add numbers/series not present in VISION_JSON.
+- You may add labels from PAGE_TEXT only if explicitly stated.
+
+Return ONLY valid JSON with the SAME schema as VISION_JSON.
+"""
+
+KG_PROMPT = """You are an expert Compliance Auditor, Cybersecurity Analyst, and Data Engineer.
+Extract entities and relationships from the text for an assessment-oriented Knowledge Graph.
+
+TAXONOMY (You MUST choose one of these for the 'category' field):
+- ORGANIZATION (e.g., Company, Department, Third-Party)
+- PERSON (e.g., CISO, DPO, Employee, Process Owner)
+- POLICY_OR_PROCEDURE (e.g., Password Policy, Incident Response Plan, Backup Procedure)
+- CONTROL (e.g., MFA, Firewall, Encryption, Backup, Logging, Segregation of Duties)
+- RISK (e.g., Data Loss, Unauthorized Access, Cyber Attack, Service Unavailability)
+- EVIDENCE (e.g., Audit Log, Review Minutes, Vulnerability Scan, Configuration Screenshot)
+- ASSET (e.g., Server, Database, Workstation, Network, Application, Cloud Service)
+- REGULATION (e.g., GDPR, ISO 27001, NIS2, DORA, NIST)
+- CONCEPT (e.g., Confidentiality, Integrity, Availability, Business Continuity)
+
+PROPERTIES (You MUST populate the 'props' object):
+- 'description': A brief definition in Italian or in the document language (max 20 words).
+- 'formula': The mathematical/risk/scoring formula if explicitly mentioned in the text (otherwise leave empty).
+- 'synonyms': Array of alternative names or acronyms explicitly present in the text (e.g., ["MFA", "Multi-Factor Authentication"]).
+
+RELATION VOCABULARY (Prefer these UPPERCASE relation types):
+- IS_A, PART_OF, HAS_COMPONENT, APPLIES_TO, BELONGS_TO
+- COMPLIES_WITH, VIOLATES, MANDATES, GOVERNS, APPROVES, REVIEWS
+- MITIGATES, THREATENS, EXPLOITS, PROTECTS, VULNERABLE_TO
+- IMPLEMENTS, GENERATES, VERIFIES, TESTS, REQUIRES, DEPENDS_ON
+
+Return ONLY valid JSON with this exact schema:
+{
+  "nodes": [
+    {
+      "id": "Specific assessment entity (e.g., Multi-Factor Authentication)",
+      "category": "CONTROL",
+      "props": {
+        "description": "Controllo che richiede più fattori di autenticazione.",
+        "formula": "",
+        "synonyms": ["MFA"]
+      }
+    }
+  ],
+  "edges": [
+    {
+      "source": "Multi-Factor Authentication",
+      "target": "Unauthorized Access",
+      "relation": "MITIGATES",
+      "props": {
+        "evidence": "Il testo indica che MFA riduce il rischio di accesso non autorizzato."
+      }
+    }
+  ]
+}
+"""
+
+
+
+REL_CANON_PROMPT = """
+You are a relation-type canonicalizer for a cybersecurity, compliance, privacy, and IT audit assessment knowledge graph.
+
+INPUT: a JSON array of relation types (UPPERCASE, snake_case, may be Italian or English).
+
+OUTPUT: ONLY valid JSON, no markdown, no comments. Schema:
+{
+  "map": {
+    "<RAW>": {
+      "verb": "<ENGLISH_VERB_LEMMA>",
+      "object": "<ASSESSMENT_OBJECT_OR_EMPTY>",
+      "qualifier": "<QUALIFIER_OR_EMPTY>"
+    }
+  }
+}
+
+CANONICAL ASSESSMENT VOCABULARY:
+- Governance/compliance: COMPLY, VIOLATE, MANDATE, GOVERN, APPROVE, REVIEW, REQUIRE
+- Risk/security: MITIGATE, THREATEN, EXPLOIT, PROTECT, EXPOSE
+- Process/audit/evidence: IMPLEMENT, GENERATE, VERIFY, TEST, DEPEND, APPLY
+- Structure: BE, INCLUDE, CONTAIN, BELONG
+
+RULES:
+- verb MUST be a SINGLE ENGLISH VERB in UPPERCASE lemma, e.g. MITIGATE, REQUIRE, VERIFY, PROTECT, COMPLY, VIOLATE, IMPLEMENT.
+- object MUST be a short assessment noun/noun phrase in UPPERCASE, e.g. RISK, CONTROL, POLICY, EVIDENCE, ASSET, REQUIREMENT, REGULATION, USER_ACCESS, VULNERABILITY.
+- If RAW encodes an object (e.g. MITIGA_RISCHIO, REDUCES_UNAUTHORIZED_ACCESS), extract it into object.
+- Convert Italian/English forms to the same English verb/object:
+  - MITIGA/RIDUCE/REDUCES -> verb MITIGATE
+  - RICHIEDE/REQUIRES -> verb REQUIRE
+  - VERIFICA/CONFIRMS/VALIDATES -> verb VERIFY
+  - PROTEGGE/PROTECTS -> verb PROTECT
+  - VIOLA/VIOLATES -> verb VIOLATE
+  - IMPLEMENTA/IMPLEMENTS -> verb IMPLEMENT
+  - CONFORME_A/COMPLIES_WITH -> verb COMPLY, object REGULATION or REQUIREMENT if explicit
+- If RAW contains extra trailing tokens such as _IN, _DURING, _TO, date, phase, or status, put ONLY the last token into qualifier and keep verb/object unchanged.
+- Never output unrelated objects from other domains unless they are explicitly present in the assessment document.
+- If unsure about object, leave object empty.
+
+Return JSON only.
+"""
+
+
+
+CHART_DATA_PROMPT = """
+You are a Lead Data Scientist specializing in Security and Audit Dashboard Reconstruction.
+Your goal is to extract the EXACT underlying data table from the chart/diagram image.
+
+### PHASE 1: STRUCTURAL ANCHORING (CRITICAL)
+1. **Identify the MAIN CATEGORIES (X-Axis)**:
+   - Look at the labels *under* the groups of bars.
+   - Examples: "Q1, Q2, Q3", "Critical, High, Medium", "Access Control". 
+   - *Constraint*: These are the Row Headers.
+2. **Identify the SERIES LEGEND (Sub-groups)**:
+   - Look for the text that distinguishes the bars *within* a single category.
+   - *Visual Cue*: Are there dates (e.g., "2023", "2024") written below/inside the bars?
+   - *Visual Cue*: Is there a color legend (e.g., "Red=Open Incidents, Green=Resolved")?
+   - *Constraint*: These are the Column Headers.
+3. **Determine Cluster Size (N)**:
+   - Count how many bars exist for the first category.
+   - If a category has 2 bars, N=2. You MUST extract exactly 2 values for every other category.
+
+### PHASE 2: PRECISION EXTRACTION
+For EACH Main Category found:
+1. **Locate**: Focus on the cluster of bars for that category.
+2. **Measure**: Trace the top of each bar to the Y-Axis value. 
+   - *Interpolate*: If a bar is between 20 and 40, it is likely 30.
+   - *Ordering*: Extract values in the logical order of the Series.
+3. **Values**: Return specific numbers. DO NOT return arrays of random numbers.
+
+### PHASE 3: OUTPUT JSON
+Return VALID JSON:
+{
+  "title": "Chart Title",
+  "chart_type": "Clustered Bar / Stacked Bar / Line / Heatmap",
+  "series_discriminators": "The exact labels for the series (e.g., '2023, 2024').",
+  "data_points": [
+    {
+      "category": "Main Axis Label (e.g. Critical Vulnerabilities)",
+      "visual_check": "Short description (e.g. 'Red bar (high)')", 
+      "value": "val1, val2" 
+    }
+  ]
+}
+"""
+
+# ==============================================================================
+# NUOVO PROMPT: FULL PAGE TO MARKDOWN (LaTeX Native)
+# ==============================================================================
+MARKER_VISION_PROMPT = """
+You are an advanced AI conversion engine (OCR + Layout Analysis).
+Your task: Convert this document image into clean, structured MARKDOWN.
+
+RULES FOR MATHEMATICS (CRITICAL):
+1. Identify ALL mathematical formulas, equations, and symbols.
+2. Transcribe them EXACTLY into LaTeX format enclosed in single dollars ($...$) for inline or double dollars ($$...$$) for block equations.
+3. Example: Convert "Risk = Impact * Likelihood" into "$$Risk = Impact \times Likelihood$$".
+4. Do NOT output ascii math (like x^2). ALWAYS use LaTeX ($x^2$).
+
+RULES FOR STRUCTURE:
+1. Preserve headers (###), lists, and tables (using Markdown | col | col |).
+2. Ignore page footers, page numbers, and copyright disclaimers.
+3. If the text is garbled in the image, infer the correct words based on context.
+
+OUTPUT ONLY THE MARKDOWN. NO CONVERSATIONAL FILLER.
+"""
+
+# =========================
+# UTILS
+# =========================
+# --- Vision stats (thread-safe) ---
+VISION_STATS = {
+    "pages_total": 0,
+    "pages_with_imgs": 0,
+    "pages_crop_only": 0,
+    "pages_fullpage": 0,
+}
+
+_VISION_STATS_LOCK = Lock()
+
+# --- UTILITY DI PULIZIA E FILTRAGGIO MD ---
+
+
+def move_file_preserving_structure(file_path: str, target_base_dir: str):
+    """
+    Sposta il file mantenendo l'alberatura originale (Tier e Ontology) rispetto a INBOX_DIR.
+    """
+    try:
+        if not os.path.exists(file_path):
+            return
+            
+        # Calcola il percorso relativo (es. TIER_B_GOVERNANCE/gov_infosec_policies/file.md)
+        rel_path = os.path.relpath(file_path, INBOX_DIR)
+        
+        # Unisce il path relativo alla nuova root (es. ./data/assessment/processed/...)
+        dest_path = os.path.join(target_base_dir, rel_path)
+        
+        # Crea tutte le sottocartelle necessarie nella destinazione
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        
+        # Se esiste già un file omonimo nella destinazione, sovrascrivilo
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+            
+        shutil.move(file_path, dest_path)
+    except Exception as e:
+        print(f"   ⚠️ Errore spostamento file in {target_base_dir}: {e}")
+
+
+
+def ai_vision_gatekeeper(image_bytes: bytes) -> bool:
+    # filtro dimensione (icone/loghi)
+    if not image_bytes or len(image_bytes) < MIN_ASSET_SIZE:
+        return False
+    return True
+
+    
+
+def clean_markdown_structure(md_content: str) -> str:
+    """Rimuove sezioni strutturali pesanti (Indici, Sommari) e rumore web."""
+    sections = re.split(r'(\n#+ .*)', md_content)
+    cleaned_sections = []
+    start_idx = 0
+    if len(sections) > 1 and len(sections[0].strip()) < 300:
+        start_idx = 2 
+        
+    for i in range(start_idx, len(sections)):
+        section_text = sections[i]
+        if bool(STRUCTURAL_PAT.search(section_text[:400])):
+            continue
+        section_text = re.sub(r'https?://\S+', '', section_text)
+        section_text = re.sub(r'\S+@\S+', '', section_text)
+        cleaned_sections.append(section_text)
+    return "".join(cleaned_sections)
+
+
+def to_text(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, (list, tuple, set)):
+        parts = [to_text(i) for i in x]
+        parts = [p.strip() for p in parts if p and str(p).strip()]
+        return "; ".join(parts)
+    if isinstance(x, dict):
+        return str(x)
+    return str(x)
+
+
+
+def set_toon_type(chunk: dict, *, is_image: bool) -> dict:
+    chunk["toon_type"] = "image" if is_image else "text"
+    return chunk
+
+
+def fast_chunk_text(text: str, max_tokens: int = 2000) -> List[str]:
+    """
+    Divide il testo in chunk basati su una stima dei token (1 tok ~= 4 char).
+    - Veloce (nessun tokenizer pesante).
+    - Rispetta i confini delle parole/frasi.
+    - Include un overlap automatico per continuità semantica.
+    """
+    if not text:
+        return []
+    
+    # Stima caratteri: OpenAI usa circa 4 char per token in media
+    chunk_size_char = max_tokens * 4
+    overlap_char = int(chunk_size_char * 0.1)  # 10% overlap
+    
+    text_len = len(text)
+    if text_len <= chunk_size_char:
+        return [text]
+        
+    chunks = []
+    start = 0
+    
+    while start < text_len:
+        # Definiamo il punto di fine teorico
+        end = min(start + chunk_size_char, text_len)
+        
+        # Se non siamo alla fine assoluta del testo, cerchiamo un punto di taglio "morbido"
+        if end < text_len:
+            # Cerchiamo l'ultimo 'a capo' o 'spazio' prima del limite
+            # Questo evita di troncare parole a metà es: "ingegner" | "ia"
+            search_window = text[start:end]
+            
+            # Preferenza 1: Tagliare su un doppio a capo (fine paragrafo)
+            last_break = search_window.rfind('\n\n')
+            
+            # Preferenza 2: Tagliare su un singolo a capo
+            if last_break == -1:
+                last_break = search_window.rfind('\n')
+                
+            # Preferenza 3: Tagliare su uno spazio (ultima risorsa)
+            if last_break == -1:
+                last_break = search_window.rfind(' ')
+            
+            # Se abbiamo trovato un punto valido nella seconda metà del chunk, usiamolo
+            # (Se è troppo presto, meglio tagliare brutale che fare un chunk minuscolo)
+            if last_break != -1 and last_break > (chunk_size_char * 0.5):
+                end = start + last_break + 1  # +1 per includere il carattere di stop
+        
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+            
+        # Calcolo del prossimo start con overlap
+        # Se siamo alla fine, usciamo
+        if end >= text_len:
+            break
+            
+        # Torniamo indietro di 'overlap' caratteri, ma senza superare l'inizio attuale
+        start = max(start + 1, end - overlap_char)
+
+    return chunks
+
+
+def prep_text_for_embedding(s: str, max_chars: int = 2200) -> str:
+    if not s:
+        return ""
+    # rimuove prefix tipo "Doc: ... | Sezione: ..."
+    s = re.sub(r"^Doc:\s.*?\n", "", s.strip(), flags=re.DOTALL)
+    # normalizza whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    # tronca (tokenizer cost cresce con la lunghezza)
+    if len(s) > max_chars:
+        s = s[:max_chars]
+    return s
+
+
+def page_has_vector_graphics(page: fitz.Page) -> bool:
+    """
+    Heuristica: se la pagina contiene molti 'drawings' (linee/rect/path),
+    è molto probabile che ci sia un grafico vettoriale.
+    """
+    try:
+        drawings = page.get_drawings()
+        if not drawings:
+            return False
+        # Conteggio totale items (path ops)
+        ops = 0
+        for d in drawings:
+            items = d.get("items") or []
+            ops += len(items)
+        # Soglia: alza/abbassa se necessario (20-60 tipico)
+        return ops >= 20
+    except Exception:
+        return False
+
+
+
+def extract_markdown_chunks(file_path: str, log_id: int) -> List[Dict[str, Any]]:
+    """
+    Estrattore ad alte prestazioni per file Markdown.
+    Gestisce l'auto-cleaning e la Vision AI chirurgica.
+    FIX: Include sub-chunking per paragrafi giganti (evita errori 0 nodi).
+    """
+    out_chunks = []
+    filename = os.path.basename(file_path)
+    
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            raw_content = f.read()
+
+        # 1. AUTO-CLEANING
+        content = clean_markdown_structure(raw_content)
+
+        # 2. CHUNKING STRUTTURATO (Macro-divisione)
+        raw_paras = re.split(r'\n(?=# )|\n\n', content)
+        
+        for idx, macro_para in enumerate(raw_paras):
+            macro_para = macro_para.strip()
+            if len(macro_para) < MIN_CHUNK_LEN:
+                continue
+            
+            # ### FIX 1: Gestione Vision AI (spostata prima del sub-chunking)
+            # Analizziamo l'immagine una volta sola per il "macro blocco"
+            vision_metadata = {}
+            img_matches = re.findall(r'!\[.*?\]\((.*?)\)', macro_para)
+            
+            if img_matches and PDF_VISION_ENABLED:
+                # ... (TUA LOGICA VISION INVARIATA) ...
+                try:
+                    img_path = img_matches[0]
+                    full_img_path = os.path.join(os.path.dirname(file_path), img_path)
+                    
+                    if os.path.exists(full_img_path) and os.path.getsize(full_img_path) > 5000:
+                        with open(full_img_path, "rb") as img_f:
+                            img_bytes = img_f.read()
+                        
+                        CHART_MIN_CONF = float(os.getenv("CHART_MIN_CONF", "0.55"))
+                        c_js = extract_chart_via_vision(img_bytes)
+                        
+                        conf = float((c_js or {}).get("confidence") or 0.0)
+
+                        if c_js and c_js.get("kind") != "other" and conf >= CHART_MIN_CONF:
+                            # Salviamo i dati per iniettarli nel primo sub-chunk
+                            vision_metadata = {
+                                "chart_semantic": build_chart_semantic_chunk(1, c_js),
+                                "metadata_override": c_js
+                            }
+                            print(f"   📝 Analisi Semantica Chart (conf={conf:.2f})")
+                        else:
+                            # Salvataggio Postgres (Asset Management)
+                            conn = pg_get_conn()
+                            try:
+                                with conn.cursor() as cur:
+                                    pg_save_image(log_id, img_bytes, "image/jpeg", f"MD_{filename}_{idx}", cur)
+                                conn.commit()
+                            finally:
+                                pg_put_conn(conn)
+                except Exception as e_img:
+                    print(f"   ⚠️ Vision Error: {e_img}")
+
+
+            # ### FIX 2: SUB-CHUNKING DI SICUREZZA
+            # Se il paragrafo è > 1024 token, lo spezziamo ancora, altrimenti l'LLM fallisce.
+            # Se è piccolo, fast_chunk_text ritorna una lista con 1 solo elemento (invariato).
+            sub_chunks_text = fast_chunk_text(macro_para, max_tokens=1024)
+
+            for sub_i, txt in enumerate(sub_chunks_text):
+                
+                # Se c'era un grafico, lo alleghiamo SOLO al primo pezzo del paragrafo
+                # per evitare di duplicare l'informazione vision in N chunk.
+                current_text_sem = f"Doc: {filename} | Sezione: {txt[:60]}...\n{txt}"
+                current_meta = {}
+                
+                if sub_i == 0 and vision_metadata:
+                    # Iniettiamo la descrizione del grafico all'inizio del testo semantico
+                    current_text_sem = vision_metadata["chart_semantic"] + "\n\n" + current_text_sem
+                    current_meta = vision_metadata.get("metadata_override", {})
+
+                chunk_data = {
+                    "text_raw": txt,
+                    "text_sem": current_text_sem,
+                    "page_no": 1,
+                    "toon_type": "text" if not (sub_i == 0 and vision_metadata) else "chart_analysis",
+                    "section_hint": txt[:80] if txt.startswith("#") else f"part_{sub_i+1}",
+                    "metadata": current_meta # Importante per passare info Chart
+                }
+                
+                # Se c'era un metadata override (es. grafico), assicurati che sia nel payload
+                if "metadata_override" in vision_metadata and sub_i == 0:
+                     chunk_data["metadata_override"] = vision_metadata["metadata_override"]
+
+                out_chunks.append(chunk_data)
+            
+        print(f"   📄 Markdown Ingested: {len(out_chunks)} chunk validi.")
+        return out_chunks
+
+    except Exception as e:
+        print(f"   ❌ Errore durante l'estrazione Markdown: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+
+def force_unload_ollama(model_name: str):
+    """
+    Forza lo scaricamento e attende che la VRAM si stabilizzi.
+    Versione Aggressiva per P5000.
+    """
+    if not model_name:
+        return
+    try:
+        # print(f"   🧹 Unloading {model_name}...", end="\r")
+        url = "http://localhost:11434/api/generate"
+        payload = {
+            "model": model_name,
+            "prompt": "",
+            "keep_alive": 0 
+        }
+        requests.post(url, json=payload, timeout=2)
+        
+        # --- MODIFICA FONDAMENTALE ---
+        # La P5000 ha bisogno di tempo per de-allocare la memoria CUDA
+        # 0.5s non bastano. Facciamo 3 secondi. È lento? Sì. Si blocca? No.
+        time.sleep(2.0) 
+        
+    except Exception:
+        pass
+
+
+def force_restart_ollama(num_parallel: str = "1") -> bool:
+    """
+    Riavvio Ottimizzato per GPU 16GB (P5000).
+    Forza OLLAMA_NUM_PARALLEL=1 per bilanciare Vision e Chat senza OOM.
+    """
+    print(f"🔄 Resetting Ollama Server (Target Parallelism={num_parallel})...")
+
+    # 1) Kill processi esistenti (Pulizia VRAM)
+    try:
+        subprocess.run(["taskkill", "/f", "/im", "ollama.exe"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["taskkill", "/f", "/im", "ollama_app.exe"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(3) # Un secondo in più per essere sicuri che la VRAM sia libera
+    except Exception:
+        pass
+
+    # 2) Configura l'ambiente P5000 Friendly
+    env = os.environ.copy()
+    
+    # Su 16GB, UNO alla volta è meglio. Massimizza la VRAM per il contesto lungo.
+    env["OLLAMA_NUM_PARALLEL"] = str(num_parallel)
+    
+    # Teniamo in memoria max 2 modelli (Vision e Brain) per evitare continui reload
+    env["OLLAMA_MAX_LOADED_MODELS"] = "2"
+    
+    # Opzionale: Flash Attention se supportato (spesso aiuta su Pascal/Volta/Ampere)
+    env["OLLAMA_FLASH_ATTENTION"] = "1" 
+
+    # 3) Percorso Ollama
+    ollama_path = shutil.which("ollama")
+    if not ollama_path:
+        ollama_path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama.exe")
+
+    print(f"   🚀 Starting Ollama from: {ollama_path} with P5000 optimizations...")
+
+    # 4) Avvio server
+    try:
+        subprocess.Popen(
+            [ollama_path, "serve"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            shell=False
+        )
+    except Exception as e:
+        print(f"   ❌ Errore critico avvio Ollama: {e}")
+        return False
+
+    # 5) Healthcheck
+    for i in range(20): # Aumentato timeout a 20 per dare tempo al caricamento VRAM
+        try:
+            res = requests.get("http://127.0.0.1:11434/api/tags", timeout=2)
+            if res.status_code == 200:
+                print(f"   ✨ Ollama is READY (Parallel={num_parallel})")
+                return True
+        except:
+            time.sleep(1)
+            
+    print("   ⚠️ Ollama non ha risposto entro il timeout, ma potrebbe essere attivo.")
+    return True
+
+
+    # 2. Configura l'ambiente
+    env = os.environ.copy()
+    num_parallel=4
+    env["OLLAMA_NUM_PARALLEL"] = num_parallel
+    env["OLLAMA_MAX_LOADED_MODELS"] = "2"
+    
+    # 3. Individua il percorso di Ollama
+    # Cerchiamo ollama nel PATH; se non lo trova, usiamo il percorso standard di installazione su Windows
+    ollama_path = shutil.which("ollama")
+    if not ollama_path:
+        ollama_path = os.path.expandvars(r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe")
+
+    print(f"   🚀 Starting Ollama from: {ollama_path}")
+
+    # 4. Avvio del server con shell=True per risolvere i problemi di PATH su Windows
+    try:
+        subprocess.Popen(
+            [ollama_path, "serve"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            shell=True # Fondamentale per evitare il WinError 2
+        )
+    except Exception as e:
+        print(f"   ❌ Errore critico nell'avvio di Ollama: {e}")
+        return False
+
+    # 5. Verifica disponibilità (Invariato)
+# 5. Verifica disponibilità
+    for i in range(15):
+        try:
+            # FIX: Usiamo /api/tags che accetta GET e risponde 200 OK
+            res = requests.get("http://localhost:11434/api/tags", timeout=1)
+            if res.status_code == 200:
+                print(f"   ✨ Ollama is READY (Parallel={num_parallel})")
+                return True
+        except Exception:
+            time.sleep(2)
+            print(f"   ...waiting for server ({i+1}/15)")
+    
+    return False
+
+
+
+def ensure_ollama_parallel(num_parallel="4"):
+    """
+    Imposta le variabili d'ambiente e avvia il server Ollama.
+    """
+    # 1. Imposta la variabile d'ambiente per il processo Python e i suoi figli
+    os.environ["OLLAMA_NUM_PARALLEL"] = num_parallel
+    os.environ["OLLAMA_MAX_LOADED_MODELS"] = "2" # Ottimizza la VRAM
+    
+    print(f"🚀 Configurazione Ollama: NUM_PARALLEL={num_parallel}")
+
+    # 2. Verifica se Ollama è già attivo
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=2)
+        if response.status_code == 200:
+            print("   ✅ Ollama è già in esecuzione. Nota: se non è stato avviato con NUM_PARALLEL, i thread saranno sequenziali.")
+            return
+    except requests.exceptions.ConnectionError:
+        print("   ⚠️ Server Ollama non trovato. Avvio in corso...")
+
+    # 3. Avvio del server come processo in background (subprocess.Popen)
+    # 'ollama serve' rimarrà attivo mentre lo script prosegue
+    subprocess.Popen(
+        ["ollama", "serve"],
+        env=os.environ, # Passa le variabili d'ambiente impostate sopra
+        stdout=subprocess.DEVNULL, # Nasconde i log del server per pulizia terminale
+        stderr=subprocess.DEVNULL
+    )
+
+    # 4. Attesa che il server sia pronto
+    for _ in range(10):
+        try:
+            if requests.get("http://localhost:11434/api/tags").status_code == 200:
+                print("   ✨ Server Ollama pronto!")
+                return
+        except:
+            time.sleep(2)
+    print("   ❌ Errore: Impossibile avviare Ollama automaticamente.")
+
+
+
+def sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk_size)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+def deterministic_chunk_id(
+    doc_id: str,
+    page_no: int,
+    chunk_index: int,
+    toon_type: str,
+    text_sem: str,
+    image_id: Optional[int] = None,
+) -> str:
+    """
+    ID deterministico per chunk.
+    Se re-ingestisci lo stesso documento con lo stesso chunking -> stesso chunk_id -> niente duplicazioni Neo4j/Qdrant/PG.
+    """
+    text_hash = sha256_hex((text_sem or "").encode("utf-8"))[:16]
+    base = f"{doc_id}::p{page_no}::i{chunk_index}::{toon_type}::{text_hash}"
+    if image_id is not None:
+        base += f"::img{image_id}"
+    # 32 hex chars: stabile, corto, compatibile come string ID
+    return sha256_hex(base.encode("utf-8"))[:32]
+
+def normalize_ws(text: str) -> str:
+    """
+    Normalizza gli spazi ma preserva la struttura 'visiva' delle tabelle.
+    Non schiaccia più spazi > 2 in uno solo, perché nei PDF significano 'colonna'.
+    """
+    text = (text or "").replace("\x00", " ")
+    
+    # Sostituisce i tab con spazi per uniformità
+    text = text.replace("\t", "    ")
+    
+    # 1. Rimuove spazi eccessivi SOLO se sono singoli (normale testo)
+    # Se ci sono più di 2 spazi consecutivi, li manteniamo (potrebbe essere una tabella)
+    # Regex: Sostituisce 1 spazio ripetuto, ma rispetta '   ' (3+) come separatore colonna
+    # text = re.sub(r"[ ]{2,}", " ", text) <--- VECCHIO CODICE CHE ROMPEVA LE TABELLE
+    
+    # NUOVO: Collassa spazi enormi (>10) ma lascia il respiro per le colonne (2-10 spazi)
+    text = re.sub(r" {10,}", "    ", text) 
+    
+    # Gestione a capo: rimuove solo i tripli a capo inutili
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    
+    return text.strip()
+
+def normalize_entity_id(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace('"', "").replace("'", "")
+    s = re.sub(r"\s+", " ", s)
+    return s[:180]
+
+def normalize_doc_name(value: str) -> str:
+    """Sincronizzato con gui_reflex.py"""
+    if not value: return ""
+    v = os.path.basename(str(value).lower().strip())
+    v = re.sub(r"\.(pdf|md|txt|docx|html)$", "", v)
+    v = re.sub(r"[_\-\s]+out$", "", v)
+    v = re.sub(r"[_\-\s]+output$", "", v)
+    v = re.sub(r"[^a-z0-9]+", "", v)
+    return v
+
+
+
+import json
+import re
+from typing import Any, Dict, Optional, Tuple, Union
+
+
+def safe_json_extract(raw: str):
+    """
+    Estrae in modo robusto il primo JSON valido (dict/list) da una risposta LLM.
+    Gestisce:
+      - code fences (backticks)
+      - testo prima/dopo il JSON
+      - caratteri di controllo / null bytes
+      - smart quotes
+      - trailing commas
+      - FIX LATEX: Escaping automatico per sintassi LaTeX (\\sum -> \\\\sum)
+    Ritorna: dict | list | None
+    """
+    import json, re
+
+    if raw is None:
+        return None
+
+    s = str(raw)
+
+    # 1) strip code fences
+    # FIX ANTI-BUG COPIA/INCOLLA: Usiamo la moltiplicazione per creare i backtick
+    # così l'interfaccia della chat non si confonde!
+    fence_pattern = "`" * 3 + r"(?:json)?\s*([\s\S]*?)\s*" + "`" * 3
+    fence = re.search(fence_pattern, s, flags=re.IGNORECASE)
+    
+    if fence:
+        s = fence.group(1)
+
+    # 2) rimuove caratteri di controllo (salva \t \n \r)
+    s = "".join(ch for ch in s if ch == "\t" or ch == "\n" or ch == "\r" or ord(ch) >= 32)
+
+    # 3) normalizza smart quotes
+    s = (s.replace("“", '"').replace("”", '"')
+           .replace("‘", "'").replace("’", "'"))
+
+    # helper: trova primo JSON bilanciato {..} o [..]
+    def _first_balanced_json(text: str):
+        starts = []
+        for i, ch in enumerate(text):
+            if ch in "{[":
+                starts.append(i)
+
+        for start in starts:
+            open_ch = text[start]
+            close_ch = "}" if open_ch == "{" else "]"
+            depth = 0
+            in_str = False
+            esc = False
+
+            for j in range(start, len(text)):
+                c = text[j]
+
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif c == "\\":
+                        esc = True
+                    elif c == '"':
+                        in_str = False
+                    continue
+                else:
+                    if c == '"':
+                        in_str = True
+                        continue
+                    if c == open_ch:
+                        depth += 1
+                    elif c == close_ch:
+                        depth -= 1
+                        if depth == 0:
+                            return text[start:j+1]
+        return None
+
+    cand = _first_balanced_json(s)
+    if not cand:
+        return None
+
+    # 4) prova parse diretto
+    try:
+        return json.loads(cand)
+    except Exception:
+        pass
+
+    # 5) micro-repair: trailing commas + spazi strani + LATEX ESCAPING
+    repaired = cand
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)  # trailing commas
+    repaired = repaired.strip()
+
+    # 🔥 FIX CRITICO LATEX ESCAPING 🔥
+    # Trova tutti i backslash (es. \sum, \frac) non seguiti da valid json escapes (" \ / b f n r t u)
+    # e li raddoppia (\\sum) per evitare il crash del parser JSON.
+    repaired = re.sub(r'\\(?=[^"\\/bfnrtu])', r'\\\\', repaired)
+
+    # 6) riprova
+    try:
+        return json.loads(repaired)
+    except Exception as e:
+        print(f"      [JSON-REPAIR-FAILED] Impossibile recuperare il JSON: {e}")
+        return None
+
+
+
+
+def split_text_with_overlap(text: str, max_chars: int, overlap: int) -> List[str]:
+    text = normalize_ws(text)
+    if len(text) <= max_chars:
+        return [text]
+    out = []
+    i = 0
+    step = max(1, max_chars - overlap)
+    while i < len(text):
+        out.append(text[i:i + max_chars])
+        i += step
+    return out
+
+def split_paragraphs(text: str, max_chars: int, overlap: int) -> List[str]:
+    text = normalize_ws(text)
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    merged = []
+    buf = ""
+    for p in paras:
+        if len(buf) + len(p) + 2 <= max_chars:
+            buf = (buf + "\n\n" + p).strip()
+        else:
+            if buf:
+                merged.append(buf)
+            buf = p
+    if buf:
+        merged.append(buf)
+
+    final_chunks = []
+    for m in merged:
+        final_chunks.extend(split_text_with_overlap(m, max_chars, overlap))
+    return final_chunks
+
+def find_section_hint(page_text: str) -> str:
+    if not page_text:
+        return ""
+    lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
+    for ln in lines[:15]:
+        if 4 <= len(ln) <= 90 and ln.count(".") <= 1 and not ln.endswith("."):
+            return ln[:90]
+    return ""
+
+def add_context_windows(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not chunks:
+        return chunks
+    texts = [c.get("text_sem", "") for c in chunks]
+    for i, c in enumerate(chunks):
+        prev_txt = texts[i - 1] if i > 0 else ""
+        next_txt = texts[i + 1] if i + 1 < len(texts) else ""
+        c["context_prev"] = prev_txt[-CONTEXT_WINDOW_CHARS:] if prev_txt else ""
+        c["context_next"] = next_txt[:CONTEXT_WINDOW_CHARS] if next_txt else ""
+    return chunks
+
+def extract_facts(text: str) -> Dict[str, Any]:
+    if not text:
+        return {}
+    t = text[:20000]
+    perc = re.findall(r"\b\d+(?:[\.,]\d+)?\s?%\b", t)
+    currency = re.findall(r"(?:€\s?\d[\d\.,]*|\$\s?\d[\d\.,]*|\b\d[\d\.,]*\s?(?:EUR|USD)\b)", t)
+    facts: Dict[str, Any] = {}
+    if perc: facts["percentages"] = list(set(perc[:20]))
+    if currency: facts["amounts"] = list(set(currency[:20]))
+    return facts
+
+
+def is_text_layer_corrupt(text: str) -> bool:
+    """
+    Rileva layer testuale rotto. (Versione Hardened per '2C0D')
+    """
+    if not text: return False
+    
+    # 1. Pattern inequivocabili di formule rotte
+    bad_markers = [
+        "2C0D",          # EOQ Formula rotta
+        "•", "–", "—", "˜", # Bullet point corrotti
+        "× ×",           # Operatori duplicati
+        "( ) ( )"        # Parentesi vuote
+    ]
+    
+    for marker in bad_markers:
+        if marker in text:
+            return True # Trovato marcatore di corruzione -> Butta il testo!
+
+    # 2. Densità numeri
+    lines = text.split('\n')
+    numeric_lines = 0
+    total_lines = len(lines)
+    if total_lines > 5:
+        for line in lines:
+            if re.fullmatch(r'[\d\s\Wμ]+', line.strip()) and len(line) > 5:
+                numeric_lines += 1
+        
+        if (numeric_lines / total_lines) > 0.4:
+            return True
+            
+    return False
+
+
+def smart_clean_text(text: str) -> str:
+    """
+    Interpreta e pulisce il testo del PDF:
+    1. Rimuove simboli di font corrotti (artefatti matematici).
+    2. Rimuove righe che sono solo sequenze di numeri spaziati (indici di formule esplosi).
+    3. Normalizza spaziature.
+    """
+    if not text: 
+        return ""
+    
+    # 1. Rimuovi i caratteri "Ghost" specifici che hai mostrato nel log
+    # Questi codici (x95, x96...) sono spesso bullet point o simboli matematici mappati male
+    text = re.sub(r'[\x95\x96\x97\x98\x81\x80\x8d\uf0b7\uf020]', ' ', text)
+    
+    lines = text.split('\n')
+    valid_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # 2. Rilevamento Header/Footer ripetitivi
+        # Se la riga è identica a intestazioni note, saltala
+        if line.lower() in ["formulae sheet", "maths tables", "s17"]:
+            continue
+            
+        # 3. Rilevamento "Numeri Esplosi" (es. "3 3 4" o "1 1 1")
+        # Le formule matematiche nel layer testo spesso appaiono come numeri spaziati senza senso.
+        # Se una riga ha solo numeri e spazi e meno di 2 lettere, è spazzatura del layer testo.
+        if re.match(r'^[\d\s\W]+$', line) and len(re.findall(r'[a-zA-Z]', line)) < 2:
+            continue
+
+        valid_lines.append(line)
+    
+    # Ricostruisci il testo
+    text = " ".join(valid_lines)
+    
+    # 4. Collassa spazi multipli generati dalla rimozione
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def safe_normalize_text(text: str) -> str:
+    """
+    Normalizzazione universale per testi estratti da PDF.
+    - Gestisce legature standard (fi, fl, ff) tramite NFKC.
+    - Rimuove caratteri di controllo e 'garbage' non-ASCII sospetti.
+    - Preserva i simboli matematici necessari per le formule.
+    """
+    if not text:
+        return ""
+
+    # 1. Normalizzazione NFKC: Decompone le legature standard (es. 'ﬁ' -> 'fi')
+    # e normalizza i caratteri simili in un'unica forma standard.
+    text = unicodedata.normalize('NFKC', text)
+
+    # 2. Identificazione contesto matematico
+    # Se il testo sembra una formula, siamo più conservativi nella rimozione dei simboli.
+    is_math = bool(MATH_CANDIDATE_PAT.search(text))
+
+    # 3. Pulizia dei caratteri "Phantom" o "Private Use Area"
+    # Molti glitch dei PDF finiscono nel range Unicode E000-F8FF (Private Use Area)
+    # o sono caratteri di controllo non stampabili.
+    if not is_math:
+        # Rimuove caratteri non stampabili e simboli strani (non-latin, non-punctuation)
+        # mantenendo però lettere accentate e punteggiatura standard.
+        text = re.sub(r'[^\x20-\x7E\u00A0-\u00FF\u0100-\u017F\u0180-\u024F]+', ' ', text)
+    else:
+        # In contesto matematico, preserviamo i simboli LaTeX comuni
+        # ma puliamo comunque i null byte e i caratteri di controllo.
+        text = text.replace('\x00', ' ')
+        text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', ' ', text)
+
+    # 4. Normalizzazione degli spazi bianchi
+    text = re.sub(r'\s+', ' ', text)
+    
+    return text.strip()
+
+def _load_rel_canon_cache() -> dict:
+    try:
+        with open(REL_CANON_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+def _save_rel_canon_cache(cache: dict) -> None:
+    try:
+        with open(REL_CANON_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _get_rel_canon_map(rel_types: set[str]) -> dict:
+    """
+    Ritorna cache completa {RAW: {"verb":..., "object":..., "qualifier":...}}
+    e aggiorna la cache per i missing con UNA chiamata LLM per batch/doc.
+    """
+    cache = _load_rel_canon_cache()
+
+    missing = [rt for rt in sorted(rel_types) if rt and rt not in cache]
+    if not missing:
+        return cache
+
+    raw = llm_chat(
+        REL_CANON_PROMPT,
+        json.dumps(missing, ensure_ascii=False),
+        LLM_MODEL_NAME,
+        max_tokens=REL_CANON_MAX_TOKENS
+    )
+
+    js = safe_json_extract(raw) or {}
+    mapping = (js.get("map") or {}) if isinstance(js, dict) else {}
+
+    for k, v in mapping.items():
+        if not isinstance(v, dict):
+            continue
+
+        kk = (k or "").strip().upper()
+        verb = (v.get("verb") or "").strip().upper()
+        obj = (v.get("object") or "").strip().upper()
+        qual = (v.get("qualifier") or "").strip().upper()
+
+        if kk and verb:
+            cache[kk] = {"verb": verb, "object": obj, "qualifier": qual}
+
+    _save_rel_canon_cache(cache)
+    return cache
+
+
+def canonicalize_edges_to_verb_object(edges: list[dict]) -> list[dict]:
+    """
+    VERBO-ONLY:
+    - ee["relation"] = VERB lemma in EN (uppercase)
+    - props tiene audit: raw_relation, canon_verb, canon_object (se presente), qualifier (se presente)
+    """
+    if not edges:
+        return edges
+
+    rel_types = set(
+        (e.get("relation") or "").strip().upper()
+        for e in edges
+        if e.get("relation")
+    )
+    canon_map = _get_rel_canon_map(rel_types)
+
+    out: list[dict] = []
+
+    for e in edges:
+        raw_rel = (e.get("relation") or "").strip().upper()
+        raw_rel = raw_rel.replace("__", "_").strip("_")
+        if not raw_rel:
+            out.append(e)
+            continue
+
+        m = canon_map.get(raw_rel) or {}
+        verb = (m.get("verb") or raw_rel).strip().upper()
+        obj = (m.get("object") or "").strip().upper()
+        qual = (m.get("qualifier") or "").strip().upper()
+
+        # lemma cheap (en)
+        verb = _cheap_lemma_en(verb)
+
+        ee = dict(e)
+        props = dict(ee.get("props") or {})
+
+        # TYPE Neo4j: SOLO VERB
+        canon_type = _safe_reltype(verb)
+
+        # audit/provenance
+        raw_audit = raw_rel.replace("__", "_").strip("_")
+        if not RELTYPE_OK.match(raw_audit):
+            raw_audit = raw_rel
+
+        props.setdefault("raw_relation", raw_audit)
+        props.setdefault("canon_verb", verb)
+
+        # object come proprietà (non nel type)
+        if obj:
+            props.setdefault("canon_object", obj)
+
+        # fallback opzionale (se vuoi): VISIT senza oggetto -> PLACE
+        if not obj and canon_type == "VISIT":
+            props.setdefault("canon_object", "PLACE")
+
+        if qual:
+            props.setdefault("qualifier", qual)
+
+        ee["props"] = props
+        ee["relation"] = canon_type
+        out.append(ee)
+
+    return out
+
+
+
+def _safe_reltype(t: str) -> str:
+    t = (t or "").strip().upper()
+    if RELTYPE_OK.match(t):
+        return t
+    return "RELATES_TO"
+
+def _cheap_lemma_en(verb: str) -> str:
+    v = (verb or "").strip().upper()
+
+    if len(v) <= 4:
+        return v
+
+    # forme comuni
+    if v.endswith("ING") and len(v) > 6:
+        v = v[:-3]
+    elif v.endswith("ED") and len(v) > 5:
+        v = v[:-2]
+    elif v.endswith("S") and len(v) > 5:
+        v = v[:-1]
+
+    # fix "troncamenti" frequenti prodotti da LLM/JSON cleaning:
+    # ESTABLISHE -> ESTABLISH
+    if v.endswith("ISHE") and len(v) >= 8:
+        v = v[:-1]  # drop final 'E'
+
+    # DISCUS -> DISCUSS
+    if v.endswith("CUS") and len(v) >= 6:
+        v = v + "S"
+
+    return v
+
+
+
+def canonicalize_edges_by_base_presence(edges: list[dict]) -> list[dict]:
+    """
+    NO whitelist, data-driven:
+    se nello stesso batch esistono BASE e BASE_SUFFIX, collassa BASE_SUFFIX -> BASE
+    e salva raw_relation + qualifier nelle props.
+    """
+    if not edges:
+        return edges
+
+    rel_types = set((e.get("relation") or "").strip().upper() for e in edges if e.get("relation"))
+    out = []
+
+    for e in edges:
+        rel = (e.get("relation") or "").strip().upper()
+        rel = rel.replace("__", "_").strip("_")
+        if not rel or "_" not in rel:
+            out.append(e)
+            continue
+
+        parts = rel.split("_")
+        if parts:
+            parts[0] = _cheap_lemma_en(parts[0])
+            rel = "_".join(parts)
+
+
+        base, suffix = rel.rsplit("_", 1)
+
+        if base in rel_types and len(base) >= 6 and 1 <= len(suffix) <= 12:
+            ee = dict(e)
+            ee["relation"] = base
+            props = dict(ee.get("props") or {})
+            props.setdefault("raw_relation", rel)
+            props.setdefault("qualifier", suffix)
+            ee["props"] = props
+            out.append(ee)
+        else:
+            out.append(e)
+
+    return out
+
+def is_garbage_text(text: str, threshold: float = 0.10) -> bool:
+    """
+    Rileva se il testo estratto è corrotto (es. glitch di fitz).
+    Soglia 0.10 significa che se più del 10% dei caratteri sono □ o , il chunk viene scartato.
+    """
+    if not text or len(text) < 5: 
+        return True
+    # Identifica caratteri "garbage" comuni nei PDF estratti male
+    bad_chars = len(re.findall(r"[□\ufffd]", text))
+    
+    if bad_chars / len(text) > threshold:
+        return True
+    return False
+
+
+def sanitize_chart_for_analysis(chart_json: dict) -> dict:
+    if not isinstance(chart_json, dict):
+        return {}
+
+    cj = dict(chart_json)
+
+    # 1) Periodo: accetta solo anni a 4 cifre
+    tf = str(cj.get("timeframe", "") or "")
+    years = re.findall(r"\b(19\d{2}|20\d{2})\b", tf)
+    if years:
+        cj["timeframe"] = " vs ".join(sorted(set(years)))
+    else:
+        cj["timeframe"] = "NOT READABLE"
+
+    # 2) Categorie: rimuovi qualificatori sospetti
+    cats = cj.get("categories_it", [])
+    if isinstance(cats, list):
+        cleaned = []
+        for c in cats:
+            low = str(c).lower()
+            if " sud" in low or "south" in low:
+                continue
+            cleaned.append(c)
+        cj["categories_it"] = cleaned
+
+    return cj
+
+
+
+def generate_chart_analysis_it(chart_json: dict, page_text: str = "") -> str:
+    if not isinstance(chart_json, dict):
+        return ""
+    try:
+        payload = {
+            "vision_json": chart_json,
+            "page_text": (page_text or "")[:2500]
+        }
+        resp = chat(
+            model=LLM_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": CHART_ANALYST_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+            ],
+            # AGGIUNTO format='json' per evitare testo extra
+            format='json', 
+            options={"temperature": 0.1, "num_predict": 600, "num_ctx": 4096},
+        )
+        return (resp.get("message", {}).get("content", "") or "").strip()
+    except Exception as e:
+        print(f"   ⚠️ Chart Analysis Error: {e}")
+        return ""
+    
+    
+    
+MATH_CANDIDATE_PAT = re.compile(
+    r"(?i)("
+    r"formulae\s+sheet|"           # Keyword forte
+    r"maths\s+tables|"
+    r"cvss|risk\s+score|impact\s*[x×*]\s*likelihood|inherent\s+risk|residual\s+risk|rto|rpo|"
+    r"control\s+effectiveness|maturity\s+score|sla|severity\s+score|"
+    r"2c0d|"                       # <--- IL TUO ERRORE SPECIFICO (diventa trigger)
+    r"standard\s+deviation|likelihood|impact|exposure|"
+    r"[\u2200-\u22FF]|"            # Operatori matematici
+    r"[∑∏∫√=≈≠≤≥→↔∩∪∞±×÷]|"       # Simboli
+    r"[•–—˜]"                      # <--- SE VEDI SPAZZATURA, È MATEMATICA!
+    r")"
+)
+# 3. Pattern per Elementi Visuali (Bilingue)
+CHART_CANDIDATE_PAT = re.compile(
+    r"\b("
+    r"chart|graph|figure|plot|diagram|heatmap|risk matrix|control matrix|dashboard|flowchart|network diagram|architecture|timeline|asset inventory|axis|legend|"
+    r"grafico|grafica|figura|plot|diagramma|matrice rischi|matrice di rischio|matrice controlli|dashboard|cruscotto|flusso|rete|architettura|timeline|inventario asset|asse|legenda"
+    r")\b",
+    re.IGNORECASE
+)
+# Rileva parole che iniziano con la maiuscola (entità potenziali)
+_ENTITY_PROPER_NOUNS = re.compile(r'\b[A-Z][a-zà-ù]{1,}\b')
+
+def is_keyword_candidate_hybrid(text: str) -> bool:
+    """
+    Trigger bilanciato: abbassiamo la soglia di attivazione per 
+    distribuire i nodi su più chunk.
+    """
+    if not text or len(text) < 300: # Soglia minima più bassa
+        return False
+    
+    clean_text = safe_normalize_text(text)
+    
+    # Cerchiamo almeno 1 nome proprio E 1 keyword assessment/compliance
+    # oppure almeno 3 keyword assessment/tecniche totali
+    proper_nouns = set(_ENTITY_PROPER_NOUNS.findall(clean_text))
+    assessment_keywords = set(_KG_PAT.findall(clean_text))
+
+    if (len(proper_nouns) >= 1 and len(assessment_keywords) >= 1) or len(assessment_keywords) >= 3:
+        return True
+    
+    return False
+
+
+
+def is_keyword_candidate(text: str) -> bool:
+    """Valida se il chunk contiene concetti chiave per il Knowledge Graph."""
+    if not text or len(text) < KG_MIN_LEN: #
+        return False
+    return bool(_KG_PAT.search(text)) #
+
+def is_formula_candidate_page(page_text: str) -> bool:
+    """Valida se la pagina contiene elementi matematici per la Vision."""
+    return bool(page_text and MATH_CANDIDATE_PAT.search(page_text)) #
+
+def is_chart_candidate_page(page_text: str) -> bool:
+    """Valida se la pagina contiene riferimenti visivi (grafici/tabelle)."""
+    return bool(page_text and CHART_CANDIDATE_PAT.search(page_text)) #
+
+
+# TIME CHECKER START
+def _ms(t0: float) -> int:
+    return int((time.time() - t0) * 1000)
+
+def log_phase(filename: str, label: str, ms: int):
+    print(f"   ⏱️ {filename} | {label}: {ms} ms")
+# TIME CHECKER END
+
+
+# =========================
+# Postgres helpers
+# =========================
+def pg_get_conn():
+    return pg_pool.getconn()
+
+def pg_put_conn(conn):
+    pg_pool.putconn(conn)
+
+def pg_start_log(source_name: str, source_type: str) -> int:
+    conn = pg_get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ingestion_logs (source_name, source_type, ingestion_ts, status) "
+                "VALUES (%s, %s, NOW(), %s) RETURNING log_id",
+                (source_name, source_type, "RUNNING")
+            )
+            log_id = cur.fetchone()[0]
+        conn.commit()
+        return log_id
+    finally:
+        pg_put_conn(conn)
+
+def pg_close_log(log_id: int, status: str, total_chunks: int, processing_ms: int, error_msg: str = None):
+    conn = pg_get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ingestion_logs SET status = %s, total_chunks = %s, processing_time_ms = %s, error_message = %s "
+                "WHERE log_id = %s",
+                (status, total_chunks, processing_ms, error_msg, log_id)
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        pg_put_conn(conn)
+
+def pg_get_image_by_hash(image_hash: str, cur) -> Optional[Tuple[int, str]]:
+    cur.execute(
+        "SELECT image_id, description_ai FROM ingestion_images WHERE image_hash = %s LIMIT 1",
+        (image_hash,)
+    )
+    return cur.fetchone()
+
+def pg_save_image(log_id: int, image_bytes: bytes, mime_type: str, description: str, cur) -> int:
+    img_hash = sha256_hex(image_bytes)
+    cached = pg_get_image_by_hash(img_hash, cur)
+    if cached:
+        return cached[0]
+    cur.execute(
+        "INSERT INTO ingestion_images (log_id, image_data, image_hash, mime_type, description_ai, ingestion_ts) "
+        "VALUES (%s, %s, %s, %s, %s, NOW()) RETURNING image_id",
+        (log_id, psycopg2.Binary(image_bytes), img_hash, mime_type, description)
+    )
+    return cur.fetchone()[0]
+
+
+def flush_postgres_chunks_batch(batch_data: List[Tuple]):
+    if not batch_data:
+        return
+
+    now = time.strftime('%Y-%m-%d %H:%M:%S')
+
+    # batch_data è costruito così:
+    # (
+    #   log_id,
+    #   chunk_index,
+    #   toon_type,
+    #   content_raw,
+    #   content_semantic,
+    #   metadata_json,
+    #   chunk_uuid
+    # )
+    rows = [row + (now,) for row in batch_data]
+
+    chunk_uuids = []
+    seen = set()
+
+    for row in batch_data:
+        if len(row) < 7:
+            continue
+
+        chunk_uuid = str(row[6]).strip()
+
+        if chunk_uuid and chunk_uuid not in seen:
+            seen.add(chunk_uuid)
+            chunk_uuids.append(chunk_uuid)
+
+    conn = pg_get_conn()
+
+    try:
+        with conn.cursor() as cur:
+            # 1) Dedup applicativa compatibile con TimescaleDB.
+            # Non richiede UNIQUE(chunk_uuid), quindi evita l'errore TS103.
+            if chunk_uuids:
+                execute_values(
+                    cur,
+                    """
+                    WITH doomed(chunk_uuid) AS (
+                        VALUES %s
+                    )
+                    DELETE FROM public.document_chunks d
+                    USING doomed
+                    WHERE d.chunk_uuid::text = doomed.chunk_uuid::text;
+                    """,
+                    [(u,) for u in chunk_uuids]
+                )
+
+            # 2) Inserimento nuova versione corrente dei chunk.
+            execute_values(
+                cur,
+                """
+                INSERT INTO public.document_chunks (
+                    log_id,
+                    chunk_index,
+                    toon_type,
+                    content_raw,
+                    content_semantic,
+                    metadata_json,
+                    chunk_uuid,
+                    ingestion_ts
+                )
+                VALUES %s
+                """,
+                rows
+            )
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        print(f"   ⚠️ Postgres Batch Error: {e}")
+
+    finally:
+        pg_put_conn(conn)
+
+
+# =========================
+# Qdrant helpers
+# =========================
+def get_embedding_dimension_safe(model) -> int:
+    """
+    Compatibilità SentenceTransformer:
+    - versioni nuove: get_embedding_dimension()
+    - versioni vecchie: get_sentence_embedding_dimension()
+    """
+    if hasattr(model, "get_embedding_dimension"):
+        return int(model.get_embedding_dimension())
+
+    return int(model.get_sentence_embedding_dimension())
+
+
+def ensure_qdrant_collection():
+    dim = get_embedding_dimension_safe(embedder)
+
+    try:
+        info = qdrant_client.get_collection(QDRANT_COLLECTION)
+
+        if info.config.params.vectors.size != dim:
+            print(f"⚠️ Vector dim mismatch! {info.config.params.vectors.size} vs {dim}")
+
+    except Exception:
+        print(f"🆕 Creating Qdrant collection '{QDRANT_COLLECTION}' (dim={dim})")
+
+        qdrant_client.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=models.VectorParams(
+                size=dim,
+                distance=models.Distance.COSINE,
+            ),
+        )
+
+NEO4J_BATCH_QUERY = """
+UNWIND $rows AS r
+
+// 1) Documento (Isolato)
+MERGE (d:Document {doc_id: r.doc_id})
+SET d.filename = r.filename,
+    d.doc_type = r.doc_type,
+    d.log_id = r.log_id,
+    d.ingested_at = datetime()
+
+// 2) Pagina (Isolata)
+WITH d, r
+MERGE (p:Page {pid: r.doc_id + "::" + toString(r.page_no)})
+SET p.doc_id = r.doc_id,
+    p.page_no = r.page_no
+MERGE (d)-[:HAS_PAGE]->(p)
+
+// 3) Chunk (Isolato)
+WITH p, r
+MERGE (c:Chunk {id: r.chunk_id})
+SET c.chunk_id = r.chunk_id,
+    c.chunk_index = r.chunk_index,
+    c.toon_type = r.toon_type,
+    c.page = r.page_no,
+    c.filename = r.filename,
+    c.text = left(r.text_sem, 1000), 
+    c.section_hint = coalesce(r.section_hint, ""),
+    c.ontology = r.ontology
+MERGE (p)-[:HAS_CHUNK]->(c)
+
+// 4) Entità (GLOBALI E CONDIVISE TRA DOCUMENTI)
+WITH r, c
+UNWIND coalesce(r.nodes, []) AS n
+WITH n, c, r
+WHERE n.id IS NOT NULL AND n.id <> ""
+
+MERGE (e:Entity {id: n.id})
+ON CREATE SET 
+    e.name = n.id,
+    e.category = CASE WHEN n.category IS NOT NULL AND n.category <> 'UNCLASSIFIED' THEN n.category ELSE 'UNCLASSIFIED' END,
+    e.sources = [r.filename_norm]
+ON MATCH SET 
+    e.category = CASE WHEN n.category IS NOT NULL AND n.category <> 'UNCLASSIFIED' THEN n.category ELSE e.category END,
+    // Se il file non è già nella lista dei sorgenti, aggiungilo all'array
+    e.sources = CASE WHEN r.filename_norm IN coalesce(e.sources, []) THEN coalesce(e.sources, []) ELSE coalesce(e.sources, []) + r.filename_norm END
+SET e += coalesce(n.props, {})
+
+// Il collegamento tra l'entità globale e il pezzetto di testo isolato
+MERGE (e)-[:PRESENT_IN]->(c)
+"""
+
+# Formula nodes deterministici
+NEO4J_FORMULA_QUERY = """
+UNWIND $rows AS r
+MATCH (c:Chunk {id: r.chunk_id})
+MERGE (f:Formula {fid: r.fid})
+SET f.latex = r.latex, 
+    f.latex_raw = r.latex_raw,  // Salvataggio del dato puro
+    f.plain = r.plain, 
+    f.meaning_it = r.meaning_it, 
+    f.keywords = r.keywords,
+    f.page = r.page_no, 
+    f.source = r.filename
+MERGE (f)-[:MENTIONED_IN]->(c)
+"""
+
+def _flat_props(props) -> Dict[str, Any]:
+    if not isinstance(props, dict):
+        return {}
+    out = {}
+    for k, v in props.items():
+        if isinstance(v, (str, int, float, bool)):
+            out[k[:60]] = v
+        elif isinstance(v, list) and len(v) <= 12 and all(isinstance(x, (str, int, float, bool)) for x in v):
+            out[k[:60]] = v
+    return out
+
+def _clean_type(t: str) -> str:
+    t = (t or "").strip()
+    t = re.sub(r"[^a-zA-Z0-9]", "", t[:60].capitalize())
+    return t[:50] or "Entity"
+
+def _clean_rel(r: str) -> str:
+    r = (r or "").strip().upper()
+    r = re.sub(r"[^A-Z0-9_]+", "_", r)
+    r = re.sub(r"_+", "_", r).strip("_")
+    return r[:50] or "RELATED_TO"
+
+def canonicalize_edges(edges: list[dict]) -> list[dict]:
+    """
+    Canonicalizza relation types senza whitelist linguistica:
+    - se esiste sia BASE che BASE_SUFFIX nello stesso batch di edges,
+      collassa BASE_SUFFIX -> BASE e salva suffix in props["qualifier"].
+    """
+    if not edges:
+        return edges
+
+    # set dei relation type presenti (già puliti da _clean_rel)
+    rel_types = set((e.get("relation") or "").strip().upper() for e in edges if e.get("relation"))
+
+    out = []
+    for e in edges:
+        rel = (e.get("relation") or "").strip().upper()
+        if not rel or "_" not in rel:
+            out.append(e)
+            continue
+
+        base, suffix = rel.rsplit("_", 1)
+
+        # guardrail: base non troppo corto e suffix ragionevole
+        if base in rel_types and len(base) >= 8 and 1 <= len(suffix) <= 12:
+            ee = dict(e)
+            ee["relation"] = base
+            props = dict(ee.get("props") or {})
+            props.setdefault("raw_relation", rel)
+            props.setdefault("qualifier", suffix)
+            ee["props"] = props
+            out.append(ee)
+        else:
+            out.append(e)
+
+    return out
+
+def _as_str(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x.strip()
+    return str(x).strip()
+
+
+def _as_str_list(x) -> list[str]:
+    if not x:
+        return []
+    if isinstance(x, list):
+        return [str(v).strip() for v in x if str(v).strip()]
+    if isinstance(x, str):
+        return [x.strip()] if x.strip() else []
+    return []
+
+
+def _normalize_graph_schema(js: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalizza output KG flat:
+    - nodi con description/formula/synonyms in props
+    - archi con evidence in props
+    - compatibile con Neo4j Entity generico
+    """
+    if not isinstance(js, dict):
+        if isinstance(js, list):
+            js = {"nodes": js, "edges": []}
+        else:
+            return None
+
+    g = dict(js)
+
+    nnodes = []
+    for n in (g.get("nodes") or g.get("entities") or []):
+        if not isinstance(n, dict):
+            continue
+
+        nid = n.get("id") or n.get("name") or n.get("label")
+        if not nid:
+            continue
+
+        category = _as_str(n.get("category") or n.get("type") or "UNCLASSIFIED").upper()
+
+        props = {}
+        props["description"] = _as_str(n.get("description"))
+        props["formula"] = _as_str(n.get("formula"))
+        props["synonyms"] = _as_str_list(n.get("synonyms"))
+
+        # preserva eventuali props già presenti
+        raw_props = n.get("props") or n.get("properties") or {}
+        if isinstance(raw_props, dict):
+            for k, v in raw_props.items():
+                if k in props:
+                    continue
+                if isinstance(v, (str, int, float, bool)):
+                    props[k[:60]] = v
+                elif isinstance(v, list) and all(isinstance(x, (str, int, float, bool)) for x in v):
+                    props[k[:60]] = v
+
+        node_out = {
+            "id": _as_str(nid),
+            "category": category,
+            "props": props
+        }
+
+        nnodes.append(node_out)
+
+    g["nodes"] = nnodes
+
+    eedges = []
+    for e in (g.get("edges") or g.get("relationships") or []):
+        if not isinstance(e, dict):
+            continue
+
+        src = e.get("source") or e.get("from")
+        tgt = e.get("target") or e.get("to")
+        rel = e.get("relation") or e.get("type") or "RELATED_TO"
+
+        if not src or not tgt:
+            continue
+
+        props = {}
+
+        evidence = e.get("evidence")
+        if evidence:
+            props["evidence"] = _as_str(evidence)
+
+        raw_props = e.get("props") or e.get("properties") or {}
+        if isinstance(raw_props, dict):
+            for k, v in raw_props.items():
+                if isinstance(v, (str, int, float, bool)):
+                    props[k[:60]] = v
+                elif isinstance(v, list) and all(isinstance(x, (str, int, float, bool)) for x in v):
+                    props[k[:60]] = v
+
+        edge_out = {
+            "source": _as_str(src),
+            "target": _as_str(tgt),
+            "relation": _as_str(rel).upper(),
+            "props": props
+        }
+
+        eedges.append(edge_out)
+
+    g["edges"] = eedges
+    return g
+
+
+def _sanitize_graph(graph_data: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Passa i dati a Neo4j con controlli antiproiettile contro le allucinazioni dell'LLM."""
+    if not isinstance(graph_data, dict): return [], []
+    
+    nodes = []
+    seen = set()
+    for n in graph_data.get("nodes", []):
+        # 🔥 FIX ANTI-CRASH: Se l'LLM allucina una stringa invece di un oggetto, saltala
+        if not isinstance(n, dict): continue  
+        
+        nid = n.get("id")
+        if not nid or str(nid) in seen: continue
+        seen.add(str(nid))
+        nodes.append({
+            "id": str(nid)[:200],
+            "category": str(n.get("category", "UNCLASSIFIED"))[:50],
+            "props": n.get("props", {})
+        })
+        
+    edges = []
+    for e in graph_data.get("edges", []):
+        # 🔥 FIX ANTI-CRASH: Protezione per gli archi
+        if not isinstance(e, dict): continue  
+        
+        src = e.get("source")
+        tgt = e.get("target")
+        if not src or not tgt: continue
+        edges.append({
+            "source": str(src)[:200],
+            "target": str(tgt)[:200],
+            "relation": str(e.get("relation", "RELATED_TO"))[:50],
+            "props": e.get("props", {})
+        })
+        
+    return nodes[:80], edges[:100]
+
+def enrich_formula_nodes_and_edges(nodes: list[dict], edges: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Se un nodo concettuale contiene props.formula, crea anche:
+    - un nodo FORMULA dedicato
+    - un edge concetto -> formula con HAS_FORMULA
+
+    Esempio:
+    CVSS Base Score
+      props.formula = "CVSS = f(Impact, Exploitability)"
+    diventa anche:
+      (:Entity {id:"Formula::CVSS Base Score"})
+      (:Entity)-[:HAS_FORMULA]->(:Entity)
+    """
+    if not nodes:
+        return nodes, edges
+
+    existing_ids = {n.get("id") for n in nodes if isinstance(n, dict)}
+    existing_edges = {
+        (e.get("source"), e.get("target"), e.get("relation"))
+        for e in edges
+        if isinstance(e, dict)
+    }
+
+    new_nodes = []
+    new_edges = []
+
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+
+        nid = n.get("id")
+        cat = str(n.get("category", "") or "").upper()
+        props = n.get("props") or {}
+        formula = str(props.get("formula", "") or "").strip()
+
+        if not nid or not formula:
+            continue
+
+        # Se il nodo è già FORMULA, non duplicare.
+        if cat == "FORMULA":
+            continue
+
+        fid = f"Formula::{nid}"
+
+        if fid not in existing_ids:
+            new_nodes.append({
+                "id": fid,
+                "category": "FORMULA",
+                "props": {
+                    "description": f"Formula associata a {nid}",
+                    "formula": formula,
+                    "synonyms": []
+                }
+            })
+            existing_ids.add(fid)
+
+        edge_key = (nid, fid, "HAS_FORMULA")
+        if edge_key not in existing_edges:
+            new_edges.append({
+                "source": nid,
+                "target": fid,
+                "relation": "HAS_FORMULA",
+                "props": {
+                    "evidence": "Formula estratta dal testo e associata al concetto."
+                }
+            })
+            existing_edges.add(edge_key)
+
+    return nodes + new_nodes, edges + new_edges
+
+
+def flush_neo4j_rows_batch(rows: List[Dict[str, Any]]):
+    if not NEO4J_ENABLED or not rows:
+        return
+    
+    try:
+        with neo4j_driver.session() as session:
+            # A. Inserimento Struttura e Nodi
+            session.run(NEO4J_BATCH_QUERY, rows=rows)
+
+            # B. Inserimento Relazioni Native (Raggruppate per Tipo)
+            edges_by_type = {}
+            for r in rows:
+                for edge in r.get("edges", []):
+                    rel_type = edge.get("relation", "RELATES_TO").upper().replace(" ", "_")
+                    rel_type = "".join(c for c in rel_type if c.isalnum() or c == "_")
+                    
+                    if not rel_type:
+                        continue
+                        
+                    if rel_type not in edges_by_type:
+                        edges_by_type[rel_type] = []
+                    
+                    edges_by_type[rel_type].append({
+                        "source": edge.get("source"),
+                        "target": edge.get("target"),
+                        # 🚀 FIX: Usa 'props' invece di 'properties' per non perdere i dati dell'arco
+                        "props": edge.get("props", {}) 
+                    })
+
+            # Eseguiamo query specifiche per tipo di verbo
+            for rel_type, edges in edges_by_type.items():
+                edge_query = f"""
+                UNWIND $batch AS e
+                MATCH (s:Entity {{id: e.source}})
+                MATCH (t:Entity {{id: e.target}})
+                MERGE (s)-[r:{rel_type}]->(t)
+                SET r += coalesce(e.props, {{}}),
+                    r.last_seen = datetime(),
+                    r.count = coalesce(r.count, 0) + 1
+                """
+                session.run(edge_query, batch=edges)
+
+    except Exception as e:
+        print(f"   ⚠️ Neo4j Batch Error: {e}")
+
+
+def flush_neo4j_formulas_batch(rows: List[Dict[str, Any]]):
+    if not NEO4J_ENABLED or not rows:
+        return
+    try:
+        with neo4j_driver.session() as session:
+            session.run(NEO4J_FORMULA_QUERY, rows=rows)
+    except Exception as e:
+        print(f"   ⚠️ Neo4j Formula Batch Error: {e}")
+
+
+# =========================
+# LLM / Vision
+# =========================
+def llm_chat(prompt: str, text: str, model: str, max_tokens: int = LLM_MAX_TOKENS) -> str:
+    """
+    Chiamata testuale a Ollama usata soprattutto per KG extraction.
+    Usa HTTP /api/chat con timeout reale, così lo script non resta appeso
+    se Ollama non risponde.
+    """
+    return ollama_chat_http(
+        model=model,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text},
+        ],
+        options={
+            "temperature": LLM_TEMPERATURE,
+            "num_predict": int(max_tokens) if max_tokens is not None else LLM_MAX_TOKENS,
+        },
+        response_format_json=False,
+        timeout_s=OLLAMA_KG_TIMEOUT_S,
+    )
+
+
+# ==============================================================================
+# API CALLER (OLLAMA NATIVE - MINISTRAL OPTIMIZED)
+# ==============================================================================
+# Assicurati di avere in cima al file: from ollama import chat, ChatResponse
+
+# ==============================================================================
+# API CALLER (OLLAMA NATIVE LIBRARY)
+# ==============================================================================
+# Assicurati di avere l'import in alto: from ollama import chat, ChatResponse
+
+# ---- Ollama global lock ----
+# Serializza TUTTE le chiamate a Ollama:
+# - Vision-to-Markdown
+# - KG extraction
+# - eventuali chiamate chat/generate
+#
+# Serve perché con OLLAMA_NUM_PARALLEL=1 e GPU singola P5000,
+# producer e consumer non devono chiamare Ollama contemporaneamente.
+OLLAMA_CALL_LOCK = Lock()
+
+OLLAMA_API_GENERATE = os.getenv(
+    "OLLAMA_API_GENERATE",
+    "http://127.0.0.1:11434/api/generate"
+)
+
+OLLAMA_API_CHAT = os.getenv(
+    "OLLAMA_API_CHAT",
+    "http://127.0.0.1:11434/api/chat"
+)
+
+# Timeout separati: evitano che una singola chiamata Ollama sembri bloccare tutta l'ingestion.
+OLLAMA_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT_S", "240"))
+OLLAMA_VISION_TIMEOUT_S = int(os.getenv("OLLAMA_VISION_TIMEOUT_S", str(OLLAMA_TIMEOUT_S)))
+OLLAMA_KG_TIMEOUT_S = int(os.getenv("OLLAMA_KG_TIMEOUT_S", "180"))
+OLLAMA_RETRIES = int(os.getenv("OLLAMA_RETRIES", "1"))
+
+
+def ollama_chat_http(
+    *,
+    model: str,
+    messages: List[Dict[str, str]],
+    options: Optional[Dict[str, Any]] = None,
+    response_format_json: bool = False,
+    timeout_s: Optional[int] = None,
+) -> str:
+    """
+    Chiamata testuale Ollama con timeout reale via HTTP /api/chat.
+
+    Perché serve:
+    - ollama.chat() può rimanere appeso senza timeout visibile lato script;
+    - fut.result(timeout=...) non uccide il thread se la chiamata Ollama resta bloccata;
+    - con producer/consumer e P5000 è meglio serializzare tutte le chiamate LLM/Vision.
+    """
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": options or {},
+    }
+
+    if response_format_json:
+        payload["format"] = "json"
+
+    effective_timeout = int(timeout_s or OLLAMA_KG_TIMEOUT_S)
+    last_err = None
+
+    with OLLAMA_CALL_LOCK:
+        for attempt in range(OLLAMA_RETRIES + 1):
+            try:
+                r = requests.post(
+                    OLLAMA_API_CHAT,
+                    json=payload,
+                    timeout=effective_timeout,
+                )
+                r.raise_for_status()
+
+                data = r.json() or {}
+                msg = data.get("message") or {}
+                return (msg.get("content") or "").strip()
+
+            except Exception as e:
+                last_err = e
+                sleep_s = min(3.0, 0.75 * (attempt + 1))
+                print(
+                    f"   ⚠️ Ollama chat retry {attempt + 1}/{OLLAMA_RETRIES + 1} "
+                    f"| model={model} | err={e}"
+                )
+                time.sleep(sleep_s)
+
+    print(f"   ❌ Ollama chat failed | model={model} | err={last_err}")
+    return ""
+
+
+def llm_chat_multimodal(
+    prompt: str,
+    image_bytes: bytes,
+    model: str,
+    max_tokens: int = 4000,
+    num_ctx: int = 4096,
+    response_format_json: bool = False,  # ✅ usa format="json"
+    force_json: Optional[bool] = None,   # ✅ ALIAS retro-compat (fix definitivo)
+) -> str:
+    """
+    Vision via Ollama /api/generate (robusto).
+    - max_tokens -> options.num_predict
+    - timeout + retry
+    - lock per evitare deadlock con Vision in parallelo
+    - response_format_json: usa format='json' per forzare JSON valido
+    - force_json: alias compatibile con chiamate già presenti nel codice
+    """
+    if not image_bytes:
+        return ""
+
+    # ✅ alias: se qualcuno chiama force_json=True, lo mappiamo su response_format_json
+    if force_json is not None:
+        response_format_json = bool(force_json)
+
+    try:
+        img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    except Exception as e:
+        print(f"   ❌ Base64 encode error: {e}")
+        return ""
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "images": [img_b64],
+        "options": {
+            "temperature": 0.0,
+            "num_ctx": int(num_ctx),
+            "num_predict": int(max_tokens) if max_tokens is not None else 4000,
+        },
+        "stream": False,
+    }
+
+    # ✅ forza JSON lato Ollama (riduce drasticamente parse-fail)
+    if response_format_json:
+        payload["format"] = "json"
+
+    with OLLAMA_CALL_LOCK:
+        last_err = None
+
+        for attempt in range(OLLAMA_RETRIES + 1):
+            try:
+                r = requests.post(
+                    OLLAMA_API_GENERATE,
+                    json=payload,
+                    timeout=OLLAMA_VISION_TIMEOUT_S,
+                )
+                r.raise_for_status()
+
+                data = r.json() or {}
+                return data.get("response", "") or ""
+
+            except Exception as e:
+                last_err = e
+                sleep_s = min(3.0, 0.75 * (attempt + 1))
+                time.sleep(sleep_s)
+
+        print(f"   ⚠️ Vision generate failed (model={model}): {last_err}")
+        return ""
+
+
+def _downscale_and_compress_for_vision(
+    img_bytes: bytes,
+    max_side: int = 1800,
+    jpeg_quality: int = 92,
+    output_format: str = "PNG",   # ✅ CHART: PNG = testo più nitido
+) -> bytes:
+    """
+    Prepara immagini per Vision mantenendo il testo leggibile.
+    - PNG consigliato per grafici (etichette piccole).
+    - JPEG ok per foto, ma può "impastare" le scritte.
+    """
+    try:
+        from PIL import Image
+        import io
+
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h = img.size
+
+        scale = min(1.0, max_side / max(w, h))
+        if scale < 1.0:
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+        buf = io.BytesIO()
+        fmt = (output_format or "PNG").upper().strip()
+
+        if fmt == "JPEG" or fmt == "JPG":
+            img.save(buf, format="JPEG", quality=int(jpeg_quality), optimize=True)
+        else:
+            # ✅ PNG: preserva edge e testo
+            img.save(buf, format="PNG", optimize=True)
+
+        return buf.getvalue()
+    except Exception:
+        return img_bytes
+
+
+
+def ocr_extract_text(img_bytes: bytes) -> str:
+    """
+    Deterministic OCR used ONLY to assist Vision on titles/sources.
+    No hallucinations possible here.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+
+        img = Image.open(io.BytesIO(img_bytes))
+        text = pytesseract.image_to_string(img, lang="ita+eng")
+        return normalize_ws(text)
+    except Exception:
+        return ""
+
+def render_full_page_png(page_obj, dpi: int = 200) -> bytes:
+    """
+    Render pagina PDF in PNG (migliore per formule e testo fine).
+    """
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page_obj.get_pixmap(matrix=mat, alpha=False)
+    return pix.tobytes("png")
+
+
+def render_full_page_jpeg(page: fitz.Page, dpi: int = VISION_DPI) -> bytes:
+    pix = page.get_pixmap(dpi=dpi, alpha=False)
+    return pix.tobytes("jpg")
+
+# --- Vision cache (in-memory) ---
+# chiave: sha256(image_bytes) / valore: json vision
+_vision_cache: Dict[str, Dict[str, Any]] = {}
+_vision_cache_order: List[str] = []
+
+def _vision_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    return _vision_cache.get(key)
+
+def _vision_cache_put(key: str, val: Dict[str, Any]):
+    if key in _vision_cache:
+        return
+    _vision_cache[key] = val
+    _vision_cache_order.append(key)
+    if len(_vision_cache_order) > VISION_CACHE_MAX:
+        old = _vision_cache_order.pop(0)
+        _vision_cache.pop(old, None)
+
+
+def extract_formulas_vision(img_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Estrazione Formule V3: Supersampling + PNG per pedici nitidi.
+    """
+    if not img_bytes:
+        return None
+
+    # 1. UPSCALING AGGRESSIVO (Fondamentale per i vettoriali renderizzati)
+    # 2400px garantisce che un pedice 'i' sia leggibile.
+    # PNG è obbligatorio: il JPEG 'sbaverebbe' le linee sottili delle frazioni.
+    vbytes = _downscale_and_compress_for_vision(
+        img_bytes, 
+        max_side=2400,    # <--- AUMENTATO DA 1600
+        output_format="PNG", 
+        jpeg_quality=100
+    )
+    
+    key = sha256_hex(vbytes) + "::formula_latex_v3_highres"
+    cached = _vision_cache_get(key)
+    if cached:
+        return cached
+
+    try:
+        # Usa il nuovo prompt LaTeX-centrico
+        raw = llm_chat_multimodal(
+            FORMULA_VISION_PROMPT, 
+            vbytes, 
+            VISION_MODEL_NAME, 
+            max_tokens=1500, # Più token per formule lunghe
+            response_format_json=True
+        )
+        
+        js = safe_json_extract(raw)
+        if not js or ("formulas" not in js and "summary_it" not in js):
+            return None
+            
+        _vision_cache_put(key, js)
+        return js
+    except Exception as e:
+        print(f"   ⚠️ Formula Vision Error: {e}")
+        return None
+
+
+def normalize_chart_json_for_semantics(js: Dict[str, Any], page_no: int, context_hint: str = "") -> Dict[str, Any]:
+    """
+    Normalizza output Vision eterogeneo (V8 - Robustezza Totale).
+    Gestisce varianti di schema (value/values, category/labels) tipiche di Ministral/Qwen.
+    """
+    if not isinstance(js, dict):
+        return {}
+
+    out = dict(js)  # shallow copy
+
+    # ----------------------------
+    # Page Alignment
+    # ----------------------------
+    out["page_no"] = page_no
+
+    # ----------------------------
+    # Kind / Toon Type Inference
+    # ----------------------------
+    if not out.get("kind"):
+        # Se ci sono dati strutturati e assi, è probabilmente un grafico a barre
+        if out.get("data_points") and (out.get("x-axis_labels") or out.get("x_axis_labels")):
+            out["kind"] = "bar_chart"
+        else:
+            out["kind"] = out.get("toon_type") or "immagine"
+
+    # Uniformiamo toon_type per il downstream (Neo4j/Postgres)
+    out["toon_type"] = "immagine"
+
+    # ----------------------------
+    # Timeframe Auto-Detection
+    # ----------------------------
+    tf = out.get("timeframe")
+    if not tf or str(tf).strip() in ("", "NOT READABLE", "None"):
+        # Se timeframe è vuoto, cerca anni nelle etichette dell'asse X
+        xlab = out.get("x-axis_labels") or out.get("x_axis_labels") or out.get("xAxis") or []
+        if isinstance(xlab, (list, tuple)):
+            years = []
+            for v in xlab:
+                years += re.findall(r"\b(19\d{2}|20\d{2})\b", str(v))
+            years = list(dict.fromkeys(years))  # unique preserving order
+            if len(years) >= 2:
+                out["timeframe"] = f"{years[0]} vs {years[-1]}"
+            elif len(years) == 1:
+                out["timeframe"] = years[0]
+
+    # ----------------------------
+    # Confidence Score Calculation
+    # ----------------------------
+    conf = out.get("confidence", None)
+    try:
+        conf = float(conf) if conf is not None else None
+    except Exception:
+        conf = None
+
+    if conf is None:
+        # Euristica: calcola un punteggio basato sulla completezza dei dati
+        score = 0.25
+        if out.get("title"): score += 0.15
+        if out.get("source"): score += 0.10
+        if out.get("unit_of_measure"): score += 0.05
+
+        dps = out.get("data_points") or out.get("numbers") or []
+        if isinstance(dps, list):
+            if len(dps) >= 2: score += 0.25
+            if len(dps) >= 4: score += 0.10
+
+        tf2 = out.get("timeframe") or ""
+        if re.findall(r"\b(19\d{2}|20\d{2})\b", str(tf2)):
+            score += 0.10
+
+        # Clamp tra 0.0 e 0.95
+        conf = max(0.0, min(0.95, score))
+
+    out["confidence"] = conf
+
+    # ----------------------------
+    # Text Fields Defaults
+    # ----------------------------
+    if not out.get("what_is_visible_it"):
+        title = str(out.get("title") or "").strip()
+        uom = str(out.get("unit_of_measure") or "").strip()
+        out["what_is_visible_it"] = (
+            f"Grafico/immagine informativa. Titolo: {title}."
+            + (f" Unità di misura: {uom}." if uom else "")
+        ).strip()
+
+    if not out.get("observations_it"):
+        # Se c'è una descrizione in inglese, la usiamo come osservazione
+        vtd = out.get("visual_trend_description")
+        if vtd:
+            out["observations_it"] = [str(vtd)]
+        else:
+            out["observations_it"] = []
+
+    if not out.get("analysis_it"):
+        out["analysis_it"] = ""
+
+    # ----------------------------
+    # Numbers Normalization (Legacy Sync + Robustness)
+    # ----------------------------
+    # Questa sezione popola 'numbers' (usato da parti legacy) usando 'data_points'
+    if not out.get("numbers"):
+        numbers = []
+        dps = out.get("data_points") or []
+        if isinstance(dps, list):
+            for dp in dps[:12]: # Limitiamo a 12 per evitare payload enormi
+                if isinstance(dp, dict):
+                    
+                    # --- FIX ROBUSTEZZA (Value/Values + Label/Category) ---
+                    # 1. Cattura valori singolari o plurali
+                    v_raw = dp.get("value") or dp.get("values")
+                    
+                    # 2. Cattura etichette in qualsiasi formato allucinato dal modello
+                    l_raw = (dp.get("category") or 
+                             dp.get("categories") or 
+                             dp.get("label") or 
+                             dp.get("labels") or 
+                             "")
+                    # ------------------------------------------------------
+
+                    numbers.append({
+                        "label": l_raw,
+                        "value": v_raw,
+                        "unit": out.get("unit_of_measure") or "",
+                        "period": out.get("timeframe") or ""
+                    })
+        out["numbers"] = numbers
+
+    return out
+
+
+def extract_chart_via_vision(img_bytes: bytes, context_hint: str = "") -> Optional[Dict[str, Any]]:
+    """
+    FIX 3 (definitivo):
+    - prepara immagine in PNG (testo più nitido)
+    - OCR su immagine migliore
+    - 2-pass retry se data_points sono pochi / NOT_READABLE
+    - sceglie automaticamente l'output "migliore" (più categorie, meno NOT_READABLE)
+    """
+    if not img_bytes:
+        return None
+
+    def _score_chart(js: Dict[str, Any]) -> int:
+        dps = js.get("data_points", [])
+        if not isinstance(dps, list):
+            return -9999
+        n = 0
+        bad = 0
+        for dp in dps:
+            if not isinstance(dp, dict):
+                continue
+            cat = str(dp.get("category", "") or "")
+            val = str(dp.get("value", "") or "")
+            if cat.strip():
+                n += 1
+            if "NOT_READABLE" in cat.upper() or "NOT_READABLE" in val.upper():
+                bad += 1
+        # più categorie = meglio; meno NOT_READABLE = meglio
+        return (n * 10) - (bad * 25)
+
+    # PAGE: prova a leggerla da context_hint tipo "... Page 2 ..."
+    page_no = 0
+    if context_hint:
+        m = re.search(r"\bpage\s+(\d+)\b", context_hint, re.I)
+        if m:
+            try:
+                page_no = int(m.group(1))
+            except Exception:
+                page_no = 0
+
+    # PASS 1 (PNG nitido)
+    vbytes1 = _downscale_and_compress_for_vision(img_bytes, max_side=1900, output_format="PNG")
+    key1 = sha256_hex(vbytes1) + "::chart_grounded_fix3_p1"
+    cached = _vision_cache_get(key1)
+    if cached:
+        return cached
+
+    ocr1 = ocr_extract_text(vbytes1)
+
+    prompt1 = CHART_DATA_PROMPT
+    if context_hint:
+        prompt1 += f"\n\nCONTEXT HINT: {context_hint[:600]}\n"
+    if ocr1:
+        prompt1 += f"\nVERIFIED OCR TEXT (Use as evidence): \"\"\"{ocr1[:1600]}\"\"\""
+
+    raw1 = llm_chat_multimodal(
+        prompt1, vbytes1, VISION_MODEL_NAME, max_tokens=2000, response_format_json=True
+    )
+    js1 = safe_json_extract(raw1)
+    if not isinstance(js1, dict):
+        js1 = {}
+
+    # Condizione retry: poche categorie o NOT_READABLE presenti
+    need_retry = True
+    if isinstance(js1.get("data_points", None), list):
+        dps1 = js1.get("data_points", [])
+        n1 = sum(1 for x in dps1 if isinstance(x, dict) and str(x.get("category", "")).strip())
+        has_bad = any(
+            "NOT_READABLE" in str(x.get("category", "")).upper() or "NOT_READABLE" in str(x.get("value", "")).upper()
+            for x in dps1 if isinstance(x, dict)
+        )
+        # se ho almeno 4 categorie leggibili e niente NOT_READABLE, ok
+        need_retry = (n1 < 4) or has_bad
+
+    # PASS 2 (più grande, istruzioni più “hard”)
+    js2 = {}
+    if need_retry:
+        vbytes2 = _downscale_and_compress_for_vision(img_bytes, max_side=2600, output_format="PNG")
+        ocr2 = ocr_extract_text(vbytes2)
+
+        prompt2 = CHART_DATA_PROMPT + """
+            SECOND PASS (IMPORTANT):
+            - You MUST list ALL categories visible (legend + bars/lines labels), even if some values are only estimates.
+            - If a category label is partially readable, return the best possible label instead of NOT_READABLE.
+            - Prefer OCR evidence for labels (countries/regions) and units.
+            """
+        if context_hint:
+            prompt2 += f"\n\nCONTEXT HINT: {context_hint[:600]}\n"
+        if ocr2:
+            prompt2 += f"\nVERIFIED OCR TEXT (Use as evidence): \"\"\"{ocr2[:2200]}\"\"\""
+
+        raw2 = llm_chat_multimodal(
+            prompt2, vbytes2, VISION_MODEL_NAME, max_tokens=2400, response_format_json=True
+        )
+        js2 = safe_json_extract(raw2)
+        if not isinstance(js2, dict):
+            js2 = {}
+
+    # scegli output migliore
+    best = js1 if _score_chart(js1) >= _score_chart(js2) else js2
+    if not isinstance(best, dict) or not best:
+        return None
+
+    # --- CLEANING (anni / geo) ---
+    tf = str(best.get("timeframe", "") or "")
+    years = re.findall(r"\b(19\d{2}|20\d{2})\b", tf)
+    if years:
+        best["timeframe"] = " vs ".join(sorted(set(years)))
+
+    bad_geo = [" sud", "south", " nord", "north"]
+    for dp in best.get("data_points", []) if isinstance(best.get("data_points", []), list) else []:
+        if not isinstance(dp, dict):
+            continue
+        cat = str(dp.get("category", "") or "")
+        for token in bad_geo:
+            if token in cat.lower():
+                dp["category"] = cat.lower().replace(token, "").capitalize().strip()
+
+    js_norm = normalize_chart_json_for_semantics(best, page_no=page_no, context_hint=context_hint)
+    js_norm["semantic_description"] = build_chart_semantic_chunk(page_no, js_norm)
+    js_norm["toon_type"] = "immagine"
+
+    _vision_cache_put(key1, js_norm)
+    return js_norm
+
+
+
+
+def to_text(x) -> str:
+    """Converte in stringa sicura (None, list annidate, dict)."""
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, (list, tuple, set)):
+        parts = [to_text(i) for i in x]
+        parts = [p.strip() for p in parts if p and str(p).strip()]
+        return "; ".join(parts)
+    if isinstance(x, dict):
+        # qui NON forziamo json.dumps per evitare output enorme, ma è ok usare str
+        return str(x)
+    return str(x)
+
+
+def build_chart_semantic_chunk(page_no: int, chart_json: Dict[str, Any], prefix: str = "VISUAL") -> str:
+    """
+    Versione V8: Ministral-Ready.
+    Accetta 'value' (singolare) e 'values' (plurale).
+    """
+    page_human = (page_no + 1) if isinstance(page_no, int) else page_no
+
+    if not isinstance(chart_json, dict):
+        return normalize_ws(f"--- ANALISI VISUALE - Pagina {page_human} ---\n[Dati non validi]")
+
+    title = to_text(chart_json.get("title", ""))
+    ctype = to_text(chart_json.get("chart_type", "Grafico"))
+    discriminators = to_text(chart_json.get("series_discriminators") or chart_json.get("series_legend", ""))
+    
+    lines = [f"--- ANALISI VISUALE ({ctype}) - Pagina {page_human} ---"]
+    if title: lines.append(f"Titolo: {title}")
+    if discriminators: lines.append(f"Legenda Serie: {discriminators}")
+
+    datap = chart_json.get("data_points") or []
+    if datap:
+        lines.append("\nDati Estratti:")
+        if not isinstance(datap, list): datap = [datap]
+        
+        for d in datap[:40]:
+            if isinstance(d, dict):
+                cat = to_text(d.get("category", ""))
+                
+                # --- FIX CRITICO PER MINISTRAL (Value vs Values) ---
+                # Cerca prima 'value', se vuoto cerca 'values', se vuoto stringa vuota
+                raw_val = d.get("value") or d.get("values") or ""
+                
+                if isinstance(raw_val, list):
+                    # Unisce lista [0.8, 5.5] -> "0.8, 5.5"
+                    val = ", ".join([str(v) for v in raw_val if v is not None])
+                else:
+                    # Pulisce stringa
+                    val = to_text(raw_val).replace("[", "").replace("]", "").replace("'", "")
+                # ---------------------------------------------------
+
+                vis_check = to_text(d.get("visual_check", ""))
+                check_str = f" ({vis_check})" if (vis_check and len(vis_check) < 80) else ""
+
+                if cat or val:
+                    lines.append(f" - {cat}: {val}{check_str}")
+
+    return normalize_ws("\n".join(lines))
+
+
+# =========================
+# Chunk builders
+# =========================
+def build_formula_semantic_chunk(page_no: int, formulas_json: Dict[str, Any]) -> str:
+    """
+    Crea un chunk ottimizzato per il RAG contenente spiegazioni e LaTeX puro.
+    FIX ROBUSTEZZA: Gestisce casi in cui 'latex' è una lista o dict invece di str.
+    """
+    formulas = (formulas_json or {}).get("formulas") or []
+    summary = (formulas_json or {}).get("summary_it") or ""
+    
+    if not formulas and not summary:
+        return ""
+
+    lines = [f"--- FORMULE E MODELLI MATEMATICI - Pagina {page_no} ---"]
+    if summary:
+        lines.append(f"Contenuto: {summary}\n")
+
+    for f in formulas:
+        desc = f.get("meaning_it") or f.get("description_it") or "Formula"
+        
+        # --- FIX QUI: Normalizzazione forzata a stringa ---
+        raw_latex = f.get("latex", "")
+        if isinstance(raw_latex, list):
+            # Se è una lista, uniamo gli elementi
+            latex_str = " ".join([str(x) for x in raw_latex])
+        elif isinstance(raw_latex, dict):
+            latex_str = str(raw_latex)
+        else:
+            latex_str = str(raw_latex)
+            
+        # Ora possiamo fare replace sicuro
+        latex = latex_str.replace("\\\\", "\\") 
+        # --------------------------------------------------
+        
+        vars_list = []
+        # Fix anche per variables se il modello impazzisce
+        raw_vars = f.get("variables", [])
+        if isinstance(raw_vars, list):
+            for v in raw_vars:
+                if isinstance(v, dict):
+                    vars_list.append(f"{v.get('name')}: {v.get('meaning')}")
+                elif isinstance(v, str):
+                    vars_list.append(v)
+        
+        vars_str = "; ".join(vars_list)
+        
+        # Blocco semantico: Concetto + LaTeX + Variabili
+        block = f"## {desc}\nModello (LaTeX): $${latex}$$\nVariabili: {vars_str}"
+        lines.append(block)
+
+    return "\n".join(lines).strip()
+
+
+# =========================
+# KG extraction (LLM) - ROBUST DEBUG & RETRY
+# =========================
+def llm_extract_kg(filename: str, page_no, text: str, model_name: str):
+    """
+    Estrazione KG Unificata e Pulita.
+    Schema FLAT ottimizzato per LLM 8B/9B.
+    """
+    base = os.path.basename(str(filename))
+    if not text or len(text) < 50:
+        return [], []
+
+    # UNICO PROMPT: FLAT SCHEMA
+    FLAT_KG_PROMPT = """You are an expert Compliance Auditor, Cybersecurity Analyst, and Data Engineer.
+
+CRITICAL DISAMBIGUATION RULES FOR NEO4J:
+- For generic parameters, assets, or rules, you MUST append the core topic of the current document in parentheses to the ID, e.g., "Firewall (Perimeter Security)" or "Backup (DRP)".
+- Do not create isolated generic nodes. Always disambiguate them.
+- Ensure each extracted entity is strictly relevant to IT security, risk management, or regulatory compliance.
+
+CRITICAL JSON SCHEMA REQUIREMENT:
+Every node object MUST contain EXACTLY these 5 keys. Missing keys will crash the system.
+1. "id": Entity name, concept, or technical control (e.g., "MFA", "ISO 27001", "Data Breach").
+2. "category": Chosen from the Taxonomy.
+3. "description": Brief definition EXTRACTED FROM THE TEXT (keep the original language of the text). NEVER copy the placeholder examples.
+4. "formula": If there is a strict technical rule or mathematical formula, extract it here. Otherwise, use an empty string "".
+5. "synonyms": Array of alternative names, acronyms, or translations explicitly present in the input text.
+
+TAXONOMY (Choose ONE for 'category'):
+- ORGANIZATION (e.g., Company, Department, Third-Party)
+- PERSON (e.g., CISO, DPO, Employee)
+- POLICY_OR_PROCEDURE (e.g., Password Policy, Incident Response Plan)
+- CONTROL (e.g., MFA, Firewall, Encryption, Backup)
+- RISK (e.g., Data Loss, Unauthorized Access, Cyber Attack)
+- EVIDENCE (e.g., Audit Log, Review Minutes, Vulnerability Scan)
+- ASSET (e.g., Server, Database, Workstation, Network)
+- REGULATION (e.g., GDPR, ISO 27001, NIS2, DORA)
+- CONCEPT (e.g., Confidentiality, Integrity, Business Continuity)
+
+RELATION VOCABULARY (Use ONLY these EXACT UPPERCASE relation types):
+- HIERARCHY / STRUCTURE: IS_A, PART_OF, HAS_COMPONENT, APPLIES_TO, BELONGS_TO
+- GOVERNANCE & COMPLIANCE: COMPLIES_WITH, VIOLATES, MANDATES, GOVERNS, APPROVES, REVIEWS
+- RISK & SECURITY: MITIGATES, THREATENS, EXPLOITS, PROTECTS, VULNERABLE_TO
+- PROCESS & AUDIT: IMPLEMENTS, GENERATES, VERIFIES, TESTS, REQUIRES, DEPENDS_ON
+
+GRAPH EXTRACTION RULES:
+1. Canonical node IDs: Use stable human-readable IDs. Prefer the canonical name used in the input text.
+2. Synonyms: Fill "synonyms" ONLY with alternative names or acronyms explicitly present in the input text (e.g., ["Disaster Recovery Plan", "DRP"]).
+3. Semantic edge density: Build a semantically useful graph. Every edge MUST be supported by evidence.
+4. Relation selection guide:
+   A) Use MITIGATES when a CONTROL reduces a RISK.
+   B) Use COMPLIES_WITH when a POLICY or CONTROL aligns with a REGULATION.
+   C) Use THREATENS or EXPLOITS when a RISK impacts an ASSET.
+   D) Use PROTECTS when a CONTROL defends an ASSET.
+   E) Use VERIFIES or TESTS when an EVIDENCE confirms a CONTROL.
+   F) Use MANDATES when a REGULATION requires a CONTROL or POLICY.
+
+5. Evidence: Provide an 'evidence' key for every edge explaining the connection. Keep the original language of the text.
+
+Return ONLY valid JSON. Example of EXACT expected format:
+{
+  "nodes": [
+    {
+      "id": "Multi-Factor Authentication",
+      "category": "CONTROL",
+      "description": "Controllo di sicurezza che richiede due o più metodi di verifica.",
+      "formula": "",
+      "synonyms": ["MFA"]
+    },
+    {
+      "id": "Data Breach",
+      "category": "RISK",
+      "description": "Accesso non autorizzato ai dati personali.",
+      "formula": "",
+      "synonyms": []
+    }
+  ],
+  "edges": [
+    {
+      "source": "Multi-Factor Authentication",
+      "target": "Data Breach",
+      "relation": "MITIGATES",
+      "evidence": "L'implementazione della MFA riduce significativamente il rischio di data breach."
+    }
+  ]
+}
+"""
+    
+    try:
+        # TENTATIVO 1: JSON MODE
+        raw_content = ollama_chat_http(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": FLAT_KG_PROMPT},
+                {"role": "user", "content": f"Extract entities and relations in JSON format from this text:\n\n{text[:3500]}"},
+            ],
+            options={
+                "temperature": 0.0,
+                "num_predict": 1800,
+                "num_ctx": 4096,
+            },
+            response_format_json=True,
+            timeout_s=OLLAMA_KG_TIMEOUT_S,
+        )
+        js = safe_json_extract(raw_content)
+
+        if not js or not isinstance(js, dict) or not js.get("nodes"):
+            raise ValueError("JSON incompleto o senza nodi")
+
+    except Exception as e:
+        print(f"   ⚠️ [KG-RETRY] Pag {page_no}: Fallito JSON mode. Riprovo in RAW mode...")
+        try:
+            # TENTATIVO 2: RAW MODE (Fallback robusto)
+            raw_content = ollama_chat_http(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": FLAT_KG_PROMPT + "\nIMPORTANT: Return ONLY raw JSON. No markdown blocks."},
+                    {"role": "user", "content": f"Extract entities and relations from this text:\n\n{text[:3000]}"},
+                ],
+                options={
+                    "temperature": 0.1,
+                    "num_predict": 1600,
+                    "num_ctx": 4096,
+                },
+                response_format_json=False,
+                timeout_s=OLLAMA_KG_TIMEOUT_S,
+            )
+            js = safe_json_extract(raw_content)
+
+            if not js or not isinstance(js, dict):
+                return [], []
+
+        except Exception as e2:
+            print(f"   ❌ [KG-ERR] Pag {page_no}: Fallimento totale ({e2})")
+            return [], []
+
+    # Filtriamo a monte qualsiasi allucinazione (stringhe al posto di dizionari)
+    raw_nodes = js.get("nodes", js.get("entities", []))
+    raw_edges = js.get("edges", js.get("relationships", []))
+    
+    nodes = [n for n in raw_nodes if isinstance(n, dict)]
+    edges = [e for e in raw_edges if isinstance(e, dict)]
+
+    # DEBUG RADAR
+    if nodes:
+        props_count = sum(1 for n in nodes if n.get("description") or n.get("formula"))
+        class_count = sum(1 for n in nodes if n.get("category") and n.get("category") != "UNCLASSIFIED")
+        print(f"   [DEBUG-KG] Pag {page_no}: {len(nodes)} nodi estratti -> {class_count} categorizzati, {props_count} con proprietà.")
+
+    return nodes, edges
+
+
+def extract_pdf_text_by_page_pdfminer(file_path: str) -> list[str]:
+    """
+    VERSIONE UPGRADE 3: Estrazione ottimizzata per velocità.
+    Utilizza LAParams minimi per evitare l'analisi complessa del layout.
+    """
+    if extract_pages is None or LTTextContainer is None:
+        return []
+
+    # LAParams ottimizzati: disabilitiamo il rilevamento verticale e 
+    # allarghiamo i margini per processare i blocchi di testo più velocemente.
+    fast_params = LAParams(
+        detect_vertical=False, 
+        all_texts=True, 
+        char_margin=2.0, 
+        line_margin=0.5,
+        word_margin=0.1
+    )
+    
+    pages: list[str] = []
+    try:
+        # L'argomento 'caching=True' è fondamentale per non ri-analizzare 
+        # le risorse comuni (font, immagini) ad ogni cambio pagina.
+        for layout in extract_pages(file_path, laparams=fast_params, caching=True):
+            # Usiamo una list comprehension per una raccolta dei chunk più rapida
+            chunks = [element.get_text() for element in layout if isinstance(element, LTTextContainer)]
+            pages.append("".join(chunks))
+    except Exception as e:
+        print(f"   ⚠️ PDFMiner Extraction Error: {e}")
+        return []
+
+    return pages
+
+
+# ==============================================================================
+# HELPER: CHUNKING RICORSIVO (Text Splitter)
+# ==============================================================================
+def recurse_text_chunking(text: str, base_meta: Dict[str, Any], max_chars: int = 1200) -> List[Dict[str, Any]]:
+    """
+    Versione Ottimizzata: Aumentata la soglia max_chars a 1200 (da 1000)
+    per ridurre il numero totale di nodi e chunk.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    # CASO BASE: Aumentiamo la tolleranza per non spezzare troppo
+    if len(text) <= max_chars + 200: 
+        source = base_meta.get("source", "unknown")
+        p_no = base_meta.get("page", 0)
+        
+        # Ridotto l'header: rimosso il nome file che è già nei metadati 
+        # per risparmiare token e ridurre la ripetitività nel testo semantico.
+        sem_header = f"PAG. {p_no}" 
+        
+        meta_final = base_meta.copy()
+        if "metadata_override" in base_meta:
+            del meta_final["metadata_override"]
+            meta_final.update(base_meta["metadata_override"])
+
+        return [{
+            "text_raw": text,
+            "text_sem": f"{sem_header}: {text}",
+            "page_no": p_no,
+            "toon_type": base_meta.get("type", "text"),
+            "section_hint": "content",
+            "image_id": base_meta.get("original_image_id"),
+            "metadata_override": meta_final
+        }]
+    
+    # ... resto della logica ricorsiva ...
+    # LOGICA RICORSIVA: Il testo è troppo lungo
+    chunks = []
+    
+    # 1. Gerarchia separatori (dal più forte al più debole)
+    separators = ["\n\n", "\n", ". ", " "]
+    split_char = ""
+    
+    for sep in separators:
+        if sep in text:
+            # Verifica euristica: se splittiamo qui, otteniamo pezzi validi?
+            temp_parts = text.split(sep)
+            if len(temp_parts) > 1:
+                split_char = sep
+                break
+    
+    # 2. Se nessun separatore funziona (taglio brutale)
+    if not split_char:
+        mid = len(text) // 2
+        return (
+            recurse_text_chunking(text[:mid], base_meta, max_chars) + 
+            recurse_text_chunking(text[mid:], base_meta, max_chars)
+        )
+
+    # 3. Accumulatore (Greedy Bin Packing)
+    raw_parts = text.split(split_char)
+    current_chunk_str = ""
+    
+    for part in raw_parts:
+        candidate = part if not current_chunk_str else (current_chunk_str + split_char + part)
+        
+        if len(candidate) <= max_chars:
+            current_chunk_str = candidate
+        else:
+            if current_chunk_str:
+                chunks.extend(recurse_text_chunking(current_chunk_str, base_meta, max_chars))
+            current_chunk_str = part
+
+    # 4. Aggiungi l'ultimo pezzo rimasto
+    if current_chunk_str:
+        chunks.extend(recurse_text_chunking(current_chunk_str, base_meta, max_chars))
+
+    return chunks
+
+
+def prep_text_for_embedding(s: str, max_chars: int = 1800) -> str:
+    """
+    PDF-optimized: riduce rumore e costo tokenizer.
+    - rimuove header "Doc: ...\n" se presente
+    - normalizza whitespace
+    - tronca a max_chars (importantissimo per i PDF)
+    """
+    if not s:
+        return ""
+    s = s.strip()
+    s = re.sub(r"^Doc:\s.*?\n", "", s, flags=re.DOTALL)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_chars:
+        s = s[:max_chars]
+    return s
+
+
+# ==============================================================================
+# MOTORE VISIONE QWEN (Thread-Safe + Vision Supremacy)
+# ==============================================================================
+# ==============================================================================
+def extract_pdf_chunks(file_path: str, log_id: int) -> List[Dict[str, Any]]:
+    """
+    Strategia 'Vision-First' con Classificazione Granulare (Per-Chunk).
+    """
+    out_chunks = []
+    filename = os.path.basename(file_path)
+
+    # Reset stats
+    if "VISION_STATS" in globals() and "_VISION_STATS_LOCK" in globals():
+        with _VISION_STATS_LOCK: VISION_STATS["pages_total"] = 0
+
+    try:
+        doc0 = fitz.open(file_path)
+        total_pages = len(doc0)
+        doc0.close()
+    except Exception as e:
+        print(f"   ❌ Errore critico file {filename}: {e}")
+        return []
+
+    print(f"   🚀 Ingestion: {total_pages} pagine | Vision: {VISION_MODEL_NAME} | Brain: {LLM_MODEL_NAME}")
+
+    # --- WORKER INTERNO ---
+    def process_page_worker(p_idx: int):
+        p_no = p_idx + 1
+        local_res = []
+        doc_worker = None
+        try:
+            doc_worker = fitz.open(file_path)
+            page = doc_worker.load_page(p_idx)
+            
+            # 1. Rendering
+            zoom = VISION_DPI / 72
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_bytes = pix.tobytes("png")
+            # ✅ riduce tempo + VRAM + rischio blocchi Vision
+            img_bytes = _downscale_and_compress_for_vision(img_bytes, max_side=1400, jpeg_quality=90)
+            # 2. Salva img nel DB
+            img_id = None
+            t_conn = pg_get_conn()
+            if t_conn:
+                try:
+                    with t_conn.cursor() as t_cur:
+                        # Salva lo screenshot della pagina intera
+                        img_id = pg_save_image(log_id, img_bytes, "image/png", f"Page_{p_no}", cur=t_cur)
+                    t_conn.commit()
+                except Exception as e:
+                    print(f"   ⚠️ Errore salvataggio immagine PG (Pagina {p_no}): {e}")
+                    t_conn.rollback()
+                finally:
+                    pg_put_conn(t_conn)
+
+            # 3. VISIONE TOTALE
+            chunk_text = llm_chat_multimodal(
+                prompt=VISION_FIRST_PROMPT, 
+                image_bytes=img_bytes, 
+                model=VISION_MODEL_NAME 
+            )
+
+            # 4. Creazione Chunk
+            if chunk_text and "NO_CONTENT" not in chunk_text and len(chunk_text) > 10:
+                
+                # Partiamo assumendo che sia tutto TESTO.
+                # La classificazione avverrà pezzo per pezzo DOPO lo split.
+                meta = {
+                    "source": filename, 
+                    "page": p_no, 
+                    "type": "text", # Default
+                    "original_image_id": img_id
+                }
+                
+                # Generiamo i chunk grezzi
+                # 1. Generazione chunk con soglia più alta per evitare frammentazione eccessiva
+                # Usiamo CHUNK_MAX_CHARS (consigliato 1200-1500)
+                raw_chunks = recurse_text_chunking(chunk_text, meta, max_chars=CHUNK_MAX_CHARS)
+                
+                # 2. Set per la deduplicazione semantica locale (per pagina)
+                seen_hashes = set()
+                
+                # 3. POST-PROCESSING: Classificazione e Pulizia
+                for ch in raw_chunks:
+                    txt_content = ch.get("text_raw", "").strip()
+                    
+                    # --- FILTRO RIDONDANZA ---
+                    # Evitiamo chunk troppo corti o duplicati esatti generati dalla ricorsione
+                    content_hash = hashlib.md5(txt_content.encode()).hexdigest()[:12]
+                    if len(txt_content) < 100 or content_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(content_hash)
+
+                    # --- CLASSIFICAZIONE GRANULARE AVANZATA ---
+                    is_visual = False
+                    
+                    # A. Marcatori espliciti del Prompt Vision
+                    visual_markers = [
+                        "### 🖼️ VISUAL ANALYSIS", 
+                        "*Visual Elements:*", 
+                        "*Data Insights:*",
+                        "ANALISI VISIVA"
+                    ]
+                    
+                    # B. Analisi euristica del contenuto (Keywords visive)
+                    # Cerca termini come "asse", "legenda", "andamento" nel chunk
+                    visual_keywords = r"\b(asse|assi|axis|axes|legenda|legend|grafico|chart|plot|pendenza|slope|barre|bars)\b"
+                    has_visual_terms = len(re.findall(visual_keywords, txt_content, re.IGNORECASE)) >= 2
+                    
+                    if any(m in txt_content for m in visual_markers) or has_visual_terms:
+                        is_visual = True
+
+                    # C. Protezione Formule: Se è presente LaTeX ($$), non classificarlo come immagine
+                    # a meno che non ci siano riferimenti espliciti a grafici.
+                    if "$$" in txt_content and not has_visual_terms:
+                        is_visual = False
+
+                    # 4. Assegnazione finale e salvataggio
+                    ch["toon_type"] = "imagine" if is_visual else "testo"
+                    local_res.append(ch)
+
+        except Exception as e:
+            print(f"   ⚠️ Error p.{p_no}: {e}")
+        finally:
+            if doc_worker: doc_worker.close()
+            
+        return local_res
+
+    # --- ESECUZIONE PARALLELA ---
+    workers = int(os.environ.get("VISION_PARALLEL_WORKERS", "1")) #3
+    per_page_timeout = int(os.getenv("PDF_PAGE_TIMEOUT_S", "240"))  # timeout per pagina
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {executor.submit(process_page_worker, i): i for i in range(total_pages)}
+
+        done_count = 0
+        for f in as_completed(future_map, timeout=max(per_page_timeout * total_pages, per_page_timeout)):
+            p_idx = future_map[f]
+            try:
+                res = f.result(timeout=per_page_timeout)
+                if res:
+                    out_chunks.extend(res)
+            except Exception as e:
+                # Non bloccare ingestion: logga e vai avanti
+                print(f"\n   ⚠️ Pagina {p_idx+1}/{total_pages} fallita o in timeout: {e}")
+
+            done_count += 1
+            print(f"   🔄 Processed {done_count}/{total_pages}...", end="\r")
+
+    print("")
+    out_chunks.sort(key=lambda x: x["page_no"])
+    return add_context_windows(out_chunks)
+
+
+def is_page_math_heavy_or_broken(text: str) -> bool:
+    """
+    Rilevatore Universale per Vision AI.
+    Attiva la Visione se la pagina contiene:
+    1. Testo corrotto (artefatti PDF)
+    2. Tabelle numeriche (Table Hunter)
+    3. Qualsiasi formula matematica/statistica o metrica di rischio/compliance (Generic Math)
+    """
+    if not text: return False
+    
+    # --- 1. RILEVAMENTO CORRUZIONE (Fix Layout Rotti) ---
+    # "(cid:" indica font mancanti, "2C0D" è l'errore specifico del tuo PDF
+    if "(cid:" in text or "2C0D" in text: 
+        return True
+    
+    # Simboli spesso usati al posto di linee/frazioni nei PDF rotti
+    if text.count("•") > 5 or text.count("—") > 5 or text.count("˜") > 3:
+        return True
+
+    # --- 2. TABLE HUNTER (Cacciatore di Tabelle) ---
+    # Se una pagina è "piena di numeri", è una tabella.
+    digits = sum(c.isdigit() for c in text)
+    chars = len(text)
+    if chars > 100:
+        density = digits / chars
+        # Soglia 15%: se 1 carattere su 7 è un numero, è quasi sicuramente una tabella/bilancio
+        if density > 0.15:
+            print(f"   📊 Table Hunter Triggered: densità numeri {density:.2f}")
+            return True
+
+    # --- 3. UNIVERSAL MATH DETECTOR (Keyword & Simboli) ---
+    
+    text_lower = text.lower()
+
+    # A) Keyword Generiche (Italiano + Inglese)
+    # Non cerchiamo un singolo indicatore, ma le parole che compongono QUALSIASI ragionamento quantitativo o metrica di rischio.
+    universal_keywords = [
+        # Struttura
+        "formula", "equation", "equazione", "theorem", "teorema", "lemma", "proof", "dimostrazione",
+        # Operazioni / Calcolo
+        "integral", "integrale", "derivative", "derivata", "logarithm", "logaritmo", "summation", "sommatoria",
+        "matrix", "matrice", "vector", "vettore",
+        # Statistica
+        "variance", "varianza", "deviation", "deviazione", "correlation", "correlazione", 
+        "regression", "regressione", "distribution", "distribuzione", "confidence", "confidenza",
+        # Finanza
+        "discount", "sconto", "yield", "rendimento", "compounding", "capitalization", "amortization", "ammortamento",
+        "present value", "future value", "npv", "van", "irr", "tir", "cash flow", "flusso",
+        # Simboli scritti a parole
+        "sigma", "alpha", "beta", "gamma", "delta", "theta", "lambda"
+    ]
+
+    # Se trovi anche solo UNA di queste parole tecniche, attiva la Vision per sicurezza.
+    # (Usiamo un set per velocità e rimuoviamo duplicati)
+    if any(k in text_lower for k in universal_keywords):
+        return True
+
+    # B) Rilevamento Simboli Matematici (Regex)
+    # Spesso i PDF hanno i simboli matematici nel layer testo anche se la formattazione è rotta.
+    # Cerchiamo: Operatori logici, lettere greche, simboli di calcolo (∑, ∫, ∂, √, ecc.)
+    math_symbols = re.compile(r"[∑∏∫√∂∇∆∀∃∈∉⊆⊂∪∩≠≈≤≥±∓∞∝∠⊥∥]")
+    if math_symbols.search(text):
+        return True
+        
+    # C) Pattern "Variabile = Numero" (es. "r = 5%", "g = 0.02")
+    # Tipico delle liste di parametri prima di una formula
+    if re.search(r"\b[a-zA-Z0-9_]{1,4}\s*=\s*\d", text):
+        return True
+
+    return False
+
+# ==============================================================================
+# PATTERN GENERALISTA PER LA MATEMATICA
+# ==============================================================================
+# Rileva simboli matematici universali, operatori logici, lettere greche e keyword standard.
+MATH_BROAD_PAT = re.compile(
+    r"(?i)("
+    r"formula|equation|equazione|modello|model|theorem|teorema|lemma|"  # Keyword generiche
+    r"[∑∏∫√∂∇∆∀∃∄∈∉⊆⊂∪∩≠≈≡≤≥±∓×÷∝∞]|"                             # Simboli matematici avanzati
+    r"\^\{|\_\{|"                                                 # Sintassi stile LaTeX residua
+    r"[a-z]_[a-z0-9]|"                                            # Pedici (es. x_i, t_0)
+    r"\b[A-Za-z]=\d+"                                             # Assegnazioni (es. x=5)
+    r")"
+)
+
+def extract_file_chunks(file_path: str, log_id: int) -> List[Dict[str, Any]]:
+    """
+    Estrazione Universale (PDF) v3.0:
+    1. SINGOLO PASSAGGIO CON FITZ. Nessun doppio caricamento.
+    2. Testo Nativo con OVERLAP (Rolling Buffer).
+    3. Immagini Embedded (grafici raster).
+    4. Matematica/Schemi (Visione su render Hi-Res).
+    """
+    
+    # --- CONFIGURAZIONE OVERLAP ---
+    OVERLAP_SIZE = 250  # Caratteri (~40 parole)
+    prev_page_tail = "" # Buffer per la coda della pagina precedente
+    # ------------------------------
+
+    filename = os.path.basename(file_path)
+    final_chunks: List[Dict[str, Any]] = []
+    doc = None 
+
+    # Helper per contare elementi vettoriali
+    def _count_vectors(p: fitz.Page) -> int:
+        try:
+            ops = 0
+            drawings = p.get_drawings() or []
+            for d in drawings:
+                ops += len(d.get("items") or [])
+            return ops
+        except Exception:
+            return 0
+
+    try:
+        doc = fitz.open(file_path)
+        # Calcolo ID univoco documento (hash)
+        doc_id = sha256_file(file_path)[:32]
+
+        # ==============================================================
+        # CICLO UNICO: SCORRIAMO LE PAGINE UNA SOLA VOLTA
+        # ==============================================================
+        for i, page in enumerate(doc):
+            page_no = i + 1
+            
+            # 1. ESTRAZIONE TESTO NATIVO CON FITZ
+            page_text = page.get_text("text", sort=True)
+            clean_text = page_text.strip()
+            
+            # =========================================================
+            # FIX VISION-NATIVE: Rilevamento Testo Corrotto / Matematica
+            # =========================================================
+            use_vision_replacement = False
+            if PDF_VISION_ENABLED and is_page_math_heavy_or_broken(page_text):
+                print(f"   👁️‍🗨️ Pagina {page_no}: Rilevata matematica/corruzione. Attivo Vision-to-Markdown...")
+                use_vision_replacement = True
+
+            # Se serve la Visione, sostituiamo 'clean_text' con l'output dell'LLM
+            if use_vision_replacement:
+                try:
+                    # Carichiamo la pagina come immagine ad alta risoluzione (DPI 180)
+                    hq_bytes = render_full_page_png(page, dpi=180) 
+                    
+                    vision_md = llm_chat_multimodal(
+                        prompt=MARKER_VISION_PROMPT,
+                        image_bytes=hq_bytes,
+                        model=VISION_MODEL_NAME,
+                        max_tokens=3500
+                    )
+
+                    if len(vision_md) > 50:
+                        clean_text = f"\n{vision_md}" 
+                    
+                except Exception as e:
+                    print(f"   ⚠️ Vision fallback failed: {e}")
+            # =========================================================
+
+            # ---------------------------------------------------------
+            # A) CHUNK TESTO BASE (CON OVERLAP)
+            # ---------------------------------------------------------
+            if len(clean_text) > MIN_CHUNK_LEN:
+                
+                # --- LOGICA OVERLAP ---
+                header_semantico = f"Doc: {filename} | Pagina: {page_no}\n"
+                
+                if prev_page_tail:
+                    text_semantic_content = f"{header_semantico}... {prev_page_tail}\n{clean_text}"
+                else:
+                    text_semantic_content = f"{header_semantico}{clean_text}"
+                
+                # Aggiorniamo il buffer per il prossimo giro
+                if len(clean_text) > OVERLAP_SIZE:
+                    prev_page_tail = clean_text[-OVERLAP_SIZE:]
+                else:
+                    prev_page_tail = clean_text 
+                # ----------------------
+
+                final_chunks.append({
+                    "text_raw": clean_text,
+                    "text_sem": text_semantic_content, 
+                    "toon_type": "testo",
+                    "page_no": page_no,
+                    "metadata": {"source": filename, "doc_id": doc_id}
+                })
+            else:
+                prev_page_tail = ""
+
+            # ---------------------------------------------------------
+            # B) IMMAGINI EMBEDDED (Grafici Raster, Foto)
+            # ---------------------------------------------------------
+            if PDF_VISION_ENABLED:
+                page_objs = page.get_images(full=True) or []
+                
+                t_conn = pg_get_conn()
+                try:
+                    with t_conn.cursor() as t_cur:
+                        for img_idx, img in enumerate(page_objs):
+                            xref = img[0]
+                            try:
+                                base_image = doc.extract_image(xref)
+                                img_bytes = base_image.get("image", b"")
+                                
+                                if not img_bytes or len(img_bytes) < MIN_ASSET_SIZE:
+                                    continue
+
+                                img_name = f"PDF_{doc_id}_P{page_no}_IMG{img_idx}"
+                                image_id = pg_save_image(log_id, img_bytes, "image/jpeg", img_name, cur=t_cur)
+
+                                analysis = None
+                                if VISION_MODEL_NAME:
+                                    try:
+                                        analysis = extract_chart_via_vision(
+                                            img_bytes,
+                                            context_hint=f"Page {page_no} of {filename}"
+                                        )
+                                    except Exception: 
+                                        analysis = None
+                                
+                                if analysis:
+                                    sem_text = build_chart_semantic_chunk(page_no, analysis)
+                                    meta = analysis
+                                else:
+                                    sem_text = normalize_ws(f"--- ASSET VISIVO - P{page_no} ---\nNome: {img_name}")
+                                    meta = {"asset_name": img_name}
+
+                                final_chunks.append({
+                                    "text_raw": json.dumps(meta) if analysis else sem_text,
+                                    "text_sem": sem_text,
+                                    "toon_type": "imagine",
+                                    "page_no": page_no,
+                                    "image_id": image_id,
+                                    "metadata": {**meta, "source": filename}
+                                })
+
+                            except Exception:
+                                continue
+                    t_conn.commit()
+                finally:
+                    pg_put_conn(t_conn)
+
+            # ---------------------------------------------------------
+            # C) MATEMATICA & VETTORIALI (Render & Transcribe)
+            # ---------------------------------------------------------
+            has_math_text = bool(MATH_BROAD_PAT.search(page_text))
+            vector_count = _count_vectors(page)
+            has_vectors = vector_count > 10 
+
+            if PDF_VISION_ENABLED and (has_math_text or has_vectors):
+                try:
+                    pix = page.get_pixmap(dpi=300, alpha=False)
+                    hq_bytes = pix.tobytes("png")
+
+                    math_json = extract_formulas_vision(hq_bytes)
+
+
+
+                    if math_json and math_json.get("formulas"):
+                        sem_math = build_formula_semantic_chunk(page_no, math_json)
+                    
+                        # ---> AGGIUNGI QUESTA RIGA <---
+                        sem_math = f"Doc: {filename} | Pagina: {page_no}\n{sem_math}"
+                        
+                        final_chunks.append({
+                            "text_raw": json.dumps(math_json, ensure_ascii=False),
+                            "text_sem": sem_math,
+                            "toon_type": "formula",
+                            "page_no": page_no,
+                            "metadata": {
+                                "source": filename,
+                                "type": "mathematical_content",
+                                "doc_id": doc_id,
+                                "formulas_found": len(math_json.get("formulas", []))
+                            }
+                        })
+                        print(f"   Σ  Matematica rilevata a pag {page_no}: {len(math_json['formulas'])} formule.")
+
+                except Exception as e_math:
+                    print(f"   ⚠️ Errore estrazione matematica pag {page_no}: {e_math}")
+
+    except Exception as e:
+        print(f"   ❌ Errore critico file {filename}: {e}")
+        
+    finally:
+        if doc:
+            doc.close()
+
+        # In producer/consumer mode evitiamo unload concorrenti mentre il consumer usa Ollama.
+        if (
+            PDF_VISION_ENABLED
+            and VISION_MODEL_NAME
+            and os.getenv("PRODUCER_CONSUMER_MODE", "0") != "1"
+        ):
+            force_unload_ollama(VISION_MODEL_NAME)
+
+    return final_chunks
+
+
+
+def extract_pdf_as_markdown_assets(file_path: str, log_id: int) -> List[Dict[str, Any]]:
+    """
+    Estrae testo e asset da PDF.
+    FIX:
+    - Crea SEMPRE un chunk 'immagine' per ogni asset embedded (anche se Vision fallisce o ritorna kind=other)
+    - Evita che tutto finisca come 'testo' quando il PDF contiene grafici.
+    """
+    chunks_payload: List[Dict[str, Any]] = []
+
+    try:
+        doc = fitz.open(file_path)
+    except Exception as e:
+        print(f"   ❌ Errore apertura PDF {file_path}: {e}")
+        return []
+
+    filename = os.path.basename(file_path)
+    total_pages = len(doc)
+    doc_id = sha256_file(file_path)[:32]
+
+    print(f"   🚀 Ingestion: {total_pages} pagine | Vision: {VISION_MODEL_NAME} | Brain: {LLM_MODEL_NAME}")
+
+    # Pulizia VRAM preventiva
+    if PDF_VISION_ENABLED and VISION_MODEL_NAME:
+        force_unload_ollama(VISION_MODEL_NAME)
+
+    for i, page in enumerate(doc):
+        page_no = i + 1
+        try:
+            # ------------------------------------------------------------
+            # 1) Chunk TESTO pagina
+            # ------------------------------------------------------------
+            page_text = page.get_text()
+            text_sem = safe_normalize_text(page_text) or ""
+
+            # se vuoi, puoi mantenere lo skip condizionale; qui lo lasciamo conservativo
+            if len(text_sem) < 50 and not PDF_VISION_ENABLED:
+                continue
+
+            page_chunk = {
+                "text_raw": text_sem,
+                "text_sem": f"Page {page_no} content: {text_sem[:250]}...\n{text_sem}",
+                "page_no": page_no,
+                "toon_type": "testo",
+                "metadata": {
+                    "source": filename,
+                    "page": page_no,
+                    "doc_id": doc_id,
+                }
+            }
+            chunks_payload.append(page_chunk)
+
+            # ------------------------------------------------------------
+            # 2) Chunk IMMAGINI embedded (grafici inclusi)
+            # ------------------------------------------------------------
+            if PDF_VISION_ENABLED:
+                images = page.get_images(full=True) or []
+                if images:
+                    for img_index, img in enumerate(images):
+                        xref = img[0]
+                        try:
+                            base_image = doc.extract_image(xref)
+                            image_bytes = base_image.get("image", b"")
+
+                            # filtro dimensione (usa la tua soglia configurabile)
+                            if not image_bytes or len(image_bytes) < MIN_ASSET_SIZE:
+                                continue
+
+                            # salva asset in Postgres
+                            img_name = f"PDF_{doc_id}_P{page_no}_IMG{img_index}"
+                            conn = pg_get_conn()
+                            try:
+                                with conn.cursor() as cur:
+                                    image_id = pg_save_image(log_id, image_bytes, "image/jpeg", img_name, cur)
+                                conn.commit()
+                            finally:
+                                pg_put_conn(conn)
+
+                            # prova Vision
+                            c_js = None
+                            if VISION_MODEL_NAME:
+                                try:
+                                    c_js = extract_chart_via_vision(
+                                        image_bytes,
+                                        context_hint=f"{filename} | page {page_no}"
+                                    )
+                                except Exception as _:
+                                    c_js = None
+
+                            # costruisci semantica (anche fallback)
+                            conf = float((c_js or {}).get("confidence") or 0.0)
+                            kind = (c_js or {}).get("kind")
+
+                            if c_js and isinstance(c_js, dict):
+                                # FIX: uniforma tipo (evita 'imagine' typo)
+                                c_js["toon_type"] = "immagine"
+
+                            CHART_MIN_CONF = float(os.getenv("CHART_MIN_CONF", "0.55"))
+
+                            if c_js and kind != "other" and conf >= CHART_MIN_CONF:
+                                sem = build_chart_semantic_chunk(page_no, c_js)
+                                meta = c_js
+                            else:
+                                sem = normalize_ws(
+                                    f"--- CONTENUTO VISIVO (immagine) - Pagina {page_no} ---\n"
+                                    f"Asset: {img_name}\n"
+                                    f"Nota: immagine estratta dal PDF (grafico/tabella possibile).\n"
+                                    f"Stato: non interpretata automaticamente oppure conf bassa.\n"
+                                    f"Hint: prova ad aumentare VISION_DPI o abbassare CHART_MIN_CONF.\n"
+                                )
+                                meta = {
+                                    "asset_name": img_name,
+                                    "confidence": conf,
+                                    "kind": kind or "unknown",
+                                    "toon_type": "immagine"
+                                }
+
+                            # crea chunk IMMAGE dedicato (questo è il FIX chiave)
+                            img_chunk = {
+                                "text_raw": sem,               # utile anche per embedding
+                                "text_sem": sem,               # retrieval “forte”
+                                "page_no": page_no,
+                                "toon_type": "immagine",
+                                "image_id": image_id,
+                                "metadata": {
+                                    "source": filename,
+                                    "page": page_no,
+                                    "doc_id": doc_id,
+                                    **(meta if isinstance(meta, dict) else {})
+                                }
+                            }
+                            chunks_payload.append(img_chunk)
+
+                        except Exception as e_img:
+                            print(f"   ⚠️ Err. Img {img_index} pg {page_no}: {e_img}")
+                            continue
+
+
+            # ✅ VRAM safety: no unload per pagina (troppo costoso).
+            # Se serve, lasciamo solo una GC leggera.
+            if PDF_VISION_ENABLED:
+                gc.collect()
+
+
+        except Exception as e_page:
+            print(f"   ⚠️ Err. Pagina {page_no}: {e_page}")
+            continue
+
+    try:
+        doc.close()
+    except Exception:
+        pass
+
+    return chunks_payload
+
+
+
+def normalize_toon_type(ch: dict) -> str:
+    """
+    Normalizza il tipo del chunk in una tassonomia unica usata anche dal RAG:
+    text, image, table, chart, formula.
+    """
+    current_type = str(ch.get("toon_type", "")).lower().strip()
+
+    if current_type in {"formula", "math", "equation"}:
+        return "formula"
+
+    if ch.get("image_id") is not None:
+        return "image"
+
+    content_raw = ch.get("text_raw", "") or ""
+    content_sem = ch.get("text_sem", "") or ""
+
+    visual_markers = [
+        "### 🖼️ VISUAL ANALYSIS",
+        "VISUAL ANALYSIS:",
+        "*Visual Elements:*",
+        "--- CONTENUTO VISUALE",
+        "--- ANALISI VISUALE",
+        "--- CONTENUTO VISIVO",
+        "--- ASSET VISIVO",
+        "![",
+    ]
+
+    table_markers = [
+        "|---",
+        "| ---",
+        "data_table_md",
+    ]
+
+    if any(m in content_raw for m in visual_markers) or any(m in content_sem for m in visual_markers):
+        return "image"
+
+    if any(m in content_raw for m in table_markers) or any(m in content_sem for m in table_markers):
+        return "table"
+
+    if current_type in {"chart", "grafico", "chart_analysis"}:
+        return "chart"
+
+    if current_type in {"image", "immagine", "imagine", "visual", "screenshot"}:
+        return "image"
+
+    if current_type in {"table", "tabella"}:
+        return "table"
+
+    return "text"
+
+
+def process_virtual_md_chunks(content: str, asset_park: dict, filename: str, log_id: int) -> List[Dict[str, Any]]:
+    """
+    Versione 2.9.2 (Optimized):
+    - Include Debug Saving e Context Hint.
+    - Prompt Merging: Rimossa la seconda chiamata LLM per l'analisi (ora fatta dalla Vision).
+    """
+    out_chunks = []
+
+    # ✅ Cap Vision per documento
+    vision_done = 0
+    VISION_MAX_ASSETS_PER_DOC = int(os.getenv("VISION_MAX_ASSETS_PER_DOC", "25"))
+
+    content = clean_markdown_structure(content)
+    raw_paras = re.split(r'\n(?=# PAGE)|\n\n', content)
+
+    for para in raw_paras:
+        para_strip = para.strip()
+        if not para_strip:
+            continue
+
+        # Identificazione Pagina
+        current_page = 1
+        page_match = re.search(r'# PAGE (\d+)', para_strip)
+        if page_match: current_page = int(page_match.group(1))
+
+        # Scomposizione granulare
+        sub_segments = [para_strip] if len(para_strip) <= 1200 else split_text_with_overlap(para_strip, 1000, 200)
+
+        for sub_p in sub_segments:
+            clean_sub_p = safe_normalize_text(sub_p)
+            
+            chunk_data = {
+                "text_raw": clean_sub_p,
+                "text_sem": f"Doc: {filename} | Content: {clean_sub_p[:80]}...\n{clean_sub_p}",
+                "page_no": current_page, 
+                "toon_type": "text",
+                "section_hint": find_section_hint(clean_sub_p)
+            }
+
+            # --- LOGICA ASSET VISUALI ---
+            img_match = re.search(r'!\[.*?\]\(((?:img_|fig_).*?\.jpg)\)', clean_sub_p)
+            if img_match and PDF_VISION_ENABLED:
+                asset_id = img_match.group(1)
+                img_bytes = asset_park.get(asset_id)
+
+                if img_bytes and len(img_bytes) >= MIN_ASSET_SIZE and ai_vision_gatekeeper(img_bytes):
+                    if vision_done >= VISION_MAX_ASSETS_PER_DOC:
+                        out_chunks.append(chunk_data)
+                        continue
+
+                    chunk_data["toon_type"] = "immagine"
+                    hint = f"{filename} | page {current_page}"
+
+                    # Estrazione (ora include già 'analysis_it' grazie al Prompt Merging)
+                    c_js = extract_chart_via_vision(img_bytes, context_hint=hint) or {}
+                    vision_done += 1
+                    
+                    if c_js:
+                        # 🔒 GEO SANITIZATION (STRICT)
+                        bad_geo_tokens = [" sud", "south"]
+                        cats = c_js.get("categories_it", [])
+                        if isinstance(cats, list):
+                            c_js["categories_it"] = [
+                                c for c in cats
+                                if not any(tok in c.lower() for tok in bad_geo_tokens)
+                            ]
+
+                        # 🔒 BLOCK AMBIGUOUS TIMEFRAME
+                        tf = c_js.get("timeframe")
+                        years = re.findall(r"\b(19\d{2}|20\d{2})\b", str(tf)) if tf else []
+                        if len(years) < 2:
+                            c_js.pop("timeframe", None)
+
+                        # --- OPTIMIZATION START: Prompt Merging ---
+                        # Abbiamo rimosso la chiamata a generate_chart_analysis_it()
+                        # perché il dato è già presente in c_js['analysis_it'] dal modello Vision.
+                        # --- OPTIMIZATION END ---
+
+                        c_js = normalize_chart_json_for_semantics(c_js, page_no=current_page, context_hint=hint)
+                        semantic = build_chart_semantic_chunk(current_page, c_js)
+                        
+                        # Replace semantico
+                        # is_image_only: chunk che contiene solo immagine markdown (es. ![...](...)) oppure chunk di tipo image
+                        md_only = (chunk_data.get("text_raw") or "").strip()
+
+                        toon_type = (chunk_data.get("toon_type") or "").strip().lower()
+                        # accetta anche il vecchio typo "imagine"
+                        if toon_type == "imagine":
+                            toon_type = "image"
+                        chunk_data["toon_type"] = toon_type  # normalizza per downstream
+
+                        is_image_only = (toon_type == "image") or (
+                            md_only.startswith("![") and "](" in md_only and len(md_only) < 120
+                        )
+
+                        chunk_data["text_sem"] = semantic
+                        if is_image_only:
+                            chunk_data["text_raw"] = semantic 
+                    else:
+                        # Fallback se la vision fallisce o restituisce None
+                        chunk_data["text_sem"] = normalize_ws(
+                            f"--- CONTENUTO VISIVO - Pagina {current_page} ---\n"
+                            f"Asset: {asset_id}\n"
+                            f"Descrizione: immagine estratta dal PDF.\n"
+                            f"Stato: non interpretata automaticamente."
+                        )
+                        chunk_data["text_raw"] = chunk_data["text_sem"]
+
+                    # save image to PG
+                    conn = pg_get_conn()
+                    try:
+                        with conn.cursor() as cur:
+                                chunk_data["image_id"] = pg_save_image(
+                                    log_id, img_bytes, "image/jpeg", f"RAM_{asset_id}", cur
+                                )
+
+                                # 🔥 FIX: rendi l'immagine "risolvibile" dal solo record document_chunks
+                                chunk_data.setdefault("metadata", {})
+                                chunk_data["metadata"]["image_id"] = chunk_data["image_id"]
+                                chunk_data["metadata"]["asset_name"] = asset_id
+                                chunk_data["metadata"]["mime_type"] = "image/jpeg"
+
+                        conn.commit()
+                    finally:
+                        pg_put_conn(conn)
+
+            out_chunks.append(chunk_data)
+    return out_chunks
+
+
+
+def formula_kg_from_chunk(ch: dict) -> tuple[list[dict], list[dict]]:
+    """
+    Converte deterministicamente il JSON Vision delle formule in nodi KG.
+    Non dipende dal LLM KG.
+    """
+    if normalize_toon_type(ch) != "formula":
+        return [], []
+
+    raw = ch.get("text_raw") or ""
+    page_no = ch.get("page_no", 1)
+
+    try:
+        js = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        js = safe_json_extract(raw)
+
+    if not isinstance(js, dict):
+        return [], []
+
+    formulas = js.get("formulas") or []
+    if not isinstance(formulas, list):
+        return [], []
+
+    nodes = []
+    edges = []
+    seen_ids = set()
+
+    for idx, f in enumerate(formulas):
+        if not isinstance(f, dict):
+            continue
+
+        desc = (
+            f.get("description_it")
+            or f.get("meaning_it")
+            or f.get("description")
+            or f"Formula {idx + 1}"
+        )
+
+        raw_latex = f.get("latex", "")
+        if isinstance(raw_latex, list):
+            latex = " ".join(str(x) for x in raw_latex)
+        elif isinstance(raw_latex, dict):
+            latex = json.dumps(raw_latex, ensure_ascii=False)
+        else:
+            latex = str(raw_latex or "")
+
+        latex = latex.strip()
+        if not latex:
+            continue
+
+        formula_hash = sha256_hex(latex.encode("utf-8"))[:10]
+        formula_id = f"Formula::P{page_no}::{formula_hash}"
+
+        if formula_id not in seen_ids:
+            nodes.append({
+                "id": formula_id,
+                "category": "FORMULA",
+                "props": {
+                    "description": str(desc),
+                    "formula": latex,
+                    "synonyms": [],
+                    "source": "vision_formula",
+                    "page_no": page_no
+                }
+            })
+            seen_ids.add(formula_id)
+
+        variables = f.get("variables") or []
+        if isinstance(variables, list):
+            for v in variables:
+                if isinstance(v, dict):
+                    v_name = str(v.get("name", "") or "").strip()
+                    v_meaning = str(v.get("meaning", "") or "").strip()
+                else:
+                    v_name = str(v or "").strip()
+                    v_meaning = ""
+
+                if not v_name:
+                    continue
+
+                var_id = v_name
+
+                if var_id not in seen_ids:
+                    nodes.append({
+                        "id": var_id,
+                        "category": "VARIABLE",
+                        "props": {
+                            "description": v_meaning,
+                            "formula": v_name,
+                            "synonyms": [],
+                            "source": "vision_formula",
+                            "page_no": page_no
+                        }
+                    })
+                    seen_ids.add(var_id)
+
+                edges.append({
+                    "source": formula_id,
+                    "target": var_id,
+                    "relation": "HAS_VARIABLE",
+                    "props": {
+                        "evidence": "Variabile estratta dal JSON Vision della formula.",
+                        "source": "vision_formula"
+                    }
+                })
+
+    return nodes, edges
+
+
+
+def ensure_entity_props_defaults(nodes: list[dict]) -> list[dict]:
+    """
+    Garantisce che ogni nodo Entity abbia sempre:
+    - description
+    - formula
+    - synonyms
+
+    Non inventa sinonimi.
+    """
+    out = []
+
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+
+        nn = dict(n)
+        props = dict(nn.get("props") or {})
+
+        props.setdefault("description", "")
+        props.setdefault("formula", "")
+
+        syn = props.get("synonyms", [])
+        if syn is None:
+            syn = []
+        elif isinstance(syn, str):
+            syn = [syn] if syn.strip() else []
+        elif not isinstance(syn, list):
+            syn = []
+
+        props["synonyms"] = [str(x).strip() for x in syn if str(x).strip()]
+
+        nn["props"] = props
+        out.append(nn)
+
+    return out
+
+ACRONYM_PAIR_PATTERNS = [
+    # Full Name (ABC)
+    re.compile(
+        r"\b([A-ZÀ-Úa-zà-ú][A-ZÀ-Úa-zà-ú0-9\s\-/]{4,90})\s*\(([A-Z][A-Z0-9]{1,15})\)"
+    ),
+
+    # ABC (Full Name)
+    re.compile(
+        r"\b([A-Z][A-Z0-9]{1,15})\s*\(([A-ZÀ-Úa-zà-ú][A-ZÀ-Úa-zà-ú0-9\s\-/]{4,90})\)"
+    ),
+]
+
+
+def extract_local_synonym_pairs(text: str) -> dict[str, list[str]]:
+    """
+    Estrae sinonimi SOLO se appaiono esplicitamente nel testo.
+    Non usa dizionari esterni.
+    Esempi:
+    - Multi-Factor Authentication (MFA)
+    - MFA (Multi-Factor Authentication)
+    - Disaster Recovery Plan (DRP)
+    - DRP (Disaster Recovery Plan)
+    """
+    pairs: dict[str, list[str]] = {}
+
+    if not text:
+        return pairs
+
+    clean = re.sub(r"\s+", " ", text).strip()
+
+    for pat in ACRONYM_PAIR_PATTERNS:
+        for a, b in pat.findall(clean):
+            a = re.sub(r"\s+", " ", a).strip(" .,:;")
+            b = re.sub(r"\s+", " ", b).strip(" .,:;")
+
+            if not a or not b:
+                continue
+
+            a_is_acronym = bool(re.fullmatch(r"[A-Z][A-Z0-9]{1,15}", a))
+            b_is_acronym = bool(re.fullmatch(r"[A-Z][A-Z0-9]{1,15}", b))
+
+            if a_is_acronym and not b_is_acronym:
+                canonical, synonym = b, a
+            elif b_is_acronym and not a_is_acronym:
+                canonical, synonym = a, b
+            else:
+                continue
+
+            # evita canonical troppo rumorosi
+            canonical = canonical.strip()
+            synonym = synonym.strip()
+
+            if len(canonical) < 4 or len(synonym) < 2:
+                continue
+
+            pairs.setdefault(canonical, [])
+            if synonym not in pairs[canonical]:
+                pairs[canonical].append(synonym)
+
+    return pairs
+
+
+def enrich_synonyms_from_local_text(nodes: list[dict], text: str) -> list[dict]:
+    """
+    Aggiunge sinonimi document-grounded ai nodi.
+    Non inventa sinonimi: usa solo pattern presenti nel testo.
+    """
+    if not nodes or not text:
+        return nodes
+
+    local_pairs = extract_local_synonym_pairs(text)
+    if not local_pairs:
+        return nodes
+
+    out = []
+
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+
+        nn = dict(n)
+        nid = str(nn.get("id", "") or "").strip()
+        props = dict(nn.get("props") or {})
+
+        syn = props.get("synonyms", [])
+        if syn is None:
+            syn = []
+        elif isinstance(syn, str):
+            syn = [syn] if syn.strip() else []
+        elif not isinstance(syn, list):
+            syn = []
+
+        # Match sul nome canonico
+        for canonical, synonyms in local_pairs.items():
+            if nid.lower() == canonical.lower():
+                for s in synonyms:
+                    if s not in syn:
+                        syn.append(s)
+
+            # Match inverso: se il nodo è l'acronimo, aggiungi il full name come synonym
+            for s in synonyms:
+                if nid.lower() == s.lower() and canonical not in syn:
+                    syn.append(canonical)
+
+        props["synonyms"] = [str(x).strip() for x in syn if str(x).strip()]
+        nn["props"] = props
+        out.append(nn)
+
+    return out
+
+
+
+
+# =========================
+# FILE DISPATCH (PDF only here)
+# =========================
+def process_ai_and_db(file_path: str, source_type: str, doc_meta: dict, chunks: list, log_id: int):
+    """
+    Pipeline v2.5 - Optimized for Gemma 2:9b & P5000 (Final Clean)
+    Rimuove log doppi e ottimizza la visualizzazione della console.
+    """
+    t0 = time.time()
+    filename = os.path.basename(file_path)
+
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    os.makedirs(FAILED_DIR, exist_ok=True)
+
+    tier = (doc_meta or {}).get("tier", "B")
+    ontology = (doc_meta or {}).get("ontology", DEFAULT_ONTOLOGY)
+    
+    print(f"   ⚙️ Engine Start: {filename} | tier={tier} | Brain={LLM_MODEL_NAME}")
+
+    doc_id = sha256_file(file_path)[:32]
+
+    global embedder, qdrant_client
+
+    # Init Lazy dei client
+    embedder = get_embedder()
+    qdrant_client = get_qdrant_client()
+    ensure_qdrant_collection()
+
+    if not chunks:
+        pg_close_log(log_id, "FAILED", 0, _ms(t0), "No chunks extracted")
+        move_file_preserving_structure(file_path, FAILED_DIR)
+        return
+    
+    # 2. Iniezione metadati e normalizzazione tipo
+    for idx, ch in enumerate(chunks):
+        ch.setdefault("chunk_index", idx)
+        
+        # Applica la nuova classificazione invece di forzare 'text'
+        ch["toon_type"] = normalize_toon_type(ch)
+        
+        meta = ch.get("metadata", {})
+        meta.update({
+            "doc_id": doc_id, 
+            "filename": filename, 
+            "tier": tier, 
+            "ontology": ontology
+        })
+        ch["metadata"] = meta
+
+    # Buffers
+    qdrant_points, pg_rows, neo4j_rows = [], [], []
+    total_chunks = 0
+    num_chunks_totali = len(chunks)
+
+    # PDF: batch più piccolo per stabilità VRAM su P5000
+    if file_path.lower().endswith(".pdf"):
+        pdf_batch = int(os.environ.get("PDF_EMBED_BATCH_SIZE", "8"))
+        if pdf_batch > 0:
+            global EMBED_BATCH_SIZE
+            EMBED_BATCH_SIZE = pdf_batch
+
+    # LOG SINGOLO (Prima ne avevi due)
+    print(f"   🚀 Inizio elaborazione: {num_chunks_totali} chunks (Batch: {EMBED_BATCH_SIZE})")
+
+
+    # 3. Ciclo Batches
+    for i in range(0, num_chunks_totali, EMBED_BATCH_SIZE):
+        batch_t0 = time.time()
+        batch = chunks[i:i + EMBED_BATCH_SIZE]
+        
+        # Prep text
+        PDF_EMBED_MAX_CHARS = int(os.environ.get("PDF_EMBED_MAX_CHARS", "1800"))
+        texts = [prep_text_for_embedding(c.get("text_sem", ""), max_chars=PDF_EMBED_MAX_CHARS) for c in batch]
+
+        # 3a. Embeddings (Con barra di progresso reale)
+        print(f"   [DEBUG] Calcolo embeddings batch {i//EMBED_BATCH_SIZE + 1}...")
+        t_emb0 = time.time()
+        try:
+            vecs = embedder.encode(texts, batch_size=EMBED_BATCH_SIZE, show_progress_bar=True)
+        except Exception as e:
+            print(f"   ⚠️ Errore Embeddings: {e}")
+            break
+        t_emb1 = time.time()
+
+        # 3b. Knowledge Graph (Parallel)
+        batch_kg_results = {}
+        if KG_ENABLED:
+            pages_map = {}
+            for local_j, ch in enumerate(batch):
+                p = int(ch.get("page_no") or 1)
+                # salviamo anche l'indice locale nel batch, così riusiamo vecs[local_j]
+                pages_map.setdefault(p, []).append((i + local_j, local_j, ch))
+
+            # Convertiamo i vecs del batch una volta sola in torch (utile per mean/max)
+            try:
+                vecs_t = torch.tensor(vecs, dtype=torch.float32)
+            except Exception:
+                vecs_t = None
+
+            futures_kg = {}
+            for p_no, indexed_chunks in pages_map.items():
+                combined_text = "\n".join([ch.get("text_sem", "") for _, _, ch in indexed_chunks])
+                text_clean = safe_normalize_text(combined_text)[:KG_TEXT_MAX_CHARS]
+
+                # ✅ Gatekeeper su embedding già calcolato (media dei chunk della pagina)
+                if vecs_t is not None:
+                    local_idxs = [local_j for _, local_j, _ in indexed_chunks]
+                    page_vec = vecs_t[local_idxs].mean(dim=0)
+                    ok_kg = ai_gatekeeper_decision_from_vec(page_vec)
+                else:
+                    # fallback (non dovrebbe quasi mai servire)
+                    ok_kg = ai_gatekeeper_decision(text_clean)
+
+                if ok_kg:
+                    futures_kg[p_no] = kg_executor.submit(
+                        llm_extract_kg, filename, p_no, text_clean, LLM_MODEL_NAME
+                    )
+
+            # 3c. Raccolta KG (FIXED: Protezione "list index out of range")
+            for p_no, fut in futures_kg.items():
+                try:
+                    res = fut.result(timeout=KG_TIMEOUT) 
+                    
+                    # Controllo robusto sul tipo di ritorno
+                    if not res or not isinstance(res, (list, tuple)) or len(res) < 2:
+                        print(f"   ⚠️ KG Skip: Risposta non valida o incompleta a Pagina {p_no}")
+                        continue
+                        
+                    raw_nodes, raw_edges = res
+                    
+                    # Normalizzazione Schema
+                    graph_data = _normalize_graph_schema({"nodes": raw_nodes, "edges": raw_edges})
+                    
+                    if graph_data and (graph_data.get("nodes") or graph_data.get("edges")):
+                        # Sanificazione con slicing sicuro
+                        # La funzione _sanitize_graph ora deve gestire liste vuote internamente
+                        clean_nodes, clean_edges = _sanitize_graph(graph_data)
+
+                        clean_nodes, clean_edges = enrich_formula_nodes_and_edges(clean_nodes, clean_edges)
+
+                        final_edges = clean_edges
+
+                        
+                        # Validazione Neo4j (essenziale: filtra nodi senza ID)
+                        validated_nodes = [n for n in clean_nodes if isinstance(n, dict) and n.get("id")]
+                        
+                        if validated_nodes:
+                            for g_idx, _, _ in pages_map[p_no]:
+                                batch_kg_results[g_idx] = (validated_nodes, final_edges)
+                            
+                            print(f"   ✅ KG Exploded: {len(validated_nodes)} nodi e {len(final_edges)} archi a Pagina {p_no}")
+                        else:
+                            print(f"   ⚠️ KG Empty: Nessun nodo valido estratto a Pagina {p_no}")
+                            
+                except cf.TimeoutError:
+                    fut.cancel()
+                    print(f"   ⌛ KG Timeout (Pag {p_no}) dopo {KG_TIMEOUT}s: salto estrazione.")
+                    continue
+                except Exception as e:
+                    print(f"   ⚠️ KG Processing Error (Pag {p_no}): {str(e)}")
+                    continue
+                    
+                    
+        # 3c. Costruzione Record DB
+        for j, ch in enumerate(batch):
+            g_idx = i + j
+
+            # ✅ NORMALIZZA toon_type (solo "testo" / "imagine")
+            ch["toon_type"] = normalize_toon_type(ch)
+
+            vector = vecs[j]
+            chunk_id = deterministic_chunk_id(
+                doc_id,
+                ch.get("page_no", 1),
+                g_idx,
+                ch.get("toon_type"),
+                ch.get("text_sem")
+            )
+
+            # Qdrant Payload
+            page_no = int(ch.get("page_no") or ch.get("page") or 1)
+            
+            metadata = dict(ch.get("metadata") or {})
+            metadata.update({
+                "page": page_no,
+                "page_no": page_no,
+                "toon_type": ch.get("toon_type", "text"),
+                "filename": filename,
+                "doc_id": doc_id,
+                "tier": tier,
+                "ontology": ontology,
+                "source_name": filename,
+                "source_type": source_type,
+                "log_id": log_id,
+                "chunk_index": g_idx,
+            })
+            
+            if ch.get("image_id") is not None:
+                metadata["image_id"] = ch.get("image_id")
+
+            payload = metadata.copy()
+            payload.update({
+                "text_sem": ch.get("text_sem", ""),
+                "page": page_no,
+                "page_no": page_no,
+                "toon_type": ch.get("toon_type", "text"),
+            })
+
+            qdrant_points.append({
+                "id": chunk_id,
+                "vector": vector.tolist(),
+                "payload": payload,
+            })
+
+            pg_rows.append((
+                log_id,
+                g_idx,
+                ch.get("toon_type", "text"),
+                ch.get("text_raw"),
+                ch.get("text_sem"),
+                json.dumps(metadata, ensure_ascii=False),
+                chunk_id,
+            ))
+            # Neo4j Rows (Con tutte le proprietà corrette)
+            k_nodes, k_edges = batch_kg_results.get(g_idx, ([], []))
+
+            # FIX: aggiunge sempre le formule Vision come nodi FORMULA deterministici
+            formula_nodes, formula_edges = formula_kg_from_chunk(ch)
+
+            k_nodes = list(k_nodes or []) + formula_nodes
+            k_edges = list(k_edges or []) + formula_edges
+
+      
+            # FIX: garantisce proprietà standard su tutte le Entity
+            k_nodes = ensure_entity_props_defaults(k_nodes)
+
+            # FIX: arricchisce synonyms SOLO da pattern espliciti nel testo locale
+            k_nodes = enrich_synonyms_from_local_text(k_nodes, ch.get("text_sem", ""))
+            
+
+            neo4j_rows.append({
+                "doc_id": doc_id,
+                "filename": filename,
+                "filename_norm": normalize_doc_name(filename), # <--- AGGIUNTO
+                "doc_type": source_type,
+                "log_id": log_id,
+                "chunk_id": chunk_id,
+                "chunk_index": g_idx,
+                "toon_type": ch.get("toon_type"),
+                "page_no": ch.get("page_no", 1),
+                "nodes": k_nodes,
+                "edges": k_edges,
+                "ontology": ontology,
+                "text_sem": ch.get("text_sem", ""),
+                "section_hint": ch.get("section_hint", "")
+            })
+            
+            total_chunks += 1
+
+        # 4. Flush "intelligente" (meno roundtrip, stessa modalità di scrittura)
+        must_flush = (len(pg_rows) >= DB_FLUSH_SIZE) or (i + len(batch) >= num_chunks_totali)
+
+        if must_flush:
+            flush_postgres_chunks_batch(pg_rows)
+
+            try:
+                pts = [models.PointStruct(id=p["id"], vector=p["vector"], payload=p["payload"]) for p in qdrant_points]
+                qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=pts)
+            except Exception as e:
+                print(f"   ⚠️ Qdrant Error: {e}")
+
+            flush_neo4j_rows_batch(neo4j_rows)
+
+            # Reset buffers (solo dopo flush)
+            pg_rows.clear()
+            qdrant_points.clear()
+            neo4j_rows.clear()
+
+        
+        # Log Avanzamento
+        percentuale = min(100, int((i + len(batch)) / num_chunks_totali * 100))
+        print(f"   📦 Batch {int(i/EMBED_BATCH_SIZE)+1} | {percentuale}% completato | Tempo Batch: {_ms(batch_t0)}ms")
+
+    # 5. Chiusura Finale
+    total_ms = _ms(t0)
+    pg_close_log(log_id, "DONE", total_chunks, total_ms)
+
+    if NEO4J_ENABLED:
+        try:
+            with neo4j_driver.session() as session:
+                session.run("MATCH (d:Document {doc_id: $did}) SET d.processing_time_ms = $ms", did=doc_id, ms=total_ms)
+        except Exception: pass
+
+    # Sposta in PROCESSED
+    move_file_preserving_structure(file_path, PROCESSED_DIR)
+
+
+    print(f"   ✅ Completed: {filename} | chunks={total_chunks} | time={total_ms/1000:.2f}s")
+
+def main():
+    """
+    Producer/Consumer:
+    - Producer: estrae chunk da PDF/MD
+    - Consumer: fa embeddings, KG, Qdrant, Postgres, Neo4j
+    """
+    total_t0 = time.time()
+    
+    
+    USE_PRODUCER_CONSUMER = os.getenv("USE_PRODUCER_CONSUMER", "1") == "1"
+    os.environ["PRODUCER_CONSUMER_MODE"] = "1" if USE_PRODUCER_CONSUMER else "0"
+    
+    #USE_PRODUCER_CONSUMER = os.getenv("USE_PRODUCER_CONSUMER", "1") == "1"
+
+
+
+    # 1. Preparazione cartelle
+    os.makedirs(INBOX_DIR, exist_ok=True)
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    os.makedirs(FAILED_DIR, exist_ok=True)
+    ensure_inbox_structure(INBOX_DIR)
+
+    # 2. Reset Ollama
+    if not force_restart_ollama(num_parallel="1"):
+        print("   ❌ Errore: Impossibile avviare Ollama in modalità ottimizzata.")
+        print("   ⚠️ L'ingestion potrebbe fallire o risultare estremamente lenta.")
+
+    print("\n" + "=" * 60)
+    print("=== Ingestion Engine v2.5 (Producer/Consumer Edition) ===")
+    print("=" * 60 + "\n")
+
+    supported = {".pdf", ".md"}
+
+
+    # 3. Scansione input
+    input_files = []
+    for root, _, files in os.walk(INBOX_DIR):
+        for fname in files:
+            if fname.lower().endswith(".meta.json"):
+                continue
+
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in supported:
+                input_files.append((root, os.path.join(root, fname)))
+
+    if not input_files:
+        print("   ✅ INBOX vuota: nessuna operazione necessaria.")
+        return
+
+    print(f"   📂 Trovati {len(input_files)} file. Inizio sequenza PRODUCER/CONSUMER...")
+
+
+
+    # Modalità sequenziale opzionale:
+    # utile per PDF molto pesanti Vision-heavy, dove producer e consumer
+    # rischiano di stressare Ollama anche con un solo consumer.
+    if not USE_PRODUCER_CONSUMER:
+        print("   🧱 Modalità sequenziale attiva: producer/consumer disabilitato.")
+
+        for root_folder, file_path in input_files:
+            filename = os.path.basename(file_path)
+            log_id = None
+
+            try:
+                doc_meta = dispatch_document(file_path, root_folder)
+                log_id = pg_start_log(filename, "document")
+
+                print(f"   ⚙️ Extracting: {filename}...")
+
+                if file_path.lower().endswith(".md"):
+                    chunks = extract_markdown_chunks(file_path, log_id)
+                else:
+                    chunks = extract_file_chunks(file_path, log_id)
+
+                if not chunks:
+                    pg_close_log(log_id, "FAILED", 0, 0, "No chunks extracted")
+                    shutil.move(file_path, os.path.join(FAILED_DIR, filename))
+                    continue
+
+                print(f"   🧠 Processing: {filename} | chunks={len(chunks)}")
+
+                process_ai_and_db(
+                    file_path=file_path,
+                    source_type="document",
+                    doc_meta=doc_meta,
+                    chunks=chunks,
+                    log_id=log_id
+                )
+
+            except Exception as e:
+                print(f"   ❌ Errore sequenziale su {filename}: {e}")
+
+                if log_id is not None:
+                    try:
+                        pg_close_log(log_id, "FAILED", 0, 0, str(e)[:500])
+                    except Exception:
+                        pass
+
+                try:
+                    move_file_preserving_structure(file_path, FAILED_DIR)
+                except Exception as move_e:
+                    print(f"   ⚠️ Errore spostamento FAILED: {move_e}")
+
+        print("\n" + "=" * 60)
+        print(f"   ✨ Ingestion sequenziale completata | total_time={time.time() - total_t0:.2f}s")
+        print("=" * 60)
+        return
+
+
+    # 4. Coda documenti
+    # Con PDF Vision-heavy conviene tenerla a 1:
+    # - meno RAM occupata
+    # - meno pressione su producer
+    # - meno rischio di avere troppi chunk pronti mentre Ollama è occupato
+    doc_queue = queue.Queue(maxsize=int(os.getenv("DOC_QUEUE_MAXSIZE", "1")))
+
+    # 1 consumer perché hai una sola GPU/Ollama seriale.
+    NUM_CONSUMERS = 1
+
+    def consumer_worker():
+        while True:
+            item = doc_queue.get()
+
+            try:
+                if item is None:
+                    return
+
+                file_path, source_type, doc_meta, chunks, log_id = item
+                filename = os.path.basename(file_path)
+
+                try:
+                    print(f"   🧠 Consumer Processing: {filename} | chunks={len(chunks)}")
+
+                    process_ai_and_db(
+                        file_path=file_path,
+                        source_type=source_type,
+                        doc_meta=doc_meta,
+                        chunks=chunks,
+                        log_id=log_id
+                    )
+
+                except Exception as e:
+                    print(f"   ❌ Errore Consumer su {filename}: {e}")
+
+                    try:
+                        pg_close_log(log_id, "FAILED", 0, 0, str(e)[:500])
+                    except Exception:
+                        pass
+
+                    try:
+                        if os.path.exists(file_path):
+                            shutil.move(file_path, os.path.join(FAILED_DIR, filename))
+                    except Exception as move_e:
+                        print(f"   ⚠️ Errore spostamento FAILED: {move_e}")
+
+            finally:
+                doc_queue.task_done()
+
+    # 5. Avvio consumer
+    consumers = []
+    for _ in range(NUM_CONSUMERS):
+        t = threading.Thread(target=consumer_worker, daemon=False)
+        t.start()
+        consumers.append(t)
+
+    # 6. Producer: estrae i documenti e li mette in coda
+    for root_folder, file_path in input_files:
+        filename = os.path.basename(file_path)
+        log_id = None
+
+        try:
+            doc_meta = dispatch_document(file_path, root_folder)
+            log_id = pg_start_log(filename, "document")
+
+            print(f"   ⚙️ Producer Extracting: {filename}...")
+
+            if file_path.lower().endswith(".md"):
+                chunks = extract_markdown_chunks(file_path, log_id)
+            else:
+                chunks = extract_file_chunks(file_path, log_id)
+
+            if not chunks:
+                pg_close_log(log_id, "FAILED", 0, 0, "No chunks extracted")
+
+                try:
+                    shutil.move(file_path, os.path.join(FAILED_DIR, filename))
+                except Exception as move_e:
+                    print(f"   ⚠️ Errore spostamento FAILED: {move_e}")
+
+                continue
+
+            # Se la coda è piena, il producer aspetta.
+            # Logghiamo l'attesa per evitare l'impressione che lo script sia bloccato.
+            while True:
+                try:
+                    doc_queue.put((file_path, "document", doc_meta, chunks, log_id), timeout=30)
+                    break
+                except queue.Full:
+                    print("   ⏳ Coda piena: attendo il consumer AI/DB...")
+
+        except Exception as e:
+            print(f"   ❌ Errore Producer su {filename}: {e}")
+
+            if log_id is not None:
+                try:
+                    pg_close_log(log_id, "FAILED", 0, 0, str(e)[:500])
+                except Exception:
+                    pass
+
+            try:
+                if os.path.exists(file_path):
+                    shutil.move(file_path, os.path.join(FAILED_DIR, filename))
+            except Exception as move_e:
+                print(f"   ⚠️ Errore spostamento FAILED: {move_e}")
+
+    # 7. Fine producer: invia poison pill
+    print("   ⏳ Lettura documenti completata. Attesa completamento AI/Database...")
+
+    for _ in range(NUM_CONSUMERS):
+        doc_queue.put(None)
+
+    # Aspetta anche i poison pill, perché consumer chiama task_done() nel finally
+    doc_queue.join()
+
+    for t in consumers:
+        t.join()
+
+    # 8. Cleanup finale Ollama
+    try:
+        if PDF_VISION_ENABLED and VISION_MODEL_NAME:
+            force_unload_ollama(VISION_MODEL_NAME)
+
+        if LLM_MODEL_NAME:
+            force_unload_ollama(LLM_MODEL_NAME)
+
+    except Exception:
+        pass
+
+    total_ms = _ms(total_t0)
+
+    print("\n" + "=" * 60)
+    print(f"   ✨ Ingestion Producer/Consumer completata con successo | total_time={total_ms/1000:.2f}s")
+    print("=" * 60)
+    
+    
+if __name__ == "__main__":
+    main()

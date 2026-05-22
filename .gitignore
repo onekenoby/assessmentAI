@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+
+# Ambienti Virtuali
+venv/
+env/
+ENV/
+
+# Cartelle Dati e Modelli (MOLTO IMPORTANTE)
+data/
+INBOX_DIR/
+modelli/
+*.gguf
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+bak/
+.web

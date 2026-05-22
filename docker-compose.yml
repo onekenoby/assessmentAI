@@ -1,0 +1,141 @@
+##########################################
+### DOCKER COMPOSE - ASSESSMENT STACK (Con LibreOffice + Neo4j Plugins)
+##########################################
+
+##########################################
+#
+# Per avviare:
+#
+#
+# docker compose --profile finance down   
+# docker compose --profile assessment up -d
+##########################################
+
+services:
+
+  # ========================================================
+  # STACK FINANCE
+  # ========================================================
+  
+  timescaledb_finance:
+    image: timescale/timescaledb:latest-pg16
+    container_name: ai_timescale_finance
+    profiles: ["finance"] # <---
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin_password
+      POSTGRES_DB: ai_ingestion
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/finance/postgres:/var/lib/postgresql/data
+    networks:
+      - ai_network
+
+  qdrant_finance:
+    image: qdrant/qdrant:latest
+    container_name: ai_qdrant_finance
+    profiles: ["finance"] # <--- 
+    restart: always
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./data/finance/qdrant:/qdrant/storage
+    networks:
+      - ai_network
+
+  neo4j_finance:
+    image: neo4j:latest
+    container_name: ai_neo4j_finance
+    profiles: ["finance"] # <---
+    restart: always
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/admin_password
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+    volumes:
+      - ./data/finance/neo4j/data:/data
+      - ./data/finance/neo4j/logs:/logs
+    networks:
+      - ai_network
+
+
+  # ========================================================
+  # STACK ASSESSMENT (Nuovo POC)
+  # ========================================================
+
+  timescaledb_assessment:
+    image: timescale/timescaledb:latest-pg16
+    container_name: ai_timescale_assessment
+    profiles: ["assessment"]
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin_password
+      POSTGRES_DB: assessment_ingestion
+    ports:
+      - "5433:5432" # Porta esterna 5433
+    volumes:
+      - ./data/assessment/postgres:/var/lib/postgresql/data
+    networks:
+      - ai_network
+
+  qdrant_assessment:
+    image: qdrant/qdrant:latest
+    container_name: ai_qdrant_assessment
+    profiles: ["assessment"]
+    restart: always
+    ports:
+      - "6334:6333" # Porta esterna 6334
+    volumes:
+      - ./data/assessment/qdrant:/qdrant/storage
+    networks:
+      - ai_network
+
+  neo4j_assessment:
+    image: neo4j:latest
+    container_name: ai_neo4j_assessment
+    profiles: ["assessment"]
+    restart: always
+    ports:
+      - "7475:7474" # Browser su 7475
+      - "7688:7687" # Bolt su 7688
+    environment:
+      NEO4J_AUTH: neo4j/admin_password
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+    volumes:
+      - ./data/assessment/neo4j/data:/data
+      - ./data/assessment/neo4j/logs:/logs
+    networks:
+      - ai_network
+
+  # ========================================================
+  # OFFICE COMPONENT (LibreOffice Web Interface)
+  # ========================================================
+
+  libreoffice:
+    image: lscr.io/linuxserver/libreoffice:latest
+    container_name: ai_office_interface
+    profiles: ["assessment"]
+    restart: always
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Rome
+    volumes:
+      - ./data/assessment/inbox:/config/workspace # Mappa la cartella dei documenti
+    ports:
+      - "3001:3000" # Accedi via browser su http://localhost:3001
+    networks:
+      - ai_network
+
+networks:
+  ai_network:
+    driver: bridge
