@@ -1,21 +1,6 @@
-
-import os
-
-# --- FIX ANTI-BLOCCO GUI/RAG ---
-# Deve stare prima di torch / sentence_transformers.
-# Evita oversubscription CPU e freeze quando embedding + Ollama lavorano insieme.
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-CPU_THREADS = os.environ.get("EMBED_CPU_THREADS", "4")
-os.environ.setdefault("OMP_NUM_THREADS", CPU_THREADS)
-os.environ.setdefault("MKL_NUM_THREADS", CPU_THREADS)
-os.environ.setdefault("OPENBLAS_NUM_THREADS", CPU_THREADS)
-os.environ.setdefault("NUMEXPR_NUM_THREADS", CPU_THREADS)
-
-
 import reflex as rx
 import torch
-
+import os
 import time
 import re
 import json
@@ -36,11 +21,10 @@ from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import uuid
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict
 
 import warnings
 import logging
-
 
 # 1. Nasconde i warning standard di Python sollevati dal modulo neo4j
 warnings.filterwarnings("ignore", module="neo4j")
@@ -366,13 +350,8 @@ neo4j_driver = None
 pg_pool = None
 
 # Device selection (già definiti nel tuo script, ma assicurati siano accessibili)
-# Device selection
-# Per la GUI/RAG conviene CPU di default per non competere con Ollama sulla VRAM.
-# Se vuoi forzare CUDA: set EMBED_DEVICE=cuda
-#device_embed = "cuda" if torch.cuda.is_available() else "cpu"
-#device_rerank = "cpu" 
-device_embed = os.getenv("EMBED_DEVICE", "cpu")
-device_rerank = os.getenv("RERANK_DEVICE", "cpu")
+device_embed = "cuda" if torch.cuda.is_available() else "cpu"
+device_rerank = "cpu" 
 
 def init_resources():
     """
@@ -2651,12 +2630,12 @@ def extract_rag_tokens(query_text: str) -> List[str]:
 
 def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
     """
-    Ricerca diretta nel grafo Neo4j sui nodi Entity reali.
+    Ricerca diretta nel grafo Neo4j sui nodi Entity.
 
-    Coerente con ingestion.py:
-    - ingestion crea nodi (e:Entity)
-    - collega Entity -> Chunk con PRESENT_IN
-    - il contenuto completo viene arricchito dopo da Postgres tramite chunk_uuid
+    Versione pulita:
+    - non usa proprietà Neo4j inesistenti come source_name/content_semantic/content_raw
+    - ritorna chunk_id coerente con chunk_uuid usato da Qdrant/Postgres
+    - lascia a Postgres il compito di arricchire il contenuto completo
     """
     if not neo4j_driver or not query_text.strip():
         return []
@@ -2667,27 +2646,30 @@ def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, An
         return []
 
     cypher = """
-    MATCH (e:Entity)-[:PRESENT_IN|MENTIONED_IN]->(c:Chunk)
-    WHERE any(tok IN $tokens WHERE
-        toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
-        toLower(coalesce(e.description, '')) CONTAINS tok OR
-        toLower(coalesce(e.category, e.type, labels(e)[0], '')) CONTAINS tok OR
-        any(s IN coalesce(e.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
-        toLower(coalesce(c.filename, '')) CONTAINS tok OR
-        toLower(coalesce(c.text, '')) CONTAINS tok
+    MATCH (f)-[:MENTIONED_IN|PRESENT_IN]->(c:Chunk)
+    WHERE (
+            f:Formula
+            OR toUpper(coalesce(f.category, '')) = 'FORMULA'
+        )
+    AND any(tok IN $tokens WHERE
+            toLower(coalesce(c.filename, '')) CONTAINS tok OR
+            toLower(coalesce(f.latex, '')) CONTAINS tok OR
+            toLower(coalesce(f.formula, '')) CONTAINS tok OR
+            toLower(coalesce(f.plain, '')) CONTAINS tok OR
+            toLower(coalesce(f.meaning_it, '')) CONTAINS tok OR
+            toLower(coalesce(f.description, '')) CONTAINS tok OR
+            toLower(coalesce(f.name, f.id, '')) CONTAINS tok
     )
-    WITH
-        c,
-        collect(DISTINCT coalesce(e.name, e.id)) AS entities,
-        count(DISTINCT e) AS rel_count
     RETURN
         coalesce(c.chunk_id, c.id) AS chunk_id,
         coalesce(c.filename, 'Neo4j') AS filename,
         coalesce(c.page, 0) AS page,
         coalesce(c.chunk_index, 0) AS chunk_index,
-        entities,
-        rel_count
-    ORDER BY rel_count DESC, page ASC, chunk_index ASC
+        coalesce(f.latex, f.formula, '') AS latex,
+        coalesce(f.plain, f.name, f.id, '') AS plain,
+        coalesce(f.meaning_it, f.description, '') AS meaning,
+        count(*) AS rel_count
+    ORDER BY page ASC, chunk_index ASC
     LIMIT $limit
     """
 
@@ -2703,23 +2685,20 @@ def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, An
                 if not cid:
                     continue
 
-                entities = r.get("entities") or []
-                entity_preview = ", ".join(str(x) for x in entities[:12])
-
                 out.append({
                     "id": str(cid),
-                    "content": "Entity match: " + entity_preview,
+                    "content": r.get("content") or "",
                     "filename": r.get("filename") or "Neo4j",
                     "page": int(r.get("page") or 0),
                     "type": "graph",
                     "tier": "GRAPH",
                     "score_graph": float(r.get("rel_count") or 1.0),
-                    "origin": "Neo4j Entity Search",
-                    "section_hint": "Entities: " + ", ".join(str(x) for x in entities[:5]),
+                    "origin": f"Neo4j Entity Search: {r.get('entity_name')}",
+                    "section_hint": f"Entity: {r.get('entity_name')}",
                 })
 
     except Exception as e:
-        print(f"⚠️ Neo4j entity search error: {e}")
+        print(f"⚠️ Neo4j direct search error: {e}")
 
     return out
 
@@ -2993,8 +2972,8 @@ def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, A
         toLower(coalesce(e2.description, '')) CONTAINS tok OR
         toLower(coalesce(e1.category, e1.type, labels(e1)[0], '')) CONTAINS tok OR
         toLower(coalesce(e2.category, e2.type, labels(e2)[0], '')) CONTAINS tok OR
-        any(s IN coalesce(e1.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
-        any(s IN coalesce(e2.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok)
+        any(s IN coalesce(e1.synonyms, []) WHERE toLower(s) CONTAINS tok) OR
+        any(s IN coalesce(e2.synonyms, []) WHERE toLower(s) CONTAINS tok)
     )
     OPTIONAL MATCH (e1)-[:PRESENT_IN|MENTIONED_IN]->(c1:Chunk)
     OPTIONAL MATCH (e2)-[:PRESENT_IN|MENTIONED_IN]->(c2:Chunk)
@@ -3020,31 +2999,13 @@ def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, A
         return []
 
 
-
-
-def clean_graph_relation_label(value: Any) -> str:
-    """
-    Pulisce il nome della relazione Neo4j prima di mostrarla in tabella.
-    Evita che props Neo4j come last_seen/evidence finiscano nella colonna Relazione.
-    """
-    text = str(value or "RELATES_TO").strip()
-
-    # Se per errore arriva già una relazione contaminata da props:
-    # "COMPLIES_WITH {'last_seen': ...}" -> "COMPLIES_WITH"
-    if "{" in text:
-        text = text.split("{", 1)[0].strip()
-
-    text = text.upper()
-    text = re.sub(r"[^A-Z0-9_]+", "_", text)
-    text = re.sub(r"_+", "_", text).strip("_")
-
-    return text[:80] or "RELATES_TO"
-
+from typing import List, Dict, Any, Optional
 
 def graph_relations_to_source(rows: List[Dict[str, Any]]) -> Optional[SourceItem]:
     """
     Converte le relazioni Neo4j in una tabella Markdown.
-    La colonna Relazione contiene SOLO il type Neo4j, non le proprietà dell'arco.
+    Questo rende il contesto grafo più deterministico per il modello.
+    Blindata con _md_cell per evitare la corruzione della tabella Markdown.
     """
     if not rows:
         return None
@@ -3059,8 +3020,15 @@ def graph_relations_to_source(rows: List[Dict[str, Any]]) -> Optional[SourceItem
     seen = set()
 
     for r in rows:
+        # Usa _md_cell (già presente nel tuo codice) per pulire e troncare in sicurezza
         source = _md_cell(r.get("source") or "", 180)
-        relation = _md_cell(clean_graph_relation_label(r.get("relation")), 120)
+        
+        # Recuperiamo anche le proprietà della relazione (se presenti) per dare più contesto
+        props = r.get("props") or {}
+        props_str = f" {props}" if props else ""
+        relation_raw = str(r.get("relation") or "RELATES_TO") + props_str
+        relation = _md_cell(relation_raw, 120)
+        
         target = _md_cell(r.get("target") or "", 180)
         filename = _md_cell(r.get("filename") or "N/D", 200)
         page = int(r.get("page") or 0)
@@ -3092,6 +3060,7 @@ def graph_relations_to_source(rows: List[Dict[str, Any]]) -> Optional[SourceItem
         db_origin="Neo4j Relation Search",
         section_hint="Entity relations table",
     )
+
 
 
 def _md_cell(value: Any, max_len: int = 600) -> str:
@@ -3742,7 +3711,6 @@ def extract_requested_document(query_text: str) -> str:
 def candidate_matches_requested_doc(candidate: Dict[str, Any], requested_doc: str) -> bool:
     """
     Verifica se un candidato appartiene al documento richiesto.
-    Evita che filename vuoto / Unknown / Neo4j passino il filtro documentale.
     """
     if not requested_doc:
         return True
@@ -3751,16 +3719,9 @@ def candidate_matches_requested_doc(candidate: Dict[str, Any], requested_doc: st
     if not wanted:
         return True
 
-    raw_filename = str(candidate.get("filename", "") or "").strip()
+    filename = normalize_doc_name(candidate.get("filename", ""))
 
-    if raw_filename in ("", "Unknown", "Neo4j", "KG", "Neo4j Knowledge Graph"):
-        return False
-
-    filename = normalize_doc_name(raw_filename)
-
-    if not filename:
-        return False
-
+    # Match robusto nei due versi
     return wanted in filename or filename in wanted
 
 def search_pg_by_document_scope(
@@ -3898,19 +3859,6 @@ def search_pg_by_document_scope(
     finally:
         pg_pool.putconn(conn)
 
-def relation_row_matches_requested_doc(row: Dict[str, Any], requested_doc: str) -> bool:
-    """
-    Applica lo stesso filtro documento anche alle relazioni Neo4j.
-    """
-    if not requested_doc:
-        return True
-
-    return candidate_matches_requested_doc(
-        {"filename": row.get("filename", "")},
-        requested_doc,
-    )
-
-
 def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem], str]:
     """
     Retrieval V5:
@@ -4047,19 +3995,6 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
 
     neo4j_entity_hits = search_neo4j_entities(expanded_query, limit=30)
     neo4j_relation_rows = search_neo4j_relations(expanded_query, limit=40)
-
-    # Se l'utente ha chiesto un documento specifico,
-    # anche le relazioni Neo4j devono rispettare lo stesso perimetro.
-    if requested_doc and neo4j_relation_rows:
-        before_rel_scope = len(neo4j_relation_rows)
-
-        neo4j_relation_rows = [
-            r for r in neo4j_relation_rows
-            if relation_row_matches_requested_doc(r, requested_doc)
-        ]
-
-        counts["neo4j_relation_scope_before"] = before_rel_scope
-        counts["neo4j_relation_scope_after"] = len(neo4j_relation_rows)
 
     formula_query = (
         intent == "formula"
@@ -4500,34 +4435,26 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
         if preferred_content:
             t["content"] = preferred_content
 
-        current_filename = str(t.get("filename") or "").strip()
-        pg_filename = (
-            pg_meta.get("filename")
+        t["filename"] = (
+            t.get("filename")
+            or pg_meta.get("filename")
             or pg_meta.get("source_name")
-            or current_filename
             or "Unknown"
         )
 
-        if current_filename in ("", "Unknown", "Neo4j", "KG", "Neo4j Knowledge Graph"):
-            t["filename"] = pg_filename
-        else:
-            t["filename"] = current_filename
+        t["page"] = int(
+            t.get("page")
+            or pg_meta.get("page_no")
+            or pg_meta.get("page")
+            or 0
+        )
 
-        current_page = int(t.get("page") or 0)
-        pg_page = int(pg_meta.get("page_no") or pg_meta.get("page") or 0)
-
-        if current_page <= 0 and pg_page > 0:
-            t["page"] = pg_page
-        else:
-            t["page"] = current_page
-
-        current_type = normalize_source_type(t.get("type", ""))
-        pg_type = normalize_source_type(pg_meta.get("toon_type") or pg_meta.get("type") or "")
-
-        if current_type in ("", "graph") and pg_type:
-            t["type"] = pg_type
-        else:
-            t["type"] = current_type or "text"
+        t["type"] = (
+            t.get("type")
+            or pg_meta.get("toon_type")
+            or pg_meta.get("type")
+            or "text"
+        )
 
         t["tier"] = normalize_tier_value(
             t.get("tier")
