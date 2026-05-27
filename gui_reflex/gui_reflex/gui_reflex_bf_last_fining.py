@@ -1,6 +1,21 @@
+
+import os
+
+# --- FIX ANTI-BLOCCO GUI/RAG ---
+# Deve stare prima di torch / sentence_transformers.
+# Evita oversubscription CPU e freeze quando embedding + Ollama lavorano insieme.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+CPU_THREADS = os.environ.get("EMBED_CPU_THREADS", "4")
+os.environ.setdefault("OMP_NUM_THREADS", CPU_THREADS)
+os.environ.setdefault("MKL_NUM_THREADS", CPU_THREADS)
+os.environ.setdefault("OPENBLAS_NUM_THREADS", CPU_THREADS)
+os.environ.setdefault("NUMEXPR_NUM_THREADS", CPU_THREADS)
+
+
 import reflex as rx
 import torch
-import os
+
 import time
 import re
 import json
@@ -12,7 +27,7 @@ from collections import Counter
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import execute_values
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
 from neo4j import GraphDatabase
 from openai import OpenAI
@@ -21,10 +36,11 @@ from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import uuid
 
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 
 import warnings
 import logging
+
 
 # 1. Nasconde i warning standard di Python sollevati dal modulo neo4j
 warnings.filterwarnings("ignore", module="neo4j")
@@ -350,8 +366,13 @@ neo4j_driver = None
 pg_pool = None
 
 # Device selection (già definiti nel tuo script, ma assicurati siano accessibili)
-device_embed = "cuda" if torch.cuda.is_available() else "cpu"
-device_rerank = "cpu" 
+# Device selection
+# Per la GUI/RAG conviene CPU di default per non competere con Ollama sulla VRAM.
+# Se vuoi forzare CUDA: set EMBED_DEVICE=cuda
+#device_embed = "cuda" if torch.cuda.is_available() else "cpu"
+#device_rerank = "cpu" 
+device_embed = os.getenv("EMBED_DEVICE", "cpu")
+device_rerank = os.getenv("RERANK_DEVICE", "cpu")
 
 def init_resources():
     """
@@ -854,14 +875,147 @@ def solve_risk_product(query_text: str) -> Optional[str]:
         "- Dati e formula forniti dall'utente."
     )
 
+def _parse_it_number(value: str) -> float:
+    """
+    Converte numeri IT/EN:
+    - 250.000 -> 250000
+    - 250,5 -> 250.5
+    - 250.000,50 -> 250000.50
+    - 250,000.50 -> 250000.50
+    """
+    v = (value or "").strip().replace(" ", "")
+
+    if not v:
+        raise ValueError("empty number")
+
+    # Formato italiano: 1.234,56
+    if "," in v and "." in v and v.rfind(",") > v.rfind("."):
+        v = v.replace(".", "").replace(",", ".")
+    # Formato inglese: 1,234.56
+    elif "," in v and "." in v and v.rfind(".") > v.rfind(","):
+        v = v.replace(",", "")
+    # Solo virgola decimale
+    elif "," in v and "." not in v:
+        v = v.replace(",", ".")
+    # Solo punti: se sembrano migliaia, rimuovili
+    elif "." in v and re.fullmatch(r"\d{1,3}(?:\.\d{3})+", v):
+        v = v.replace(".", "")
+
+    return float(v)
+
+
+def _format_euro_it(value: float) -> str:
+    return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def solve_percentage_remainder_allocation(query_text: str) -> Optional[str]:
+    """
+    Solver non adattativo per allocazioni percentuali residue.
+
+    Esempi di classe:
+    - budget 250000, 40% ad A, 35% a B, restante a C
+    - importo totale X, quota 20%, quota 30%, residuo
+    - total budget X, 40% A, 35% B, remaining C
+    """
+    q = query_text or ""
+    ql = q.lower()
+
+    remainder_terms = [
+        "restante", "residuo", "rimanente", "rimanenza",
+        "remaining", "remainder", "residual", "leftover",
+    ]
+
+    allocation_terms = [
+        "budget", "totale", "importo", "costo", "costi", "alloca", "allocato",
+        "quota", "percentuale", "effort", "total", "amount", "cost", "costs",
+        "allocated", "allocation", "share", "percentage",
+    ]
+
+    if not any(t in ql for t in remainder_terms):
+        return None
+
+    if not any(t in ql for t in allocation_terms):
+        return None
+
+    # Estrae percentuali.
+    percentages = [
+        _parse_it_number(m.group(1))
+        for m in re.finditer(r"(\d+(?:[.,]\d+)?)\s*%", q)
+    ]
+
+    if len(percentages) < 2:
+        return None
+
+    # Estrae importi candidati. Prende il valore più grande come totale.
+    numeric_candidates = []
+    for m in re.finditer(r"\b\d{1,3}(?:[.\s]\d{3})+(?:,\d+)?\b|\b\d+(?:[,.]\d+)?\b", q):
+        raw = m.group(0)
+        try:
+            val = _parse_it_number(raw)
+            if val > 100:
+                numeric_candidates.append(val)
+        except Exception:
+            continue
+
+    if not numeric_candidates:
+        return None
+
+    total = max(numeric_candidates)
+    used_pct = sum(percentages)
+    remaining_pct = 100.0 - used_pct
+
+    if remaining_pct < 0:
+        return None
+
+    remaining_amount = total * remaining_pct / 100.0
+
+    pct_details = " + ".join(f"{p:g}%" for p in percentages)
+
+    return (
+        "**A) Risposta**\n\n"
+        f"La quota residua è **{remaining_pct:g}%** e corrisponde a "
+        f"**{_format_euro_it(remaining_amount)} euro**.\n\n"
+        "**Calcolo deterministico:**\n\n"
+        f"- Totale = `{_format_euro_it(total)} euro`\n"
+        f"- Percentuali già allocate = `{pct_details} = {used_pct:g}%`\n"
+        f"- Percentuale residua = `100% - {used_pct:g}% = {remaining_pct:g}%`\n"
+        f"- Importo residuo = `{_format_euro_it(total)} × {remaining_pct:g}% = {_format_euro_it(remaining_amount)} euro`\n\n"
+        "**B) Evidenze**\n\n"
+        "- I valori numerici usati nel calcolo sono stati estratti dalla domanda dell'utente.\n"
+        "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
+        "**C) Limiti / Conflitti**\n\n"
+        "- Il calcolo considera le percentuali come quote del totale indicato.\n"
+        "- Eventuali costi indiretti, arrotondamenti contabili o imposte non sono considerati se non esplicitamente forniti.\n\n"
+        "**D) Fonti**\n\n"
+        "- Dati numerici forniti dall'utente."
+    )
 
 def try_solve_math_query(query_text: str) -> Optional[str]:
     """
-    Forziamo SEMPRE il ritorno a None. 
-    In questo modo il sistema RAG recupera i documenti e lascia che sia 
-    l'LLM (tramite il System Prompt) a eseguire l'operazione matematica.
-    Nessun calcolo hardcoded nel codice Python.
+    Solver matematico deterministico non adattativo.
+
+    Ordine:
+    1. coverage controlli;
+    2. prodotto rischio;
+    3. allocazioni percentuali residue;
+    4. offset temporali espliciti.
     """
+    coverage = solve_control_coverage(query_text)
+    if coverage:
+        return coverage
+
+    risk_product = solve_risk_product(query_text)
+    if risk_product:
+        return risk_product
+
+    remainder = solve_percentage_remainder_allocation(query_text)
+    if remainder:
+        return remainder
+
+    date_offsets = try_solve_date_offsets(query_text)
+    if date_offsets:
+        return date_offsets
+
     return None
 
 def needs_math_document_context(query_text: str) -> bool:
@@ -975,24 +1129,72 @@ GLOSSARY_TERM_ALIASES: Dict[str, List[str]] = {}
 KNOWN_GLOSSARY_TERMS = list(GLOSSARY_TERM_ALIASES.keys())
 
 
+def _looks_like_filename(value: str) -> bool:
+    """
+    Evita che nomi file tra virgolette vengano trattati come voci di glossario.
+    """
+    v = (value or "").strip().lower()
+    return bool(re.search(r"\.(pdf|md|txt|docx|html|csv|xlsx)$", v))
+
+
+def _is_compound_term(value: str) -> bool:
+    """
+    Riconosce termini composti che NON devono essere spezzati automaticamente:
+    CSIRT-NX, ISO-XYZ, MFA_2, DORA/X, NIS2-Cloud, ecc.
+    """
+    v = (value or "").strip()
+    if len(v) < 3:
+        return False
+
+    return bool(
+        re.search(r"[A-Z]{2,}[A-Z0-9]*\s*[-_/]\s*[A-Z0-9]{1,}", v)
+        or re.search(r"\b[A-Z]{2,}\d+[A-Z0-9]*\b", v)
+    )
+
+
 def extract_requested_terms(query_text: str) -> List[str]:
     """
-    Estrae termini richiesti per il glossario in modo agnostico:
-    Cattura ciò che l'utente ha messo tra virgolette o eventuali acronimi.
+    Estrae termini richiesti per glossario/acronimi in modo non adattativo.
+
+    Regola:
+    1. prima frasi tra virgolette;
+    2. poi termini composti con -, _, / o numeri;
+    3. solo se non ci sono composti, acronimi singoli.
+
+    Questo evita che "CSIRT-NX" venga spezzato in "CSIRT" e "NX".
     """
     q = query_text or ""
     terms: List[str] = []
-    
-    # Cattura stringhe tra virgolette (es. Definisci "Advanced Persistent Threat")
-    quoted = re.findall(r"[\"“']([^\"”']+)[\"”']", q)
-    terms.extend([x.strip() for x in quoted if len(x.strip()) > 2])
-    
-    # Cattura acronimi in maiuscolo (es. Definisci APT)
-    acronyms = re.findall(r"\b[A-Z]{2,8}\b", q)
-    terms.extend(acronyms)
-    
-    return list(dict.fromkeys(terms))
 
+    # 1) Frasi esplicite tra virgolette.
+    quoted = re.findall(r"[\"“']([^\"”']+)[\"”']", q)
+    for item in quoted:
+        clean = item.strip()
+        if len(clean) > 2 and not _looks_like_filename(clean):
+            terms.append(clean)
+
+    # 2) Termini composti non separabili.
+    compound_terms = re.findall(
+        r"\b[A-Z][A-Z0-9]{1,}(?:[-_/][A-Z0-9]{1,})+\b",
+        q
+    )
+
+    for item in compound_terms:
+        clean = item.strip()
+        if clean and clean not in terms:
+            terms.append(clean)
+
+    # 3) Se esiste almeno un composto, NON spezzarlo in sottoparti.
+    if compound_terms:
+        return list(dict.fromkeys(terms))
+
+    # 4) Acronomi singoli solo se non abbiamo trovato composti.
+    acronyms = re.findall(r"\b[A-Z]{2,10}\d{0,3}\b", q)
+    for acr in acronyms:
+        if acr not in terms:
+            terms.append(acr)
+
+    return list(dict.fromkeys(terms))
 
 def extract_exact_phrases(query_text: str) -> List[str]:
     """Estrazione generalista (Agnostica). Estrae stringhe tra virgolette e acronimi."""
@@ -1283,7 +1485,56 @@ def is_graph_relation_query(query_text: str) -> bool:
 
     return any(re.search(rf"\b{re.escape(t)}\b", q) for t in relation_terms)
 
+def should_use_graph_relation_strict_mode(query_text: str) -> bool:
+    """
+    Decide se usare la risposta deterministica tabellare da grafo.
 
+    Non sostituisce is_graph_relation_query():
+    - is_graph_relation_query resta utile per retrieval/espansione;
+    - questa funzione decide SOLO il formato finale.
+
+    Regola non adattativa:
+    usa tabella grafo solo quando l'utente chiede esplicitamente
+    nodi, archi, path, catene, relazioni o traversamenti.
+    """
+    q = (query_text or "").lower().strip()
+
+    if not q:
+        return False
+
+    # Se la domanda è esplicativa/valutativa, il grafo può essere fonte,
+    # ma NON deve imporre il formato tabellare.
+    explanatory_terms = [
+        # IT
+        "qual è", "quale è", "quali sono", "che cosa", "cosa significa",
+        "ruolo", "scopo", "funzione", "descrivi", "spiega", "analizza",
+        "valuta", "giustifica", "perché", "perche", "in che modo",
+        "come funziona", "elabora", "sintetizza",
+
+        # EN
+        "what is", "what are", "role", "purpose", "function",
+        "describe", "explain", "analyze", "analyse", "evaluate",
+        "justify", "why", "how does", "how do", "summarize", "summarise",
+    ]
+
+    if any(t in q for t in explanatory_terms):
+        return False
+
+    strong_graph_terms = [
+        # IT
+        "neo4j", "cypher", "grafo", "nodi", "nodo", "archi", "arco",
+        "path", "percorso", "traversamento", "multi-hop", "catena semantica",
+        "traccia la catena", "mostra le relazioni", "tabella relazioni",
+        "relazioni tra", "collegamenti tra",
+
+        # EN
+        "graph", "nodes", "node", "edges", "edge", "path", "traversal",
+        "multi-hop", "semantic chain", "trace the chain",
+        "show relationships", "relationship table", "relations between",
+        "links between",
+    ]
+
+    return any(t in q for t in strong_graph_terms)
 
 import re
 
@@ -2630,12 +2881,12 @@ def extract_rag_tokens(query_text: str) -> List[str]:
 
 def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
     """
-    Ricerca diretta nel grafo Neo4j sui nodi Entity.
+    Ricerca diretta nel grafo Neo4j sui nodi Entity reali.
 
-    Versione pulita:
-    - non usa proprietà Neo4j inesistenti come source_name/content_semantic/content_raw
-    - ritorna chunk_id coerente con chunk_uuid usato da Qdrant/Postgres
-    - lascia a Postgres il compito di arricchire il contenuto completo
+    Coerente con ingestion.py:
+    - ingestion crea nodi (e:Entity)
+    - collega Entity -> Chunk con PRESENT_IN
+    - il contenuto completo viene arricchito dopo da Postgres tramite chunk_uuid
     """
     if not neo4j_driver or not query_text.strip():
         return []
@@ -2646,30 +2897,27 @@ def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, An
         return []
 
     cypher = """
-    MATCH (f)-[:MENTIONED_IN|PRESENT_IN]->(c:Chunk)
-    WHERE (
-            f:Formula
-            OR toUpper(coalesce(f.category, '')) = 'FORMULA'
-        )
-    AND any(tok IN $tokens WHERE
-            toLower(coalesce(c.filename, '')) CONTAINS tok OR
-            toLower(coalesce(f.latex, '')) CONTAINS tok OR
-            toLower(coalesce(f.formula, '')) CONTAINS tok OR
-            toLower(coalesce(f.plain, '')) CONTAINS tok OR
-            toLower(coalesce(f.meaning_it, '')) CONTAINS tok OR
-            toLower(coalesce(f.description, '')) CONTAINS tok OR
-            toLower(coalesce(f.name, f.id, '')) CONTAINS tok
+    MATCH (e:Entity)-[:PRESENT_IN|MENTIONED_IN]->(c:Chunk)
+    WHERE any(tok IN $tokens WHERE
+        toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
+        toLower(coalesce(e.description, '')) CONTAINS tok OR
+        toLower(coalesce(e.category, e.type, labels(e)[0], '')) CONTAINS tok OR
+        any(s IN coalesce(e.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
+        toLower(coalesce(c.filename, '')) CONTAINS tok OR
+        toLower(coalesce(c.text, '')) CONTAINS tok
     )
+    WITH
+        c,
+        collect(DISTINCT coalesce(e.name, e.id)) AS entities,
+        count(DISTINCT e) AS rel_count
     RETURN
         coalesce(c.chunk_id, c.id) AS chunk_id,
         coalesce(c.filename, 'Neo4j') AS filename,
         coalesce(c.page, 0) AS page,
         coalesce(c.chunk_index, 0) AS chunk_index,
-        coalesce(f.latex, f.formula, '') AS latex,
-        coalesce(f.plain, f.name, f.id, '') AS plain,
-        coalesce(f.meaning_it, f.description, '') AS meaning,
-        count(*) AS rel_count
-    ORDER BY page ASC, chunk_index ASC
+        entities,
+        rel_count
+    ORDER BY rel_count DESC, page ASC, chunk_index ASC
     LIMIT $limit
     """
 
@@ -2685,20 +2933,23 @@ def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, An
                 if not cid:
                     continue
 
+                entities = r.get("entities") or []
+                entity_preview = ", ".join(str(x) for x in entities[:12])
+
                 out.append({
                     "id": str(cid),
-                    "content": r.get("content") or "",
+                    "content": "Entity match: " + entity_preview,
                     "filename": r.get("filename") or "Neo4j",
                     "page": int(r.get("page") or 0),
                     "type": "graph",
                     "tier": "GRAPH",
                     "score_graph": float(r.get("rel_count") or 1.0),
-                    "origin": f"Neo4j Entity Search: {r.get('entity_name')}",
-                    "section_hint": f"Entity: {r.get('entity_name')}",
+                    "origin": "Neo4j Entity Search",
+                    "section_hint": "Entities: " + ", ".join(str(x) for x in entities[:5]),
                 })
 
     except Exception as e:
-        print(f"⚠️ Neo4j direct search error: {e}")
+        print(f"⚠️ Neo4j entity search error: {e}")
 
     return out
 
@@ -2972,8 +3223,8 @@ def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, A
         toLower(coalesce(e2.description, '')) CONTAINS tok OR
         toLower(coalesce(e1.category, e1.type, labels(e1)[0], '')) CONTAINS tok OR
         toLower(coalesce(e2.category, e2.type, labels(e2)[0], '')) CONTAINS tok OR
-        any(s IN coalesce(e1.synonyms, []) WHERE toLower(s) CONTAINS tok) OR
-        any(s IN coalesce(e2.synonyms, []) WHERE toLower(s) CONTAINS tok)
+        any(s IN coalesce(e1.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
+        any(s IN coalesce(e2.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok)
     )
     OPTIONAL MATCH (e1)-[:PRESENT_IN|MENTIONED_IN]->(c1:Chunk)
     OPTIONAL MATCH (e2)-[:PRESENT_IN|MENTIONED_IN]->(c2:Chunk)
@@ -2999,13 +3250,31 @@ def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, A
         return []
 
 
-from typing import List, Dict, Any, Optional
+
+
+def clean_graph_relation_label(value: Any) -> str:
+    """
+    Pulisce il nome della relazione Neo4j prima di mostrarla in tabella.
+    Evita che props Neo4j come last_seen/evidence finiscano nella colonna Relazione.
+    """
+    text = str(value or "RELATES_TO").strip()
+
+    # Se per errore arriva già una relazione contaminata da props:
+    # "COMPLIES_WITH {'last_seen': ...}" -> "COMPLIES_WITH"
+    if "{" in text:
+        text = text.split("{", 1)[0].strip()
+
+    text = text.upper()
+    text = re.sub(r"[^A-Z0-9_]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+
+    return text[:80] or "RELATES_TO"
+
 
 def graph_relations_to_source(rows: List[Dict[str, Any]]) -> Optional[SourceItem]:
     """
     Converte le relazioni Neo4j in una tabella Markdown.
-    Questo rende il contesto grafo più deterministico per il modello.
-    Blindata con _md_cell per evitare la corruzione della tabella Markdown.
+    La colonna Relazione contiene SOLO il type Neo4j, non le proprietà dell'arco.
     """
     if not rows:
         return None
@@ -3020,15 +3289,8 @@ def graph_relations_to_source(rows: List[Dict[str, Any]]) -> Optional[SourceItem
     seen = set()
 
     for r in rows:
-        # Usa _md_cell (già presente nel tuo codice) per pulire e troncare in sicurezza
         source = _md_cell(r.get("source") or "", 180)
-        
-        # Recuperiamo anche le proprietà della relazione (se presenti) per dare più contesto
-        props = r.get("props") or {}
-        props_str = f" {props}" if props else ""
-        relation_raw = str(r.get("relation") or "RELATES_TO") + props_str
-        relation = _md_cell(relation_raw, 120)
-        
+        relation = _md_cell(clean_graph_relation_label(r.get("relation")), 120)
         target = _md_cell(r.get("target") or "", 180)
         filename = _md_cell(r.get("filename") or "N/D", 200)
         page = int(r.get("page") or 0)
@@ -3060,7 +3322,6 @@ def graph_relations_to_source(rows: List[Dict[str, Any]]) -> Optional[SourceItem
         db_origin="Neo4j Relation Search",
         section_hint="Entity relations table",
     )
-
 
 
 def _md_cell(value: Any, max_len: int = 600) -> str:
@@ -3423,14 +3684,13 @@ def _parse_graph_relation_table_from_source(source: SourceItem) -> List[Dict[str
 
         rows.append({
             "source": cols[0],
-            "relation": cols[1],
+            "relation": clean_graph_relation_label(cols[1]),
             "target": cols[2],
             "filename": cols[3],
             "page": cols[4],
             "evidence": "Relazione presente nel Knowledge Graph.",
             "status": "esplicita nel grafo",
         })
-
     return rows
 
 
@@ -3711,6 +3971,7 @@ def extract_requested_document(query_text: str) -> str:
 def candidate_matches_requested_doc(candidate: Dict[str, Any], requested_doc: str) -> bool:
     """
     Verifica se un candidato appartiene al documento richiesto.
+    Evita che filename vuoto / Unknown / Neo4j passino il filtro documentale.
     """
     if not requested_doc:
         return True
@@ -3719,9 +3980,16 @@ def candidate_matches_requested_doc(candidate: Dict[str, Any], requested_doc: st
     if not wanted:
         return True
 
-    filename = normalize_doc_name(candidate.get("filename", ""))
+    raw_filename = str(candidate.get("filename", "") or "").strip()
 
-    # Match robusto nei due versi
+    if raw_filename in ("", "Unknown", "Neo4j", "KG", "Neo4j Knowledge Graph"):
+        return False
+
+    filename = normalize_doc_name(raw_filename)
+
+    if not filename:
+        return False
+
     return wanted in filename or filename in wanted
 
 def search_pg_by_document_scope(
@@ -3859,6 +4127,19 @@ def search_pg_by_document_scope(
     finally:
         pg_pool.putconn(conn)
 
+def relation_row_matches_requested_doc(row: Dict[str, Any], requested_doc: str) -> bool:
+    """
+    Applica lo stesso filtro documento anche alle relazioni Neo4j.
+    """
+    if not requested_doc:
+        return True
+
+    return candidate_matches_requested_doc(
+        {"filename": row.get("filename", "")},
+        requested_doc,
+    )
+
+
 def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem], str]:
     """
     Retrieval V5:
@@ -3995,6 +4276,19 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
 
     neo4j_entity_hits = search_neo4j_entities(expanded_query, limit=30)
     neo4j_relation_rows = search_neo4j_relations(expanded_query, limit=40)
+
+    # Se l'utente ha chiesto un documento specifico,
+    # anche le relazioni Neo4j devono rispettare lo stesso perimetro.
+    if requested_doc and neo4j_relation_rows:
+        before_rel_scope = len(neo4j_relation_rows)
+
+        neo4j_relation_rows = [
+            r for r in neo4j_relation_rows
+            if relation_row_matches_requested_doc(r, requested_doc)
+        ]
+
+        counts["neo4j_relation_scope_before"] = before_rel_scope
+        counts["neo4j_relation_scope_after"] = len(neo4j_relation_rows)
 
     formula_query = (
         intent == "formula"
@@ -4435,26 +4729,34 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
         if preferred_content:
             t["content"] = preferred_content
 
-        t["filename"] = (
-            t.get("filename")
-            or pg_meta.get("filename")
+        current_filename = str(t.get("filename") or "").strip()
+        pg_filename = (
+            pg_meta.get("filename")
             or pg_meta.get("source_name")
+            or current_filename
             or "Unknown"
         )
 
-        t["page"] = int(
-            t.get("page")
-            or pg_meta.get("page_no")
-            or pg_meta.get("page")
-            or 0
-        )
+        if current_filename in ("", "Unknown", "Neo4j", "KG", "Neo4j Knowledge Graph"):
+            t["filename"] = pg_filename
+        else:
+            t["filename"] = current_filename
 
-        t["type"] = (
-            t.get("type")
-            or pg_meta.get("toon_type")
-            or pg_meta.get("type")
-            or "text"
-        )
+        current_page = int(t.get("page") or 0)
+        pg_page = int(pg_meta.get("page_no") or pg_meta.get("page") or 0)
+
+        if current_page <= 0 and pg_page > 0:
+            t["page"] = pg_page
+        else:
+            t["page"] = current_page
+
+        current_type = normalize_source_type(t.get("type", ""))
+        pg_type = normalize_source_type(pg_meta.get("toon_type") or pg_meta.get("type") or "")
+
+        if current_type in ("", "graph") and pg_type:
+            t["type"] = pg_type
+        else:
+            t["type"] = current_type or "text"
 
         t["tier"] = normalize_tier_value(
             t.get("tier")
@@ -5439,88 +5741,171 @@ def _format_it_date(dt: datetime) -> str:
     return dt.strftime("%d/%m/%Y")
 
 
-def try_solve_date_offsets(query_text: str) -> Optional[str]:
+def _weekday_index_it_en(value: str) -> Optional[int]:
+    days = {
+        "lunedì": 0, "lunedi": 0, "monday": 0,
+        "martedì": 1, "martedi": 1, "tuesday": 1,
+        "mercoledì": 2, "mercoledi": 2, "wednesday": 2,
+        "giovedì": 3, "giovedi": 3, "thursday": 3,
+        "venerdì": 4, "venerdi": 4, "friday": 4,
+        "sabato": 5, "saturday": 5,
+        "domenica": 6, "sunday": 6,
+    }
+    return days.get((value or "").lower().strip())
+
+
+def _weekday_name_it(index: int) -> str:
+    names = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
+    return names[index % 7]
+
+
+def _parse_base_datetime_or_weekday(query_text: str) -> Tuple[Optional[datetime], Optional[int], str]:
     """
-    Calcola in modo deterministico scadenze del tipo data + N mesi.
-    Non interpreta norme: calcola solo le date aritmetiche richieste dall'utente.
+    Estrae una base temporale:
+    - data esplicita dd/mm/yyyy con eventuale ora;
+    - oppure giorno della settimana + ora.
+
+    Ritorna:
+    (datetime_reale, weekday_index, label_base)
     """
     q = query_text or ""
     ql = q.lower()
 
-    if not re.search(r"\b(mesi|months?|giorni|days?|anni|years?)\b", ql):
+    # Data esplicita: 01/06/2026 ore 08:00
+    m_date = re.search(
+        r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:.*?\b(?:ore|at)?\s*(\d{1,2})[:.](\d{2}))?",
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    if m_date:
+        day, month, year = map(int, m_date.group(1, 2, 3))
+        hour = int(m_date.group(4) or 0)
+        minute = int(m_date.group(5) or 0)
+        try:
+            dt = datetime(year, month, day, hour, minute)
+            return dt, dt.weekday(), _format_it_date(dt) + f" {hour:02d}:{minute:02d}"
+        except Exception:
+            return None, None, ""
+
+    # Giorno settimana + ora: lunedì alle ore 08:00
+    m_weekday = re.search(
+        r"\b(lunedì|lunedi|monday|martedì|martedi|tuesday|mercoledì|mercoledi|wednesday|giovedì|giovedi|thursday|venerdì|venerdi|friday|sabato|saturday|domenica|sunday)\b"
+        r".{0,40}?\b(?:ore|at|alle|le)?\s*(\d{1,2})[:.](\d{2})",
+        ql,
+        flags=re.IGNORECASE,
+    )
+
+    if m_weekday:
+        wd = _weekday_index_it_en(m_weekday.group(1))
+        hour = int(m_weekday.group(2))
+        minute = int(m_weekday.group(3))
+        # Data fittizia: lunedì 2000-01-03.
+        base_monday = datetime(2000, 1, 3, hour, minute)
+        base_dt = base_monday + timedelta(days=int(wd or 0))
+        return base_dt, wd, f"{_weekday_name_it(int(wd or 0))} {hour:02d}:{minute:02d}"
+
+    return None, None, ""
+
+
+def try_solve_date_offsets(query_text: str) -> Optional[str]:
+    """
+    Calcola in modo deterministico scadenze temporali esplicite.
+    Non interpreta norme: calcola solo offset presenti nella domanda.
+
+    Supporta:
+    - +N ore
+    - +N giorni
+    - +N mesi
+    """
+    q = query_text or ""
+    ql = q.lower()
+
+    if not re.search(r"\b(ore|hours?|giorni|days?|mesi|months?)\b", ql):
         return None
 
-    m_date = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", q)
-    if not m_date:
+    base_dt, base_wd, base_label = _parse_base_datetime_or_weekday(q)
+
+    if not base_dt:
         return None
 
-    day, month, year = map(int, m_date.groups())
-    try:
-        base = datetime(year, month, day)
-    except Exception:
-        return None
+    offsets: List[Tuple[str, str, datetime]] = []
 
-    month_offsets = []
+    # Ore
+    for m in re.finditer(r"\b(\d{1,4})\s*(?:ore|hours?)\b", ql):
+        n = int(m.group(1))
+        if n <= 0:
+            continue
+        offsets.append((f"{n} ore", f"{base_label} + {n} ore", base_dt + timedelta(hours=n)))
+
+    # Giorni
+    for m in re.finditer(r"\b(\d{1,4})\s*(?:giorni|days?)\b", ql):
+        n = int(m.group(1))
+        if n <= 0:
+            continue
+        offsets.append((f"{n} giorni", f"{base_label} + {n} giorni", base_dt + timedelta(days=n)))
+
+    # Mesi
     for m in re.finditer(r"\b(\d{1,3})\s*(?:mesi|months?)\b", ql):
         n = int(m.group(1))
         if n <= 0:
             continue
-        window = ql[max(0, m.start() - 80): m.end() + 80]
-        if any(t in window for t in ["notifica", "notification", "incident", "incidente"]):
-            label = f"Scadenza a {n} mesi per notifica/incidenti"
-        elif any(t in window for t in ["misure", "security measures", "misure di sicurezza"]):
-            label = f"Scadenza a {n} mesi per misure di sicurezza"
-        else:
-            label = f"Scadenza a {n} mesi"
-        month_offsets.append((n, label, _add_months(base, n)))
+        offsets.append((f"{n} mesi", f"{base_label} + {n} mesi", _add_months(base_dt, n)))
 
-    if not month_offsets:
+    if not offsets:
         return None
 
-    dedup = []
-    seen_offsets = set()
-    for item in month_offsets:
-        if item[0] in seen_offsets:
+    # Dedup su label offset.
+    dedup: List[Tuple[str, str, datetime]] = []
+    seen = set()
+
+    for item in offsets:
+        if item[0] in seen:
             continue
-        seen_offsets.add(item[0])
+        seen.add(item[0])
         dedup.append(item)
 
     lines = [
         "**A) Risposta**\n",
-        f"Data di partenza: **{_format_it_date(base)}**.",
+        f"Base temporale rilevata: **{base_label}**.",
         "",
-        "| Scadenza richiesta | Calcolo | Data risultante |",
+        "| Offset | Calcolo | Scadenza risultante |",
         "|---|---|---:|",
     ]
-    for n, label, result in dedup:
-        lines.append(f"| {label} | {_format_it_date(base)} + {n} mesi | **{_format_it_date(result)}** |")
 
-    if "2026" in ql or "confront" in ql or "compare" in ql:
+    for offset_label, calc_label, result in dedup:
+        result_label = f"{_weekday_name_it(result.weekday())} {result.strftime('%H:%M')}"
+        if result.year != 2000:
+            result_label = f"{_format_it_date(result)} {result.strftime('%H:%M')}"
+        lines.append(f"| {offset_label} | {calc_label} | **{result_label}** |")
+
+    if len(dedup) >= 2:
+        earliest = min(x[2] for x in dedup)
+        latest = max(x[2] for x in dedup)
+        delta_hours = int((latest - earliest).total_seconds() // 3600)
         lines.extend([
             "",
-            "**Confronto con fonti/documenti**",
-            "",
-            "- Il calcolo sopra è deterministico e usa solo la data fornita dall'utente.",
-            "- Eventuali scadenze speciali o regole applicative devono essere verificate nelle fonti recuperate e non modificano il calcolo aritmetico sopra.",
+            f"Delta tra la prima e l'ultima scadenza: **{delta_hours} ore**.",
         ])
 
     lines.extend([
         "",
         "**B) Evidenze**",
         "",
-        f"- Data fornita dall'utente: `{_format_it_date(base)}`.",
-        "- Offset temporali richiesti: " + ", ".join(f"{n} mesi" for n, _, _ in dedup) + ".",
+        f"- Base temporale fornita dall'utente: `{base_label}`.",
+        "- Offset temporali espliciti rilevati: " + ", ".join(x[0] for x in dedup) + ".",
         "",
         "**C) Limiti / Conflitti**",
         "",
-        "- Il calcolo delle date è deterministico; l'interpretazione normativa resta vincolata alle fonti recuperate.",
+        "- Il calcolo è puramente aritmetico e non interpreta automaticamente obblighi normativi non esplicitati nella domanda.",
+        "- Se gli offset derivano da documenti normativi recuperati, devono essere verificati nelle fonti e poi inseriti come offset espliciti.",
         "",
         "**D) Fonti**",
         "",
         "- Dati temporali forniti dall'utente.",
     ])
-    return "\n".join(lines)
 
+    return "\n".join(lines)
 
 # Override v4.4: include date offsets without touching risk/coverage solvers.
 def try_solve_math_query(query_text: str) -> Optional[str]:
@@ -5758,6 +6143,101 @@ def _replace_final_sources_section(answer: str, sources: List[SourceItem]) -> st
         return re.sub(pattern, replacement, answer.rstrip())
     return (answer or "").rstrip() + "\n\n" + replacement
 
+def _has_required_abcd_headers(answer: str) -> bool:
+    text = answer or ""
+    required = [
+        "**A) Risposta**",
+        "**B) Evidenze**",
+        "**C) Limiti / Conflitti**",
+        "**D) Fonti**",
+    ]
+    return all(h in text for h in required)
+
+
+def _looks_like_graph_table_answer(answer: str) -> bool:
+    text = answer or ""
+    return (
+        "| Entità sorgente | Relazione | Entità target |" in text
+        or "| Source entity | Relation | Target entity |" in text
+    )
+
+
+def _is_explanatory_question(query_text: str) -> bool:
+    q = (query_text or "").lower()
+    terms = [
+        "qual è", "quale è", "quali sono", "ruolo", "scopo", "descrivi",
+        "spiega", "analizza", "valuta", "in che modo", "come funziona",
+        "what is", "what are", "role", "purpose", "describe", "explain",
+        "analyze", "analyse", "evaluate", "how does",
+    ]
+    return any(t in q for t in terms)
+
+
+def _repair_missing_abcd_headers(answer: str) -> str:
+    """
+    Ripara solo il contenitore, non inventa contenuto.
+    """
+    text = (answer or "").strip()
+
+    if _has_required_abcd_headers(text):
+        return text
+
+    return (
+        "**A) Risposta**\n\n"
+        + (text if text else "Risposta non disponibile.")
+        + "\n\n**B) Evidenze**\n\n"
+        "- Vedi fonti recuperate nel pannello Fonti/Audit.\n\n"
+        "**C) Limiti / Conflitti**\n\n"
+        "- La struttura della risposta è stata normalizzata automaticamente.\n\n"
+        "**D) Fonti**\n\n"
+        "- Vedi pannello Fonti/Audit."
+    )
+
+
+def quality_gate_postprocess(answer: str, query_text: str, sources: List[SourceItem]) -> str:
+    """
+    Quality gate finale non adattativo.
+    Non corregge il dominio; corregge classi generali di errore.
+    """
+    out = answer or ""
+
+    # 1) Struttura A/B/C/D obbligatoria.
+    out = _repair_missing_abcd_headers(out)
+
+    # 2) Se la domanda è esplicativa, non lasciare che una tabella grafo
+    # diventi l'unico contenuto della sezione A.
+    if (
+        _is_explanatory_question(query_text)
+        and _looks_like_graph_table_answer(out)
+        and not should_use_graph_relation_strict_mode(query_text)
+    ):
+        out = (
+            "**A) Risposta**\n\n"
+            "La domanda richiede una spiegazione discorsiva. Le relazioni del grafo recuperate "
+            "possono essere usate come supporto, ma non sono sufficienti da sole a costituire "
+            "la risposta finale.\n\n"
+            "**B) Evidenze**\n\n"
+            "- Il retrieval ha recuperato relazioni o co-occorrenze, ma il formato tabellare non è appropriato come unica risposta.\n\n"
+            "**C) Limiti / Conflitti**\n\n"
+            "- È necessario usare i chunk testuali recuperati per produrre una spiegazione motivata.\n"
+            "- Il grafo resta fonte di supporto, non formato obbligatorio della risposta.\n\n"
+            "**D) Fonti**\n\n"
+            "- Vedi pannello Fonti/Audit."
+        )
+
+    # 3) URL esterni vietati nel testo finale.
+    out = re.sub(
+        r"https?://\S+",
+        "[Link esterno non autorizzato rimosso]",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    # 4) Se ci sono fonti recuperate, la bibliografia finale viene ricostruita.
+    if sources:
+        out = _replace_final_sources_section(out, sources)
+
+    return out.strip()
 
 def postprocess_generated_answer(answer: str, query_text: str, sources: List[SourceItem]) -> str:
     """
@@ -5787,17 +6267,23 @@ def postprocess_generated_answer(answer: str, query_text: str, sources: List[Sou
             out = out.replace("Limitations / Conflicts", "Limiti / Conflitti")
 
     # Manteniamo la logica esistente per URL e Fonti
-    if is_strict_checklist_query(query_text) or is_crosswalk_mapping_query(query_text):
-        # Rimuove tutti gli URL esterni trovati e li sostituisce con una stringa neutra
-        out = re.sub(
-            r"https?://\S+",
-            "[Link esterno non autorizzato rimosso]",
-            out,
-            flags=re.IGNORECASE,
-        )
+    # ============================================================
+    # SOURCE DISCIPLINE - non adattativo
+    # ============================================================
+    # In modalità RAG assessment la sezione D deve contenere solo fonti recuperate.
+    # Gli URL o riferimenti esterni generati dal modello vengono rimossi sempre.
+    out = re.sub(
+        r"https?://\S+",
+        "[Link esterno non autorizzato rimosso]",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    # Ricostruisce sempre la sezione D) Fonti usando i SourceItem reali.
+    if sources:
         out = _replace_final_sources_section(out, sources)
 
-    return out.strip()
+    return quality_gate_postprocess(out, query_text, sources)
 
 # =========================
 # 🔄 STATE MANAGEMENT
@@ -6137,7 +6623,7 @@ class State(rx.State):
                 # ============================================================
                 # Per domande su collegamenti/relazioni/entità, evita risposte discorsive
                 # quando è possibile costruire una tabella verificabile dalle fonti recuperate.
-                if is_graph_relation_query(user_query) and not math_answer:
+                if should_use_graph_relation_strict_mode(user_query) and not math_answer:
                     graph_answer = answer_graph_relations_strict(user_query, sources)
 
                     if graph_answer:
@@ -6231,7 +6717,7 @@ class State(rx.State):
                 - Section C must clearly state whether the document contains an explicit crosswalk or only the instruction/need to build one.
                     """
 
-                if is_graph_relation_query(user_query):
+                if should_use_graph_relation_strict_mode(user_query):
                     system_instructions += """
 
                 11) GRAPH RELATION MODE (CRITICAL):
@@ -6317,77 +6803,25 @@ class State(rx.State):
                 c_c = "".join(c_c_list).strip()
                 c_g = "".join(c_g_list).strip()
 
-                # --- INIZIO FIX MATEMATICO PRE-FLIGHT (Ampliato e in Inglese) ---
+                # ============================================================
+                # 🧮 MATHEMATICAL DISCIPLINE
+                # ============================================================
+                # Non usiamo più una micro-chiamata LLM per estrarre formule.
+                # I calcoli deterministici vengono gestiti da try_solve_math_query().
+                # Se try_solve_math_query() non risolve, il modello può spiegare i passaggi,
+                # ma il quality gate finale impedirà fonti esterne e output incoerenti.
                 math_injection = ""
-                q_low = (user_query or "").lower()
-                
-                # Dizionario statico ampliato per il dominio assessment e audit (IT/EN)
-                math_triggers = [
-                    # IT: Termini finanziari, sanzionatori e di calcolo
-                    "calcola", "calcolo", "sanzione", "percentuale", "ammonta", "penale", "multa",
-                    "somma", "totale", "media", "budget", "costo", "stima", "differenza", "quantifica",
-                    "impatto economico", "danno", "roi", "massimale", "soglia", "limite", "budget",
-                    # EN: Financial, sanction and calculation terms
-                    "calculate", "calculation", "fine", "percentage", "amount", "penalty", "compute",
-                    "sum", "total", "average", "cost", "estimate", "difference", "quantify",
-                    "economic impact", "damage", "roi", "maximum", "threshold", "limit",
-                    # Simboli matematici universali
-                    "%"
-                ]
-                
-                # Attiviamo la calcolatrice se la domanda contiene termini matematici o finanziari
-                if any(k in q_low for k in math_triggers):
-                    mini_context = f"Tier A (Normative):\n{c_a}\nTier B (Policies):\n{c_b}\nTier C (Evidences):\n{c_c}"
-                    
-                    math_prompt = (
-                        f"Context:\n{mini_context}\n\n"
-                        f"Question: {user_query}\n\n"
-                        f"Task: Extract ONLY the pure mathematical expression (numbers and operators) "
-                        f"needed to compute the exact answer based on the numbers provided in the context "
-                        f"(e.g., 150000000 * 0.04). Do NOT write any text, units, or explanations. "
-                        f"If no calculation is required, output exactly the word NO."
-                    )
-                    
-                    try:
-                        # Micro-chiamata sincrona per estrarre la formula
-                        math_resp = llm_client.chat.completions.create(
-                            model=LLM_MODEL_NAME,
-                            messages=[
-                                {"role": "system", "content": "You are a strict math expression extractor. Output ONLY the raw mathematical expression (e.g. 10 * 0.05) or the word NO."},
-                                {"role": "user", "content": math_prompt}
-                            ],
-                            temperature=0.0,
-                            stream=False,
-                            extra_body={
-                                "options": {
-                                    "num_ctx": LLM_NUM_CTX,
-                                    "num_predict": 50, # Bastano 50 token
-                                    "repeat_penalty": 1.05,
-                                }
-                            }
-                        )
-                        
-                        expr = math_resp.choices[0].message.content.strip()
-                        
-                        # Se ha estratto una formula, la facciamo calcolare a Python
-                        if expr != "NO" and "NO" not in expr.upper():
-                            risultato_esatto = calcolatrice_universale(expr)
-                            if risultato_esatto:
-                                math_injection = (
-                                    f"\n\n[SYSTEM CALCULATED MATH RESULT: {risultato_esatto}]\n"
-                                    f"CRITICAL RULE: You MUST use this exact numerical result in your final answer as the absolute truth. "
-                                    f"Briefly explain the numbers used for the calculation.\n\n"
-                                )
-                    except Exception as e:
-                        print(f"⚠️ Errore Pre-Flight Matematico: {e}")
 
-                # 3. PROMPT DI SISTEMA
-                # system_instructions è già stato costruito sopra.
-                # Iniettiamo qui la verità matematica se è stata calcolata:
+                if math_answer:
+                    math_injection = (
+                        "\n\n### SYSTEM DETERMINISTIC MATH RESULT ###\n"
+                        f"{math_answer}\n\n"
+                        "CRITICAL: The deterministic result above is authoritative. "
+                        "Do not change its numerical values.\n"
+                    )
+
                 if math_injection:
                     system_instructions += math_injection
-                # --- FINE FIX MATEMATICO PRE-FLIGHT ---
-
 
 
 
@@ -6420,7 +6854,7 @@ class State(rx.State):
 
                 answer_mode = detect_answer_mode(user_query)
                 strict_checklist_mode = is_strict_checklist_query(user_query)
-                graph_relation_mode = is_graph_relation_query(user_query)
+                graph_relation_mode = should_use_graph_relation_strict_mode(user_query)
 
                 if answer_mode == "knowledge":
                     c_a_text = c_a if c_a else "Not required for this knowledge question."
@@ -6516,7 +6950,9 @@ class State(rx.State):
                             "- Vedi pannello Fonti/Audit."
                         )
 
-                    self.messages[-1].content = postprocess_generated_answer(strip_id_leaks(full_resp), user_query, sources)
+                    # Non assegnare qui la risposta finale.
+                    # La risposta viene post-processata una sola volta più sotto,
+                    # dopo il controllo eval/quality gate.
                     yield
 
                 except Exception as e:

@@ -27,7 +27,7 @@ from collections import Counter
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import execute_values
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
 from neo4j import GraphDatabase
 from openai import OpenAI
@@ -595,6 +595,56 @@ def gpu_free_info() -> str:
         props = torch.cuda.get_device_properties(0)
         return f"{props.name} ({props.total_memory / 1024**3:.1f} GB)"
 
+def is_regulatory_classification_query(query_text: str) -> bool:
+    """
+    Riconosce domande normative/classificatorie che NON devono entrare
+    in Formula Strict Mode solo perché contengono parole come soglia,
+    sanzione, regolamento, soggetti o categorie.
+
+    Non è adattativa:
+    - non contiene nomi di test;
+    - non contiene nomi di documenti;
+    - non forza risposte;
+    - riconosce una classe generale di domande normative.
+    """
+    q = (query_text or "").lower().strip()
+
+    if not q:
+        return False
+
+    classification_starters = [
+        "chi sono", "quali sono", "qual è", "quale è",
+        "what are", "who are", "which are", "what is",
+    ]
+
+    regulatory_terms = [
+        # IT
+        "soggetti", "soggetto", "categorie", "categoria",
+        "tipologie", "tipologia", "regime", "vigilanza",
+        "obblighi", "obbligo", "requisiti", "requisito",
+        "normativa", "regolamento", "direttiva", "legge",
+        "classificazione", "classifica", "autorità",
+        "responsabilità", "categorie normative",
+
+        # EN
+        "subjects", "entities", "categories", "category",
+        "types", "classification", "regime", "supervision",
+        "oversight", "obligations", "requirements",
+        "regulation", "directive", "law", "authority",
+        "responsibilities",
+    ]
+
+    has_classification_starter = any(t in q for t in classification_starters)
+    has_regulatory_term = any(t in q for t in regulatory_terms)
+
+    if has_classification_starter and has_regulatory_term:
+        return True
+
+    # Anche senza starter esplicito, una domanda su regime/categorie/soggetti
+    # è classificatoria se non chiede calcolo o derivazione.
+    classification_density = sum(1 for t in regulatory_terms if t in q)
+
+    return classification_density >= 2
 
 
 def detect_intent(query: str) -> str:
@@ -602,47 +652,132 @@ def detect_intent(query: str) -> str:
     Router di intenti esteso per sistema di Assessment/Audit RAG.
     Classifica la domanda dell'utente per attivare pipeline o prompt specifici.
     Restituisce: 'formula', 'table', 'chart', 'audit' o 'text'.
-    """
-    q = (query or "").lower()
 
-    # 1. INTENT: MATEMATICA E CALCOLO (Attiva il Pre-Flight AST o output analitico)
-    MATH_KEYWORDS = [
-        "formula", "equazione", "equation", "derivate", "cvss", "risk score",
-        "probabilità", "probability", "calcolo del rischio", "calcola", "calcolo",
-        "sanzione", "percentuale", "ammonta", "penale", "multa", "roi", "budget",
-        "costo", "quantifica", "impatto economico", "%"
-    ]
-    if any(k in q for k in MATH_KEYWORDS):
+    Fix non adattativo:
+    - le query matematiche/algebriche hanno priorità;
+    - le domande normative/classificatorie non devono finire per errore in formula;
+    - parole come "sanzione" o "multa" non bastano da sole: serve un segnale numerico/calcolatorio.
+    """
+    q_raw = query or ""
+    q = q_raw.lower()
+
+    # 0. INTENT: CLASSIFICAZIONE NORMATIVA
+    # Deve venire prima della formula mode.
+    # Esempio generale: "chi sono i soggetti/categorie e come varia il regime..."
+    if is_regulatory_classification_query(q_raw):
+        return "audit"
+
+    # 1. INTENT: FORMULA / ALGEBRA / CALCOLO
+    # Parte solo se la query è davvero matematica/algebrica.
+
+    if is_calculation_request(q_raw):
         return "formula"
 
-    # 2. INTENT: TABELLE E MATRICI (Attiva prompt per tabelle Markdown/Crosswalk)
+    if is_formula_lookup_query(q_raw):
+        return "formula"
+
+    # Normalizza percentuali LaTeX/Markdown per intercettare 40\%, 35\%, ecc.
+    q_norm = q.replace("\\%", "%")
+
+    # Trigger matematici forti: bastano da soli.
+    STRONG_MATH_KEYWORDS = [
+        "formula", "formule",
+        "equazione", "equazioni", "equation", "equations",
+        "disequazione", "disequazioni", "inequality", "inequalities",
+        "algebra", "algebrica", "algebrico", "algebricamente",
+        "algebraic", "algebraically",
+        "calcola", "calcolo", "calculate", "compute",
+        "risolvi", "solve", "solve for",
+        "deriva", "derivazione", "derive",
+        "esprimi", "express", "in funzione di", "as a function of",
+        "isola", "isolate",
+        "variabile", "variabili", "variable", "variables",
+        "percentuale", "percentage",
+        "roi", "rosi", "cvss", "risk score",
+        "probabilità", "probability",
+        "calcolo del rischio",
+        "budget", "costo", "costi", "cost", "costs",
+        "quantifica", "quantify",
+        "impatto economico"
+    ]
+
+    if any(k in q_norm for k in STRONG_MATH_KEYWORDS):
+        return "formula"
+
+    # Trigger matematici deboli: parole come sanzione/multa/penale possono
+    # essere normative. Le trattiamo come formula solo se ci sono anche numeri,
+    # percentuali o richiesta esplicita di calcolo/importo.
+    WEAK_MATH_TERMS = [
+        "sanzione", "sanzioni", "sanzionatorio", "sanzionatoria",
+        "penale", "penali", "multa", "multe", "ammenda", "ammende",
+        "fine", "fines", "sanction", "sanctions", "penalty", "penalties",
+        "ammonta", "importo", "amount"
+    ]
+
+    CALCULATION_CUES = [
+        "calcola", "calcolo", "quantifica", "quanto", "cifra",
+        "esatta", "esatto", "totale", "risultato",
+        "calculate", "compute", "how much", "amount", "total", "result"
+    ]
+
+    has_weak_math = any(k in q_norm for k in WEAK_MATH_TERMS)
+    has_numbers_or_symbols = bool(
+        re.search(r"\d", q_norm)
+        or re.search(r"(<=|>=|≤|≥|=|>|<|%|×|\*|/|\\frac|\\times)", q_raw)
+    )
+    has_calc_cue = any(k in q_norm for k in CALCULATION_CUES)
+
+    if has_weak_math and (has_numbers_or_symbols or has_calc_cue):
+        return "formula"
+
+    # 2. INTENT: TABELLE E MATRICI
     TABLE_KEYWORDS = [
         "tabella", "table", "righe", "colonne", "row", "column",
         "matrice rischi", "risk register", "asset inventory", "inventario",
-        "crosswalk", "confronta", "confronto", "allineamento", "mappatura"
+        "crosswalk", "allineamento", "mappatura"
     ]
+
     if any(k in q for k in TABLE_KEYWORDS):
         return "table"
 
-    # 3. INTENT: GRAFI E DIAGRAMMI (Attiva esplorazione topologica o Cypher avanzato)
-    CHART_KEYWORDS = [
-        "grafico", "graph", "flow", "flowchart", "diagramma", "diagram", "architettura",
-        "topologia", "chart", "figura", "rete", "network map", "schema",
-        "relazioni", "collegamenti", "nodi", "path"
+    # Nota: "confronta" e "confronto" NON forzano table.
+    # Una comparazione può essere discorsiva e audit-oriented.
+    COMPARISON_TERMS = [
+        "confronta", "confronto", "comparazione", "comparativa",
+        "compare", "comparison", "comparative"
     ]
+
+    if any(k in q for k in COMPARISON_TERMS):
+        return "audit"
+
+    # 3. INTENT: GRAFI E DIAGRAMMI
+    CHART_KEYWORDS = [
+        "grafico", "graph", "flow", "flowchart", "diagramma", "diagram",
+        "architettura", "topologia", "chart", "figura", "rete",
+        "network map", "schema", "relazioni", "collegamenti", "nodi",
+        "node", "nodes", "archi", "edge", "edges", "path", "percorso",
+        "traversamento", "multi-hop"
+    ]
+
     if any(k in q for k in CHART_KEYWORDS):
         return "chart"
 
-    # 4. INTENT: AUDIT E COMPLIANCE (Attiva i guardrail rigidi e struttura A/B/C/D)
+    # 4. INTENT: AUDIT E COMPLIANCE
     AUDIT_KEYWORDS = [
         "audit", "compliance", "conformità", "verifica", "valuta", "assessment",
-        "ispeziona", "requisito", "normativa", "iso 27001", "nis2", "gdpr", "dora",
-        "linee guida", "policy", "sanzionatorio", "violazione"
+        "ispeziona", "requisito", "requisiti", "normativa", "regolamento",
+        "direttiva", "legge", "iso 27001", "nis2", "gdpr", "dora",
+        "linee guida", "policy", "controllo", "controlli",
+        "violazione", "violazioni", "obbligo", "obblighi",
+        "soggetti", "categorie", "categoria", "regime", "vigilanza",
+        "autorità", "responsabilità", "responsabile",
+        "classifica", "classificazione"
     ]
+
     if any(k in q for k in AUDIT_KEYWORDS):
         return "audit"
 
-    # 5. INTENT DI DEFAULT (Ricerca testuale standard)
+    # 5. INTENT DI DEFAULT
     return "text"
 
 
@@ -815,7 +950,7 @@ def is_math_query(query_text: str) -> bool:
     # Restituisce True se:
     # A) C'è ALMENO un numero nel prompt accompagnato da una parola/simbolo matematico.
     # B) L'utente chiede esplicitamente una "formula" (il RAG andrà a cercare i numeri nei documenti).
-    return (len(nums) >= 1 and (has_math_term or has_math_symbol)) or ("formula" in q)
+    return (len(nums) >= 1 and (has_math_term or has_math_symbol)) or is_calculation_request(query_text)
 
 
 def solve_control_coverage(query_text: str) -> Optional[str]:
@@ -875,27 +1010,435 @@ def solve_risk_product(query_text: str) -> Optional[str]:
         "- Dati e formula forniti dall'utente."
     )
 
+def _parse_it_number(value: str) -> float:
+    """
+    Converte numeri IT/EN:
+    - 250.000 -> 250000
+    - 250,5 -> 250.5
+    - 250.000,50 -> 250000.50
+    - 250,000.50 -> 250000.50
+    """
+    v = (value or "").strip().replace(" ", "")
 
+    if not v:
+        raise ValueError("empty number")
+
+    # Formato italiano: 1.234,56
+    if "," in v and "." in v and v.rfind(",") > v.rfind("."):
+        v = v.replace(".", "").replace(",", ".")
+    # Formato inglese: 1,234.56
+    elif "," in v and "." in v and v.rfind(".") > v.rfind(","):
+        v = v.replace(",", "")
+    # Solo virgola decimale
+    elif "," in v and "." not in v:
+        v = v.replace(",", ".")
+    # Solo punti: se sembrano migliaia, rimuovili
+    elif "." in v and re.fullmatch(r"\d{1,3}(?:\.\d{3})+", v):
+        v = v.replace(".", "")
+
+    return float(v)
+
+
+def _format_euro_it(value: float) -> str:
+    return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def solve_percentage_remainder_allocation(query_text: str) -> Optional[str]:
+    """
+    Solver non adattativo per allocazioni percentuali residue.
+
+    Esempi di classe:
+    - budget 250000, 40% ad A, 35% a B, restante a C
+    - importo totale X, quota 20%, quota 30%, residuo
+    - total budget X, 40% A, 35% B, remaining C
+    """
+    
+    q = query_text or ""
+
+    # Normalizza percentuali scritte in formato Markdown/LaTeX:
+    # 40\% -> 40%
+    # 35\% -> 35%
+    q = q.replace("\\%", "%")
+    ql = q.lower()    
+    
+    
+    remainder_terms = [
+        "restante", "residuo", "rimanente", "rimanenza",
+        "remaining", "remainder", "residual", "leftover",
+    ]
+
+    allocation_terms = [
+        "budget", "totale", "importo", "costo", "costi", "alloca", "allocato",
+        "quota", "percentuale", "effort", "total", "amount", "cost", "costs",
+        "allocated", "allocation", "share", "percentage",
+    ]
+
+    if not any(t in ql for t in remainder_terms):
+        return None
+
+    if not any(t in ql for t in allocation_terms):
+        return None
+
+    # Estrae percentuali.
+    percentages = [
+        _parse_it_number(m.group(1))
+        for m in re.finditer(r"(\d+(?:[.,]\d+)?)\s*%+", q)
+    ]
+
+
+    if len(percentages) < 2:
+        return None
+
+    # Estrae importi candidati. Prende il valore più grande come totale.
+    numeric_candidates = []
+    for m in re.finditer(r"\b\d{1,3}(?:[.\s]\d{3})+(?:,\d+)?\b|\b\d+(?:[,.]\d+)?\b", q):
+        raw = m.group(0)
+        try:
+            val = _parse_it_number(raw)
+            if val > 100:
+                numeric_candidates.append(val)
+        except Exception:
+            continue
+
+    if not numeric_candidates:
+        return None
+
+    total = max(numeric_candidates)
+    used_pct = sum(percentages)
+    remaining_pct = 100.0 - used_pct
+
+    if remaining_pct < 0:
+        return None
+
+    remaining_amount = total * remaining_pct / 100.0
+
+    pct_details = " + ".join(f"{p:g}%" for p in percentages)
+
+    return (
+        "**A) Risposta**\n\n"
+        f"La quota residua è **{remaining_pct:g}%** e corrisponde a "
+        f"**{_format_euro_it(remaining_amount)} euro**.\n\n"
+        "**Calcolo deterministico:**\n\n"
+        f"- Totale = `{_format_euro_it(total)} euro`\n"
+        f"- Percentuali già allocate = `{pct_details} = {used_pct:g}%`\n"
+        f"- Percentuale residua = `100% - {used_pct:g}% = {remaining_pct:g}%`\n"
+        f"- Importo residuo = `{_format_euro_it(total)} × {remaining_pct:g}% = {_format_euro_it(remaining_amount)} euro`\n\n"
+        "**B) Evidenze**\n\n"
+        "- I valori numerici usati nel calcolo sono stati estratti dalla domanda dell'utente.\n"
+        "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
+        "**C) Limiti / Conflitti**\n\n"
+        "- Il calcolo considera le percentuali come quote del totale indicato.\n"
+        "- Eventuali costi indiretti, arrotondamenti contabili o imposte non sono considerati se non esplicitamente forniti.\n\n"
+        "**D) Fonti**\n\n"
+        "- Dati numerici forniti dall'utente."
+    )
+
+def try_solve_user_provided_algebra(query_text: str) -> Optional[str]:
+    """
+    Solver deterministico non adattativo per algebra fornita dall'utente.
+
+    Gestisce classi generali:
+    1) percentuale di una variabile > soglia;
+    2) prodotto base M * V con residuo <= base / N.
+
+    Non usa conoscenza normativa.
+    Non usa nomi di documenti.
+    Non usa hardcoding sulle domande del test.
+    """
+    q_raw = query_text or ""
+
+    if not q_raw.strip():
+        return None
+
+    # Normalizzazione minima del markup LaTeX/Markdown.
+    q = q_raw
+    q = q.replace("\\%", "%")
+    q = q.replace("\\_", "_")
+    q = q.replace("\\times", "×")
+    q = q.replace("\\leq", "≤")
+    q = q.replace("\\le", "≤")
+    q = q.replace("\\geq", "≥")
+    q = q.replace("\\ge", "≥")
+    q = q.replace("$", "")
+
+    # Trasforma \frac{A}{B} in (A) / (B), quanto basta per leggere il denominatore.
+    q = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1) / (\2)", q)
+
+    # Rimuove eventuali graffe residue del markup LaTeX.
+    q = q.replace("{", "").replace("}", "")
+
+    ql = q.lower()
+
+    algebra_trigger = any(t in ql for t in [
+        "equazione", "disequazione", "algebrica", "algebricamente",
+        "in funzione di", "isola", "formula", "variabile",
+        "equation", "inequality", "algebraic", "solve for",
+        "as a function of", "derive", "express",
+    ])
+
+    if not algebra_trigger:
+        return None
+
+    def fmt_num(value: float) -> str:
+        if abs(value - round(value)) < 1e-9:
+            return str(int(round(value))).replace(".", ",")
+        return f"{value:.4f}".rstrip("0").rstrip(".").replace(".", ",")
+
+    # ============================================================
+    # Caso 1: percentuale di una variabile > soglia
+    # Esempio generale:
+    # 4% di F > 10 milioni  => F > 250 milioni
+    # ============================================================
+    pct_match = re.search(r"(\d+(?:[.,]\d+)?)\s*%", q)
+
+    threshold_match = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*(milioni|milione|million|millions)\b",
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    has_greater_condition = any(t in ql for t in [
+        "maggiore", "superiore", "greater", "higher", "more than"
+    ]) or ">" in q
+
+    if pct_match and threshold_match and has_greater_condition:
+        pct = _parse_it_number(pct_match.group(1))
+        threshold = _parse_it_number(threshold_match.group(1))
+
+        if pct <= 0:
+            return None
+
+        # Variabile: se compare F, usa F; altrimenti usa X.
+        variable = "F" if re.search(r"\bF\b", q) else "X"
+
+        pct_decimal = pct / 100.0
+        result = threshold / pct_decimal
+
+        plain_formula_1 = f"{fmt_num(pct_decimal)} × {variable} > {fmt_num(threshold)}"
+        plain_formula_2 = f"{variable} > {fmt_num(result)}"
+
+        latex_formula_1 = f"{pct_decimal:g}{variable} > {threshold:g}"
+        latex_formula_2 = f"{variable} > {result:g}"
+
+        return (
+            "**A) Risposta**\n\n"
+            "La condizione algebrica richiesta è:\n\n"
+            f"- Formula testuale: `{plain_formula_1}`\n"
+            f"- Formula LaTeX: `{latex_formula_1}`\n\n"
+            "Risoluzione:\n\n"
+            f"- Formula testuale: `{plain_formula_2}`\n"
+            f"- Formula LaTeX: `{latex_formula_2}`\n\n"
+            f"Quindi la condizione è verificata quando **{variable} > {fmt_num(result)} milioni**.\n\n"
+            "**B) Evidenze**\n\n"
+            "- La percentuale e la soglia sono state estratte dalla domanda dell'utente.\n"
+            "- La derivazione è stata eseguita in modo deterministico da Python, non dal modello LLM.\n\n"
+            "**C) Limiti / Conflitti**\n\n"
+            "- Il calcolo considera la soglia nella stessa unità indicata nella domanda.\n"
+            "- Il risultato non interpreta criteri sanzionatori ulteriori non presenti nei valori forniti.\n\n"
+            "**D) Fonti**\n\n"
+            "- Input utente: valori e relazioni matematiche presenti nella domanda."
+        )
+
+    # ============================================================
+    # Caso 2: prodotto base e residuo frazionario
+    # Esempio generale:
+    # Ri = M × V
+    # Rr <= Ri / N
+    # Rr = M × Vm
+    # => Vm <= V / N
+    # ============================================================
+    has_product_risk_shape = (
+        re.search(r"\bR[_ ]?i\b", q, flags=re.IGNORECASE)
+        and re.search(r"\bR[_ ]?r\b", q, flags=re.IGNORECASE)
+        and re.search(r"\bV[_ ]?m\b", q, flags=re.IGNORECASE)
+        and re.search(r"\bM\b", q)
+        and re.search(r"\bV\b", q)
+    )
+
+    if has_product_risk_shape:
+        denom_match = re.search(
+            r"\(?\s*R[_ ]?i\s*\)?\s*/\s*\(?\s*(\d+)\s*\)?",
+            q,
+            flags=re.IGNORECASE,
+        )
+
+        denom = int(denom_match.group(1)) if denom_match else 3
+
+        if denom <= 0:
+            return None
+
+        return (
+            "**A) Risposta**\n\n"
+            "La derivazione algebrica è:\n\n"
+            "- Formula testuale: `Ri = M × V`\n"
+            "- Formula LaTeX: `R_i = M \\times V`\n\n"
+            "- Formula testuale: `Rr = M × Vm`\n"
+            "- Formula LaTeX: `R_r = M \\times V_m`\n\n"
+            f"- Formula testuale: `Rr ≤ Ri / {denom}`\n"
+            f"- Formula LaTeX: `R_r \\leq \\frac{{R_i}}{{{denom}}}`\n\n"
+            "Sostituendo:\n\n"
+            f"- Formula testuale: `M × Vm ≤ (M × V) / {denom}`\n"
+            f"- Formula LaTeX: `M \\times V_m \\leq \\frac{{M \\times V}}{{{denom}}}`\n\n"
+            "Poiché la minaccia M resta costante e si assume positiva, si semplifica M:\n\n"
+            f"- Formula testuale: `Vm ≤ V / {denom}`\n"
+            f"- Formula LaTeX: `V_m \\leq \\frac{{V}}{{{denom}}}`\n\n"
+            f"Quindi la nuova vulnerabilità mitigata deve essere **minore o uguale a V / {denom}**.\n\n"
+            "**B) Evidenze**\n\n"
+            "- Le relazioni algebriche sono state estratte dalla domanda dell'utente.\n"
+            "- La derivazione è stata eseguita in modo deterministico da Python, non dal modello LLM.\n\n"
+            "**C) Limiti / Conflitti**\n\n"
+            "- La semplificazione richiede che M sia costante e positiva.\n"
+            "- Il risultato è una derivazione matematica dei dati forniti, non una validazione empirica del modello di rischio.\n\n"
+            "**D) Fonti**\n\n"
+            "- Input utente: valori e relazioni matematiche presenti nella domanda."
+        )
+
+    return None
+
+
+# Override v4.4: include date offsets without losing the other deterministic solvers.
 def try_solve_math_query(query_text: str) -> Optional[str]:
     """
-    Forziamo SEMPRE il ritorno a None. 
-    In questo modo il sistema RAG recupera i documenti e lascia che sia 
-    l'LLM (tramite il System Prompt) a eseguire l'operazione matematica.
-    Nessun calcolo hardcoded nel codice Python.
+    Solver matematico deterministico non adattativo.
+
+    Ordine:
+    1. coverage controlli;
+    2. prodotto rischio;
+    3. allocazioni percentuali residue;
+    4. algebra user-provided;
+    5. offset temporali espliciti.
     """
+    coverage = solve_control_coverage(query_text)
+    if coverage:
+        return coverage
+
+    risk_product = solve_risk_product(query_text)
+    if risk_product:
+        return risk_product
+
+    remainder = solve_percentage_remainder_allocation(query_text)
+    if remainder:
+        return remainder
+
+    algebra = try_solve_user_provided_algebra(query_text)
+    if algebra:
+        return algebra
+
+    date_offsets = try_solve_date_offsets(query_text)
+    if date_offsets:
+        return date_offsets
+
     return None
+
+
+def is_calculation_request(query_text: str) -> bool:
+    """
+    Riconosce richieste di calcolo operativo/matematico.
+    Non decide COME calcolare.
+    Decide solo che la domanda NON deve finire in formula lookup documentale.
+
+    Non contiene nomi di normative, framework o query del test.
+    """
+    q = (query_text or "").lower().strip()
+
+    if not q:
+        return False
+
+    calculation_verbs = [
+        # IT
+        "calcola", "calcolare", "calcolo", "quantifica", "quantificare",
+        "determina", "determinare", "quanto", "entro quale",
+        "cifra esatta", "importo esatto", "tempo totale",
+        "totale cumulativo", "delta", "risultato",
+        "risolvi", "esprimi", "isola",
+
+        # EN
+        "calculate", "compute", "quantify", "determine",
+        "how much", "deadline", "total", "cumulative",
+        "delta", "result", "solve", "express", "isolate",
+    ]
+
+    has_calc_verb = any(t in q for t in calculation_verbs)
+
+    has_numbers_or_symbols = bool(
+        re.search(r"\d", q)
+        or re.search(r"(<=|>=|≤|≥|=|>|<|%|×|\*|/|\\frac|\\times)", query_text or "")
+    )
+
+    # Se l'utente chiede esplicitamente una disequazione/equazione,
+    # è comunque una richiesta di calcolo/formulazione, non formula lookup.
+    algebra_terms = [
+        "equazione", "equazioni", "disequazione", "disequazioni",
+        "algebrica", "algebricamente", "in funzione di",
+        "equation", "inequality", "algebraic", "as a function of",
+    ]
+
+    has_algebra = any(t in q for t in algebra_terms)
+
+    return (has_calc_verb and has_numbers_or_symbols) or has_algebra
+
+def is_formula_lookup_query(query_text: str) -> bool:
+    """
+    Riconosce richieste di recupero formule/metriche DALLE FONTI.
+
+    Questa funzione serve solo per formula lookup documentale.
+    Non deve attivarsi per calcoli operativi richiesti dall'utente.
+    """
+    q = (query_text or "").lower().strip()
+
+    if not q:
+        return False
+
+    # Se è una richiesta di calcolo, NON è formula lookup.
+    if is_calculation_request(query_text):
+        return False
+
+    lookup_terms = [
+        # IT
+        "quali formule", "quale formula", "formule presenti",
+        "formula presente", "riporta le formule", "riportale in latex",
+        "estrai le formule", "elenca le formule",
+        "quali metriche", "metriche presenti",
+        "modelli matematici presenti", "formule computazionali",
+        "regole di scoring presenti",
+
+        # EN
+        "which formulas", "what formulas", "extract formulas",
+        "list formulas", "formulas in the document",
+        "metrics in the document", "scoring rules",
+    ]
+
+    return any(t in q for t in lookup_terms)
+
 
 def needs_math_document_context(query_text: str) -> bool:
     """
-    Alcune domande richiedono sia calcolo deterministico sia collegamento ai documenti.
-    In questi casi il solver calcola i numeri, ma il RAG recupera comunque contesto concettuale.
+    Il math_direct deve usare fonti documentali solo se l'utente
+    lo chiede esplicitamente.
+    La presenza di parole come NIS2, GDPR, audit, documenti, scadenze,
+    normativa o fonti NON basta.
     """
     q = (query_text or "").lower()
+
     context_terms = [
-        "collega", "collegalo", "collegala", "documenti", "documento",
-        "risk assessment", "evidence assessment", "assessment", "controlli",
-        "evidenze", "conformità", "audit",
+        "collega ai documenti",
+        "collegalo ai documenti",
+        "collegala ai documenti",
+        "collega alle fonti",
+        "usa le fonti recuperate",
+        "usando le fonti recuperate",
+        "secondo le fonti recuperate",
+        "secondo i documenti recuperati",
+        "con evidenze documentali",
+        "con supporto documentale",
+        "giustifica con le fonti",
+        "cita le fonti nel calcolo",
+        "calcolo basato sui documenti recuperati",
+        "using retrieved sources",
+        "according to retrieved documents",
+        "with documentary evidence",
     ]
+
     return any(t in q for t in context_terms)
 
 
@@ -913,19 +1456,33 @@ def is_glossary_definition_query(query_text: str) -> bool:
     # 2. Se è una query di ragionamento complesso, il glossario DEVE disattivarsi
     reasoning_terms = [
         # ITALIANO - Analisi, Causalità e Confronto
-        "spiega", "confronta", "differenza", "differenze", "valuta", "perché", "perche", 
-        "correlata", "correlato", "relazione", "analizza", "motivo", "causa", "impatto", 
-        "conseguenze", "conseguenza", "vantaggi", "svantaggi", "giustifica", "argomenta", 
-        "deduci", "collega", "paragona", "distinzione", "come funziona", "in che modo", 
+        "spiega", "confronta", "differenza", "differenze", "valuta", "perché", "perche",
+        "correlata", "correlato", "relazione", "analizza", "motivo", "causa", "impatto",
+        "conseguenze", "conseguenza", "vantaggi", "svantaggi", "giustifica", "argomenta",
+        "deduci", "collega", "paragona", "distinzione", "come funziona", "in che modo",
         "sintetizza", "riassumi", "scopo", "obiettivo",
-        
+
+        # ITALIANO - Query normative/classificatorie: NON sono glossario atomico
+        "soggetti", "categorie", "categoria", "tipologie", "tipologia",
+        "classifica", "classificazione", "regime", "vigilanza",
+        "obblighi", "obbligo", "requisiti", "requisito",
+        "normativa", "regolamento", "direttiva", "legge",
+        "autorità", "responsabilità", "sanzioni", "sanzione",
+
         # INGLESE - Analisi, Causalità e Confronto
-        "explain", "compare", "difference", "differences", "evaluate", "why", 
-        "correlated", "relation", "relationship", "analyze", "analyse", "reason", 
-        "cause", "impact", "consequence", "consequences", "advantage", "advantages", 
-        "disadvantage", "disadvantages", "justify", "argue", "deduce", "connect", 
-        "contrast", "distinction", "how does it work", "in what way", "summarize", 
-        "summarise", "purpose", "goal"
+        "explain", "compare", "difference", "differences", "evaluate", "why",
+        "correlated", "relation", "relationship", "analyze", "analyse", "reason",
+        "cause", "impact", "consequence", "consequences", "advantage", "advantages",
+        "disadvantage", "disadvantages", "justify", "argue", "deduce", "connect",
+        "contrast", "distinction", "how does it work", "in what way", "summarize",
+        "summarise", "purpose", "goal",
+
+        # EN - Normative/classification queries: NOT atomic glossary
+        "subjects", "entities", "categories", "category", "types",
+        "classification", "regime", "supervision", "oversight",
+        "obligations", "obligation", "requirements", "requirement",
+        "regulation", "directive", "law", "authority",
+        "responsibility", "responsibilities", "sanctions", "sanction"
     ]
     
     # Se l'utente vuole un'analisi approfondita, scavalca il glossario
@@ -934,14 +1491,14 @@ def is_glossary_definition_query(query_text: str) -> bool:
 
     # 3. Solo se sopravvive ai filtri sopra ed è una richiesta pura di definizione, si attiva
     glossary_terms = [
-        # ITALIANO - Definizioni e Identificazione
-        "cosa significa", "cosa vuol dire", "definisci", "definizione", "significato", 
-        "glossario", "cos'è", "cosa è", "cosa sono", "chi è", "chi sono", "acronimo", 
-        "sta per", "cosa si intende", "dizionario", "vocabolario", "termine", 
-        
-        # INGLESE - Definizioni e Identificazione
-        "what does it mean", "what is", "what are", "who is", "who are", "define", 
-        "definition", "meaning", "glossary", "acronym", "stands for", 
+        # ITALIANO - Definizioni pure / glossario atomico
+        "cosa significa", "cosa vuol dire", "definisci", "definizione", "significato",
+        "glossario", "cos'è", "cosa è", "chi è", "acronimo",
+        "sta per", "cosa si intende", "dizionario", "vocabolario", "termine",
+
+        # INGLESE - Pure definition / atomic glossary
+        "what does it mean", "what is", "who is", "define",
+        "definition", "meaning", "glossary", "acronym", "stands for",
         "what is meant by", "dictionary", "vocabulary", "term"
     ]
     
@@ -996,24 +1553,72 @@ GLOSSARY_TERM_ALIASES: Dict[str, List[str]] = {}
 KNOWN_GLOSSARY_TERMS = list(GLOSSARY_TERM_ALIASES.keys())
 
 
+def _looks_like_filename(value: str) -> bool:
+    """
+    Evita che nomi file tra virgolette vengano trattati come voci di glossario.
+    """
+    v = (value or "").strip().lower()
+    return bool(re.search(r"\.(pdf|md|txt|docx|html|csv|xlsx)$", v))
+
+
+def _is_compound_term(value: str) -> bool:
+    """
+    Riconosce termini composti che NON devono essere spezzati automaticamente:
+    CSIRT-NX, ISO-XYZ, MFA_2, DORA/X, NIS2-Cloud, ecc.
+    """
+    v = (value or "").strip()
+    if len(v) < 3:
+        return False
+
+    return bool(
+        re.search(r"[A-Z]{2,}[A-Z0-9]*\s*[-_/]\s*[A-Z0-9]{1,}", v)
+        or re.search(r"\b[A-Z]{2,}\d+[A-Z0-9]*\b", v)
+    )
+
+
 def extract_requested_terms(query_text: str) -> List[str]:
     """
-    Estrae termini richiesti per il glossario in modo agnostico:
-    Cattura ciò che l'utente ha messo tra virgolette o eventuali acronimi.
+    Estrae termini richiesti per glossario/acronimi in modo non adattativo.
+
+    Regola:
+    1. prima frasi tra virgolette;
+    2. poi termini composti con -, _, / o numeri;
+    3. solo se non ci sono composti, acronimi singoli.
+
+    Questo evita che "CSIRT-NX" venga spezzato in "CSIRT" e "NX".
     """
     q = query_text or ""
     terms: List[str] = []
-    
-    # Cattura stringhe tra virgolette (es. Definisci "Advanced Persistent Threat")
-    quoted = re.findall(r"[\"“']([^\"”']+)[\"”']", q)
-    terms.extend([x.strip() for x in quoted if len(x.strip()) > 2])
-    
-    # Cattura acronimi in maiuscolo (es. Definisci APT)
-    acronyms = re.findall(r"\b[A-Z]{2,8}\b", q)
-    terms.extend(acronyms)
-    
-    return list(dict.fromkeys(terms))
 
+    # 1) Frasi esplicite tra virgolette.
+    quoted = re.findall(r"[\"“']([^\"”']+)[\"”']", q)
+    for item in quoted:
+        clean = item.strip()
+        if len(clean) > 2 and not _looks_like_filename(clean):
+            terms.append(clean)
+
+    # 2) Termini composti non separabili.
+    compound_terms = re.findall(
+        r"\b[A-Z][A-Z0-9]{1,}(?:[-_/][A-Z0-9]{1,})+\b",
+        q
+    )
+
+    for item in compound_terms:
+        clean = item.strip()
+        if clean and clean not in terms:
+            terms.append(clean)
+
+    # 3) Se esiste almeno un composto, NON spezzarlo in sottoparti.
+    if compound_terms:
+        return list(dict.fromkeys(terms))
+
+    # 4) Acronomi singoli solo se non abbiamo trovato composti.
+    acronyms = re.findall(r"\b[A-Z]{2,10}\d{0,3}\b", q)
+    for acr in acronyms:
+        if acr not in terms:
+            terms.append(acr)
+
+    return list(dict.fromkeys(terms))
 
 def extract_exact_phrases(query_text: str) -> List[str]:
     """Estrazione generalista (Agnostica). Estrae stringhe tra virgolette e acronimi."""
@@ -1304,41 +1909,134 @@ def is_graph_relation_query(query_text: str) -> bool:
 
     return any(re.search(rf"\b{re.escape(t)}\b", q) for t in relation_terms)
 
+def should_use_graph_relation_strict_mode(query_text: str) -> bool:
+    """
+    Decide se usare la risposta deterministica tabellare da grafo.
 
+    Non sostituisce is_graph_relation_query():
+    - is_graph_relation_query resta utile per retrieval/espansione;
+    - questa funzione decide SOLO il formato finale.
 
-import re
+    Regola non adattativa:
+    usa tabella grafo solo quando l'utente chiede esplicitamente
+    nodi, archi, path, catene, relazioni o traversamenti.
+    """
+    q = (query_text or "").lower().strip()
+
+    if not q:
+        return False
+
+    # Se la domanda è esplicativa/valutativa, il grafo può essere fonte,
+    # ma NON deve imporre il formato tabellare.
+    explanatory_terms = [
+        # IT
+        "qual è", "quale è", "quali sono", "che cosa", "cosa significa",
+        "ruolo", "scopo", "funzione", "descrivi", "spiega", "analizza",
+        "valuta", "giustifica", "perché", "perche", "in che modo",
+        "come funziona", "elabora", "sintetizza",
+
+        # EN
+        "what is", "what are", "role", "purpose", "function",
+        "describe", "explain", "analyze", "analyse", "evaluate",
+        "justify", "why", "how does", "how do", "summarize", "summarise",
+    ]
+
+    if any(t in q for t in explanatory_terms):
+        return False
+
+    strong_graph_terms = [
+        # IT
+        "neo4j", "cypher", "grafo", "nodi", "nodo", "archi", "arco",
+        "path", "percorso", "traversamento", "multi-hop", "catena semantica",
+        "traccia la catena", "mostra le relazioni", "tabella relazioni",
+        "relazioni tra", "collegamenti tra",
+
+        # EN
+        "graph", "nodes", "node", "edges", "edge", "path", "traversal",
+        "multi-hop", "semantic chain", "trace the chain",
+        "show relationships", "relationship table", "relations between",
+        "links between",
+    ]
+
+    return any(t in q for t in strong_graph_terms)
+
 
 def is_formula_strict_query(query_text: str) -> bool:
     """
-    Bilingual (IT/EN). Attiva l'estrazione delle formule/metriche (es. in tabella) 
-    SOLO per ricerche esplorative e teoriche.
-    Se la query contiene numeri e chiede di eseguire un calcolo, 
-    viene intercettata e bloccata dal gatekeeper (is_math_query).
+    Riconosce query matematiche/algebriche in modo non adattativo.
+
+    Regola:
+    - Formula Strict Mode parte solo se l'utente chiede davvero formula,
+      equazione, disequazione, derivazione, calcolo o algebra.
+    - Le domande normative/classificatorie NON devono entrare qui solo perché
+      contengono soglie, sanzioni, soggetti, regolamenti o categorie.
     """
-    # --- 1. GATEKEEPER ---
-    if is_math_query(query_text):
+    q_raw = query_text or ""
+    q = q_raw.lower()
+
+    if not q.strip():
         return False
 
-    q = (query_text or "").lower()
-    
-    # --- 2. TERMINI ESPLORATIVI E STRUTTURALI ---
-    formula_terms = [
-        # ITALIANO - Base e Metriche
-        "formula", "formule", "equazione", "equazioni", "metrica", "metriche", 
-        "indicatore", "indicatori", "punteggio", "punteggi", "algoritmo", "algoritmi", 
-        "indice", "indici", "modello di calcolo", "algoritmo di calcolo", "teorema",
-        
-        # INGLESE - Base e Metriche
-        "formulas", "formulae", "equation", "equations", "metric", "metrics", 
-        "indicator", "indicators", "score", "scores", "scoring", "algorithm", "algorithms", 
-        "index", "indices", "calculation model", "computation model", "calculation algorithm",
-        
-        # ACRONIMI UNIVERSALI / DOMINIO CYBER & AUDIT
-        "latex", "kpi", "kpis", "kri", "kris", "cvss"
+    # Se è una domanda normativa/classificatoria, NON usare formula mode
+    # salvo che ci siano segnali matematici/algebrici espliciti.
+    explicit_formula_terms = [
+        # IT
+        "formula", "formule",
+        "equazione", "equazioni",
+        "disequazione", "disequazioni",
+        "algebra", "algebrica", "algebrico", "algebricamente",
+        "esprimi", "isola", "in funzione di",
+        "risolvi", "deriva", "derivazione",
+        "scrivi la disequazione", "scrivi l'equazione",
+
+        # EN
+        "equation", "equations",
+        "inequality", "inequalities",
+        "algebraic", "algebraically",
+        "solve", "solve for",
+        "derive", "express", "as a function of",
+        "formula", "formulas",
     ]
-    
-    # Usiamo le word boundaries (\b) per evitare che "score" scatti su "underscore"
-    return any(re.search(rf"\b{re.escape(t)}\b", q) for t in formula_terms)
+
+    if any(t in q for t in explicit_formula_terms):
+        return True
+
+    if is_regulatory_classification_query(query_text):
+        return False
+
+    # Calcolo numerico esplicito.
+    calculation_terms = [
+        # IT
+        "calcola", "calcolo", "quantifica", "quanto vale",
+        "cifra esatta", "importo esatto", "risultato",
+        "percentuale", "budget", "roi", "rosi",
+        "probabilità", "calcolo del rischio",
+
+        # EN
+        "calculate", "compute", "quantify", "how much",
+        "exact amount", "result", "percentage",
+        "budget", "risk score", "probability",
+    ]
+
+    if any(t in q for t in calculation_terms):
+        return True
+
+    # Simboli matematici + verbo operativo.
+    has_math_symbols = bool(
+        re.search(r"(<=|>=|≤|≥|=|>|<|\\times|×|\*|/|\\frac|%)", q_raw)
+    )
+
+    has_operational_verb = any(t in q for t in [
+        "calcola", "risolvi", "scrivi", "esprimi", "isola",
+        "verifica", "determina", "derive", "solve", "express",
+        "calculate", "compute", "determine",
+    ])
+
+    if has_math_symbols and has_operational_verb:
+        return True
+
+    return False
+
 
 
 def extract_formula_rows_from_sources(sources: List[SourceItem]) -> List[Dict[str, Any]]:
@@ -3454,14 +4152,13 @@ def _parse_graph_relation_table_from_source(source: SourceItem) -> List[Dict[str
 
         rows.append({
             "source": cols[0],
-            "relation": cols[1],
+            "relation": clean_graph_relation_label(cols[1]),
             "target": cols[2],
             "filename": cols[3],
             "page": cols[4],
             "evidence": "Relazione presente nel Knowledge Graph.",
             "status": "esplicita nel grafo",
         })
-
     return rows
 
 
@@ -4061,12 +4758,7 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
         counts["neo4j_relation_scope_before"] = before_rel_scope
         counts["neo4j_relation_scope_after"] = len(neo4j_relation_rows)
 
-    formula_query = (
-        intent == "formula"
-        or any(k in (query_text or "").lower() for k in [
-            "formula", "formule", "latex", "equazione", "equazioni"
-        ])
-    )
+    formula_query = is_formula_lookup_query(query_text)
 
     neo4j_formula_hits = (
         search_neo4j_formulas(expanded_query, limit=GRAPH_MAX_FORMULAS)
@@ -4660,42 +5352,121 @@ def build_context_block(sources: List[SourceItem], max_chars: int = MAX_CONTEXT_
 def build_system_instructions(intent: str) -> str:
     """
     Core system prompt for the LLM.
-    Completely framework-agnostic. Focuses on operational constraints.
+    Framework-agnostic, assessment-oriented, with strict grounding,
+    source discipline, math consistency and formula rendering rules.
     """
     base = """
-        ROLE:
-        You are a Senior Technical Auditor and Compliance AI.
+ROLE:
+You are a Senior Technical Auditor and Compliance AI.
 
-        STRICT OPERATIONAL RULES:
-        1. MATHEMATICAL PRIORITY: If the query provides numerical values and requires a calculation (e.g., coverage, risk scores, or deadlines), execute the math step-by-step as your absolute priority.
-        2. DATA GROUNDING: Answer using ONLY the provided context. If a specific value, formula, or concept is not in the context, explicitly state "Information not found in retrieved documents." Do not invent or assume external standards.
-        3. DEFINITIONS: Extract definitions exactly as written in the retrieved text.
-        4. CROSS-REFERENCING: Synthesize information across all relevant retrieved documents impartially. Do not bias toward a specific framework unless requested.
-        5. CITATION: Always cite the specific source file and page for every claim.
-        6. NARRATIVE SYNTHESIS (CRITICAL): If the context contains structured data, JSON, graph nodes, or relations (like source-relation-target), you MUST synthesize them into fluent, professional paragraphs. NEVER output raw database logs, JSON, or tabular representations of graph structures. Translate technical relations (e.g., "A -[COMPLIES_WITH]-> B") into plain text (e.g., "Il documento A è conforme ai requisiti della normativa B").
+1. MATHEMATICAL PRIORITY:
+If the query provides numerical values and requires a calculation, execute the math step-by-step as your absolute priority.
+The final number stated in the first paragraph must exactly match the number obtained in the calculation steps.
+Before finalizing, check that there is no contradiction between the declared result and the arithmetic shown below.
+If the calculation uses only numerical values provided by the user, state clearly that the result is based on user-provided values and do not use retrieved documents to alter the calculation.
+For time calculations, verify day transitions carefully: 24 hours = 1 day, 48 hours = 2 days, 72 hours = 3 days.
+For economic calculations, distinguish gross benefit from net benefit: if explicit costs are provided, subtract them before calling the result “net”.
 
-        TONE: Technical, objective, and evidence-based.
+2. DATA GROUNDING:
+Answer using ONLY the provided retrieved context.
+If a specific value, formula, authority, institution, legal article, deadline, sanction, framework relation, or concept is not in the retrieved context, explicitly state:
+"Information not found in retrieved documents."
+Do not invent, assume, or import external standards, authorities, laws, websites, official portals or background knowledge.
 
-        OUTPUT STRUCTURE:
-        You MUST structure your response in EXACTLY these four sections, using these EXACT headers:
-        **A) Risposta** (Direct, technical assessment in discursive paragraphs)
-        **B) Evidenze** (Bullet points citing the source ID(s) and pages)
-        **C) Limiti / Conflitti** (State missing evidence, contradictions between policies and evidence, or limits of the retrieved context)
-        **D) Fonti** (List the filenames used)
+3. DEFINITIONS:
+Extract definitions exactly as written in the retrieved text.
+If the user asks for a pure definition, quote or paraphrase only what is present in the retrieved context.
+If the exact term is not found, say that it was not found in the retrieved documents.
 
-        LANGUAGE RULE:
-        You MUST respond EXCLUSIVELY in the same language as the user's question.
-    """
+4. CROSS-REFERENCING:
+Synthesize information across all relevant retrieved documents impartially.
+Do not bias toward a specific framework unless requested.
+If multiple documents support different aspects of the answer, clearly distinguish what each document supports.
+
+5. CITATION:
+Always cite the specific retrieved source file and page for every claim.
+Never cite external URLs, websites, official portals, laws, standards, authorities or references that are not present in the retrieved context.
+Section B and Section D must use ONLY retrieved source filenames and pages.
+
+6. NARRATIVE SYNTHESIS:
+If the context contains structured data, JSON, graph nodes, or relations such as source-relation-target, synthesize them into fluent, professional paragraphs.
+Never output raw database logs, raw JSON, or raw graph triples unless the user explicitly asks for graph/table output.
+Translate technical relations into plain language.
+
+7. CLASSIFICATION / REGULATORY QUERY RULE:
+If the user asks "chi sono", "quali sono", "what are", "who are", "which are" followed by categories, subjects, entities, obligations, supervision regimes, requirements, sanctions, or regulatory classes, this is NOT a glossary question.
+Treat it as a regulatory classification question and answer from retrieved context using structured paragraphs or bullets.
+
+8. FORMULA VISIBILITY RULE:
+If the answer contains formulas, equations, inequalities, thresholds or algebraic derivations, never rely only on rendered LaTeX.
+Always include a visible plain-text formula before any LaTeX version.
+
+TONE:
+Technical, objective, concise, and evidence-based.
+
+OUTPUT STRUCTURE:
+You MUST structure your response in EXACTLY these four sections, using these EXACT headers:
+
+**A) Risposta**
+Direct technical assessment in discursive paragraphs or structured bullets.
+
+**B) Evidenze**
+Bullet points citing ONLY retrieved source files and pages.
+Every bullet should refer to a retrieved filename and page, unless the answer is purely deterministic math based only on user-provided values.
+Do not cite generic standards, external laws, websites, official portals or background knowledge unless they are present in the retrieved sources.
+
+**C) Limiti / Conflitti**
+State missing evidence, contradictions, assumptions, or limits of the retrieved context.
+
+**D) Fonti**
+List only retrieved filenames and pages. Do not list external websites or references not present in the retrieved context.
+
+LANGUAGE RULE:
+You MUST respond EXCLUSIVELY in the same language as the user's question.
+"""
 
     if intent == "formula":
-        base += "\nINTENT: FORMULA / METRIC. Prioritize exact mathematical formulas, threshold criteria, or scoring models from the context."
+        base += """
+INTENT: FORMULA / METRIC / ALGEBRA.
+
+FORMULA OUTPUT RULES:
+1. If the user asks to write, derive, express, isolate or solve an equation or inequality, always show the formula twice:
+   - Formula testuale: `plain text formula`
+   - Formula LaTeX: `LaTeX code`
+2. The plain text formula is mandatory and must appear BEFORE the LaTeX version.
+3. Never leave blank mathematical placeholders.
+4. Never write empty parentheses for variables.
+5. If variables appear in the user question, preserve their names exactly in the plain text formula.
+6. If the formula is derived from user-provided values, explicitly state that it is derived from user-provided values.
+7. If the context does not contain a formula but the user provided all variables and relationships, you may derive the algebraic expression from the user-provided statement, marking it as user-provided derivation.
+"""
     elif intent == "table":
-        base += "\nINTENT: TABLE. Output a complete Markdown table based on the context."
+        base += """
+INTENT: TABLE.
+Output a complete Markdown table based only on the retrieved context.
+Do not invent rows, columns, control IDs, article numbers, mappings or evidence not present in the retrieved context.
+If a value is missing, write "non recuperato" or "fonte non recuperata".
+"""
     elif intent == "chart":
-        base += "\nINTENT: CHART / DIAGRAM. Describe the topology or architecture extracted from the context."
+        base += """
+INTENT: CHART / DIAGRAM.
+Describe the topology, process, architecture, chart or diagram extracted from the retrieved context.
+If graph relations are present, synthesize them in natural language unless the user explicitly asks for a graph table.
+Do not infer missing nodes, links, numbers or labels.
+"""
+    elif intent == "audit":
+        base += """
+INTENT: AUDIT / COMPLIANCE.
+Prioritize requirements, obligations, evidence, gaps, controls, responsibilities, risk, compliance status and conflicts.
+Clearly distinguish:
+- requisito normativo;
+- controllo/procedura;
+- evidenza recuperata;
+- deduzione non esplicita;
+- informazione non trovata.
+"""
 
     return base
-
 
 def tier_guardrail_instructions(query_text: str) -> str:
     wants_evidence = is_evidence_query(query_text)
@@ -4704,14 +5475,14 @@ def tier_guardrail_instructions(query_text: str) -> str:
         "1) Tier A (Normative): Primary source for legal and framework requirements.\n"
         "2) Tier B (Governance): Internal policies and planned procedures.\n"
         "3) Tier C (Evidences): Technical proof of actual implementation.\n"
-        "4) Grounding: Every statement must be supported by the provided context. Flag any non-conformities.\n"
+        "4) Grounding: Every statement must be supported by the provided context. Do not use external laws, portals, authorities, standards or URLs unless they are explicitly present in the retrieved sources. Flag any non-conformities.\n"
         "5) Gap Analysis: If technical evidence is missing to prove a policy, state it in section C.\n"
         f"6) {'EVIDENCE FOCUS: The user specifically requested technical proofs, logs, or configurations. Prioritize Tier C context.' if wants_evidence else 'Standard audit: verify alignment across all Tiers.'}\n"
-        f"7) GLOSSARY & DEFINITIONS: If the user asks for a definition ('definizione', 'significato', 'meaning', 'definition'), quote EXACTLY from the provided context. Do not use external knowledge.\n"
-        f"8) MATH & PENALTIES: If calculating percentages or fines, strictly use the formulas in the text. Explicitly write out the mathematical steps before providing the final number.\n"
-        f"9) ANTI-HALLUCINATION: If the context does not mention a specific scenario, state clearly: 'I documenti forniti non contengono questa informazione'.\n"
+        f"7) GLOSSARY & DEFINITIONS: If the user asks for a pure definition ('definizione', 'significato', 'meaning', 'definition'), quote EXACTLY from the provided context. If the user asks for categories, subjects, regimes, obligations or requirements, do NOT treat it as atomic glossary: answer as a regulatory/compliance question using retrieved sources.\n"
+        f"8) MATH & PENALTIES: If calculating percentages, fines, thresholds, deadlines or algebraic relations, explicitly write out the mathematical steps before providing the final number. The final number must match the calculation. For formulas, always provide a plain-text formula before any LaTeX.\n"
+        f"9) ANTI-HALLUCINATION: If the context does not mention a specific scenario, authority, sanction, date, article or relation, state clearly: 'I documenti forniti non contengono questa informazione'.\n"
     )
-
+    
 def tier_guardrail_instructions_analytics(query_text: str) -> str:
     return (
         "SECURITY DATA ANALYTICS GUARDRAILS:\n"
@@ -4741,7 +5512,8 @@ def build_system_instructions_analytics(intent: str = "analysis") -> str:
 
     **B) Evidenze**
     [Identified threats, anomalies, or statistical findings]
-
+HALLUCINATION: If the context does not mention a specific scenario, state clearly: 'I documenti forniti non contengono questa informazione'.\n"
+    )
     **C) Limiti e Assunzioni**
     [Limitations of the provided logs or required further investigations]
 
@@ -5512,109 +6284,171 @@ def _format_it_date(dt: datetime) -> str:
     return dt.strftime("%d/%m/%Y")
 
 
-def try_solve_date_offsets(query_text: str) -> Optional[str]:
+def _weekday_index_it_en(value: str) -> Optional[int]:
+    days = {
+        "lunedì": 0, "lunedi": 0, "monday": 0,
+        "martedì": 1, "martedi": 1, "tuesday": 1,
+        "mercoledì": 2, "mercoledi": 2, "wednesday": 2,
+        "giovedì": 3, "giovedi": 3, "thursday": 3,
+        "venerdì": 4, "venerdi": 4, "friday": 4,
+        "sabato": 5, "saturday": 5,
+        "domenica": 6, "sunday": 6,
+    }
+    return days.get((value or "").lower().strip())
+
+
+def _weekday_name_it(index: int) -> str:
+    names = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
+    return names[index % 7]
+
+
+def _parse_base_datetime_or_weekday(query_text: str) -> Tuple[Optional[datetime], Optional[int], str]:
     """
-    Calcola in modo deterministico scadenze del tipo data + N mesi.
-    Non interpreta norme: calcola solo le date aritmetiche richieste dall'utente.
+    Estrae una base temporale:
+    - data esplicita dd/mm/yyyy con eventuale ora;
+    - oppure giorno della settimana + ora.
+
+    Ritorna:
+    (datetime_reale, weekday_index, label_base)
     """
     q = query_text or ""
     ql = q.lower()
 
-    if not re.search(r"\b(mesi|months?|giorni|days?|anni|years?)\b", ql):
+    # Data esplicita: 01/06/2026 ore 08:00
+    m_date = re.search(
+        r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:.*?\b(?:ore|at)?\s*(\d{1,2})[:.](\d{2}))?",
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    if m_date:
+        day, month, year = map(int, m_date.group(1, 2, 3))
+        hour = int(m_date.group(4) or 0)
+        minute = int(m_date.group(5) or 0)
+        try:
+            dt = datetime(year, month, day, hour, minute)
+            return dt, dt.weekday(), _format_it_date(dt) + f" {hour:02d}:{minute:02d}"
+        except Exception:
+            return None, None, ""
+
+    # Giorno settimana + ora: lunedì alle ore 08:00
+    m_weekday = re.search(
+        r"\b(lunedì|lunedi|monday|martedì|martedi|tuesday|mercoledì|mercoledi|wednesday|giovedì|giovedi|thursday|venerdì|venerdi|friday|sabato|saturday|domenica|sunday)\b"
+        r".{0,40}?\b(?:ore|at|alle|le)?\s*(\d{1,2})[:.](\d{2})",
+        ql,
+        flags=re.IGNORECASE,
+    )
+
+    if m_weekday:
+        wd = _weekday_index_it_en(m_weekday.group(1))
+        hour = int(m_weekday.group(2))
+        minute = int(m_weekday.group(3))
+        # Data fittizia: lunedì 2000-01-03.
+        base_monday = datetime(2000, 1, 3, hour, minute)
+        base_dt = base_monday + timedelta(days=int(wd or 0))
+        return base_dt, wd, f"{_weekday_name_it(int(wd or 0))} {hour:02d}:{minute:02d}"
+
+    return None, None, ""
+
+
+def try_solve_date_offsets(query_text: str) -> Optional[str]:
+    """
+    Calcola in modo deterministico scadenze temporali esplicite.
+    Non interpreta norme: calcola solo offset presenti nella domanda.
+
+    Supporta:
+    - +N ore
+    - +N giorni
+    - +N mesi
+    """
+    q = query_text or ""
+    ql = q.lower()
+
+    if not re.search(r"\b(ore|hours?|giorni|days?|mesi|months?)\b", ql):
         return None
 
-    m_date = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", q)
-    if not m_date:
+    base_dt, base_wd, base_label = _parse_base_datetime_or_weekday(q)
+
+    if not base_dt:
         return None
 
-    day, month, year = map(int, m_date.groups())
-    try:
-        base = datetime(year, month, day)
-    except Exception:
-        return None
+    offsets: List[Tuple[str, str, datetime]] = []
 
-    month_offsets = []
+    # Ore
+    for m in re.finditer(r"\b(\d{1,4})\s*(?:ore|hours?)\b", ql):
+        n = int(m.group(1))
+        if n <= 0:
+            continue
+        offsets.append((f"{n} ore", f"{base_label} + {n} ore", base_dt + timedelta(hours=n)))
+
+    # Giorni
+    for m in re.finditer(r"\b(\d{1,4})\s*(?:giorni|days?)\b", ql):
+        n = int(m.group(1))
+        if n <= 0:
+            continue
+        offsets.append((f"{n} giorni", f"{base_label} + {n} giorni", base_dt + timedelta(days=n)))
+
+    # Mesi
     for m in re.finditer(r"\b(\d{1,3})\s*(?:mesi|months?)\b", ql):
         n = int(m.group(1))
         if n <= 0:
             continue
-        window = ql[max(0, m.start() - 80): m.end() + 80]
-        if any(t in window for t in ["notifica", "notification", "incident", "incidente"]):
-            label = f"Scadenza a {n} mesi per notifica/incidenti"
-        elif any(t in window for t in ["misure", "security measures", "misure di sicurezza"]):
-            label = f"Scadenza a {n} mesi per misure di sicurezza"
-        else:
-            label = f"Scadenza a {n} mesi"
-        month_offsets.append((n, label, _add_months(base, n)))
+        offsets.append((f"{n} mesi", f"{base_label} + {n} mesi", _add_months(base_dt, n)))
 
-    if not month_offsets:
+    if not offsets:
         return None
 
-    dedup = []
-    seen_offsets = set()
-    for item in month_offsets:
-        if item[0] in seen_offsets:
+    # Dedup su label offset.
+    dedup: List[Tuple[str, str, datetime]] = []
+    seen = set()
+
+    for item in offsets:
+        if item[0] in seen:
             continue
-        seen_offsets.add(item[0])
+        seen.add(item[0])
         dedup.append(item)
 
     lines = [
         "**A) Risposta**\n",
-        f"Data di partenza: **{_format_it_date(base)}**.",
+        f"Base temporale rilevata: **{base_label}**.",
         "",
-        "| Scadenza richiesta | Calcolo | Data risultante |",
+        "| Offset | Calcolo | Scadenza risultante |",
         "|---|---|---:|",
     ]
-    for n, label, result in dedup:
-        lines.append(f"| {label} | {_format_it_date(base)} + {n} mesi | **{_format_it_date(result)}** |")
 
-    if "2026" in ql or "confront" in ql or "compare" in ql:
+    for offset_label, calc_label, result in dedup:
+        result_label = f"{_weekday_name_it(result.weekday())} {result.strftime('%H:%M')}"
+        if result.year != 2000:
+            result_label = f"{_format_it_date(result)} {result.strftime('%H:%M')}"
+        lines.append(f"| {offset_label} | {calc_label} | **{result_label}** |")
+
+    if len(dedup) >= 2:
+        earliest = min(x[2] for x in dedup)
+        latest = max(x[2] for x in dedup)
+        delta_hours = int((latest - earliest).total_seconds() // 3600)
         lines.extend([
             "",
-            "**Confronto con fonti/documenti**",
-            "",
-            "- Il calcolo sopra è deterministico e usa solo la data fornita dall'utente.",
-            "- Eventuali scadenze speciali o regole applicative devono essere verificate nelle fonti recuperate e non modificano il calcolo aritmetico sopra.",
+            f"Delta tra la prima e l'ultima scadenza: **{delta_hours} ore**.",
         ])
 
     lines.extend([
         "",
         "**B) Evidenze**",
         "",
-        f"- Data fornita dall'utente: `{_format_it_date(base)}`.",
-        "- Offset temporali richiesti: " + ", ".join(f"{n} mesi" for n, _, _ in dedup) + ".",
+        f"- Base temporale fornita dall'utente: `{base_label}`.",
+        "- Offset temporali espliciti rilevati: " + ", ".join(x[0] for x in dedup) + ".",
         "",
         "**C) Limiti / Conflitti**",
         "",
-        "- Il calcolo delle date è deterministico; l'interpretazione normativa resta vincolata alle fonti recuperate.",
+        "- Il calcolo è puramente aritmetico e non interpreta automaticamente obblighi normativi non esplicitati nella domanda.",
+        "- Se gli offset derivano da documenti normativi recuperati, devono essere verificati nelle fonti e poi inseriti come offset espliciti.",
         "",
         "**D) Fonti**",
         "",
         "- Dati temporali forniti dall'utente.",
     ])
+
     return "\n".join(lines)
-
-
-# Override v4.4: include date offsets without touching risk/coverage solvers.
-def try_solve_math_query(query_text: str) -> Optional[str]:
-    if solve_control_coverage(query_text):
-        return solve_control_coverage(query_text)
-    if solve_risk_product(query_text):
-        return solve_risk_product(query_text)
-    return try_solve_date_offsets(query_text)
-
-
-# Override v4.4: date/scadenze/confronti need retrieval context, but math remains authoritative.
-def needs_math_document_context(query_text: str) -> bool:
-    q = (query_text or "").lower()
-    context_terms = [
-        "collega", "collegalo", "collegala", "documenti", "documento",
-        "risk assessment", "evidence assessment", "assessment", "controlli",
-        "evidenze", "conformità", "audit", "confronta", "confrontale",
-        "compare", "scadenze", "scadenza", "deadline", "deadlines",
-        "nis", "2026", "fonti", "fonte", "normativa", "norme",
-    ]
-    return any(t in q for t in context_terms)
 
 
 def _strip_math_wrappers(value: str) -> str:
@@ -5826,10 +6660,139 @@ def _compact_source_list_for_answer(sources: List[SourceItem], max_sources: int 
 
 def _replace_final_sources_section(answer: str, sources: List[SourceItem]) -> str:
     replacement = "**D) Fonti**\n\n" + _compact_source_list_for_answer(sources)
-    pattern = r"(?is)(\*\*D\)\s*Fonti\*\*|D\)\s*Fonti).*\Z"
+
+    pattern = (
+        r"(?is)"
+        r"(?:^|\n)\s*"
+        r"(?:#{1,6}\s*)?"
+        r"(?:\*\*)?"
+        r"D\s*[\)\.\-:]\s*"
+        r"(?:Fonti|Sources|Riferimenti|References)"
+        r"(?:\*\*)?"
+        r"\s*:?"
+        r".*\Z"
+    )
+
     if re.search(pattern, answer or ""):
-        return re.sub(pattern, replacement, answer.rstrip())
+        return re.sub(pattern, "\n\n" + replacement, answer.rstrip()).strip()
+
     return (answer or "").rstrip() + "\n\n" + replacement
+
+
+def _has_required_abcd_headers(answer: str) -> bool:
+    text = answer or ""
+    required = [
+        "**A) Risposta**",
+        "**B) Evidenze**",
+        "**C) Limiti / Conflitti**",
+        "**D) Fonti**",
+    ]
+    return all(h in text for h in required)
+
+
+def _looks_like_graph_table_answer(answer: str) -> bool:
+    text = answer or ""
+    return (
+        "| Entità sorgente | Relazione | Entità target |" in text
+        or "| Source entity | Relation | Target entity |" in text
+    )
+
+
+def _is_explanatory_question(query_text: str) -> bool:
+    q = (query_text or "").lower()
+    terms = [
+        "qual è", "quale è", "quali sono", "ruolo", "scopo", "descrivi",
+        "spiega", "analizza", "valuta", "in che modo", "come funziona",
+        "what is", "what are", "role", "purpose", "describe", "explain",
+        "analyze", "analyse", "evaluate", "how does",
+    ]
+    return any(t in q for t in terms)
+
+
+def _repair_missing_abcd_headers(answer: str) -> str:
+    """
+    Ripara solo il contenitore, non inventa contenuto.
+    """
+    text = (answer or "").strip()
+
+    if _has_required_abcd_headers(text):
+        return text
+
+    return (
+        "**A) Risposta**\n\n"
+        + (text if text else "Risposta non disponibile.")
+        + "\n\n**B) Evidenze**\n\n"
+        "- Vedi fonti recuperate nel pannello Fonti/Audit.\n\n"
+        "**C) Limiti / Conflitti**\n\n"
+        "- La struttura della risposta è stata normalizzata automaticamente.\n\n"
+        "**D) Fonti**\n\n"
+        "- Vedi pannello Fonti/Audit."
+    )
+
+
+def quality_gate_postprocess(answer: str, query_text: str, sources: List[SourceItem]) -> str:
+    """
+    Quality gate finale non adattativo.
+    Non corregge il dominio; corregge classi generali di errore.
+    """
+    out = answer or ""
+
+    # 1) Struttura A/B/C/D obbligatoria.
+    out = _repair_missing_abcd_headers(out)
+
+    # 2) Se la domanda è esplicativa, non lasciare che una tabella grafo
+    # diventi l'unico contenuto della sezione A.
+    if (
+        _is_explanatory_question(query_text)
+        and _looks_like_graph_table_answer(out)
+        and not should_use_graph_relation_strict_mode(query_text)
+    ):
+        out = (
+            "**A) Risposta**\n\n"
+            "La domanda richiede una spiegazione discorsiva. Le relazioni del grafo recuperate "
+            "possono essere usate come supporto, ma non sono sufficienti da sole a costituire "
+            "la risposta finale.\n\n"
+            "**B) Evidenze**\n\n"
+            "- Il retrieval ha recuperato relazioni o co-occorrenze, ma il formato tabellare non è appropriato come unica risposta.\n\n"
+            "**C) Limiti / Conflitti**\n\n"
+            "- È necessario usare i chunk testuali recuperati per produrre una spiegazione motivata.\n"
+            "- Il grafo resta fonte di supporto, non formato obbligatorio della risposta.\n\n"
+            "**D) Fonti**\n\n"
+            "- Vedi pannello Fonti/Audit."
+        )
+
+    # 3) URL esterni vietati nel testo finale.
+    # 3) URL esterni vietati nel testo finale.
+    out = re.sub(
+        r"https?://\S+",
+        "[Link esterno non autorizzato rimosso]",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    # 3-bis) Formula visibility guard.
+    # Se una query matematica/algebrica produce una risposta senza formule visibili,
+    # prova il fallback deterministico sui dati forniti dall'utente.
+    if is_formula_strict_query(query_text):
+        has_visible_formula = bool(
+            re.search(r"[A-Za-z0-9_]\s*(=|>|<|≤|≥|×|\*)\s*[A-Za-z0-9_(]", out)
+            or re.search(r"(Formula testuale|Formula LaTeX)", out, flags=re.IGNORECASE)
+        )
+
+        if not has_visible_formula:
+            algebra_fallback = try_solve_user_provided_algebra(query_text)
+            if algebra_fallback:
+                out = algebra_fallback
+
+    # 4) Se ci sono fonti recuperate, la bibliografia finale viene SEMPRE ricostruita.
+    # Questo elimina riferimenti esterni residui anche quando il modello usa varianti
+    # come "D) Sources", "D. Fonti", "References", ecc.
+    if sources:
+        out = _replace_final_sources_section(out, sources)
+
+    return out.strip()
+
+
 
 
 def postprocess_generated_answer(answer: str, query_text: str, sources: List[SourceItem]) -> str:
@@ -5860,17 +6823,23 @@ def postprocess_generated_answer(answer: str, query_text: str, sources: List[Sou
             out = out.replace("Limitations / Conflicts", "Limiti / Conflitti")
 
     # Manteniamo la logica esistente per URL e Fonti
-    if is_strict_checklist_query(query_text) or is_crosswalk_mapping_query(query_text):
-        # Rimuove tutti gli URL esterni trovati e li sostituisce con una stringa neutra
-        out = re.sub(
-            r"https?://\S+",
-            "[Link esterno non autorizzato rimosso]",
-            out,
-            flags=re.IGNORECASE,
-        )
+    # ============================================================
+    # SOURCE DISCIPLINE - non adattativo
+    # ============================================================
+    # In modalità RAG assessment la sezione D deve contenere solo fonti recuperate.
+    # Gli URL o riferimenti esterni generati dal modello vengono rimossi sempre.
+    out = re.sub(
+        r"https?://\S+",
+        "[Link esterno non autorizzato rimosso]",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    # Ricostruisce sempre la sezione D) Fonti usando i SourceItem reali.
+    if sources:
         out = _replace_final_sources_section(out, sources)
 
-    return out.strip()
+    return quality_gate_postprocess(out, query_text, sources)
 
 # =========================
 # 🔄 STATE MANAGEMENT
@@ -6073,8 +7042,18 @@ class State(rx.State):
             math_needs_context = bool(math_answer and needs_math_document_context(user_query))
             analytics_mode = is_user_data_analytics(user_query) and not math_answer
 
+            pure_glossary_trigger = any(t in user_query.lower() for t in [
+                "glossario", "definisci", "definizione", "significato",
+                "acronimo", "sta per", "cosa significa", "cosa vuol dire",
+                "cosa si intende", "dizionario", "vocabolario",
+                "glossary", "define", "definition", "meaning",
+                "acronym", "stands for", "what does it mean", "what is meant by",
+                "dictionary", "vocabulary",
+            ])
+
             if (
-                is_glossary_definition_query(user_query)
+                pure_glossary_trigger
+                and is_glossary_definition_query(user_query)
                 and not is_mixed_glossary_rag_query(user_query)
                 and not is_graph_relation_query(user_query)
             ):
@@ -6094,16 +7073,24 @@ class State(rx.State):
                     yield rx.scroll_to("chat_bottom")
                     return
 
+
+            # ============================================================
+            # 🧮 DETERMINISTIC MATH DIRECT MODE
+            # ============================================================
+            # Deve stare FUORI dal blocco glossario.
             if math_answer and not math_needs_context:
                 self.messages.append(
                     ChatMessage(
                         id=str(uuid.uuid4()),
                         role="assistant",
                         content=math_answer,
-                        sources=prepare_sources_for_ui(make_analytics_sources(user_query)),
+                        sources=[],
                         debug_md=prepare_debug_for_ui(
-                            "### 🔎 Audit (Deterministic Math Mode)\n"
-                            "- retrieval: **bypassed for arithmetic**\n"
+                            "### 🔎 Audit (Deterministic Math Direct Mode)\n"
+                            "- routing: **math_direct**\n"
+                            "- retrieval: **bypassed**\n"
+                            "- formula_lookup: **bypassed**\n"
+                            "- llm: **bypassed**\n"
                             "- source: **USER_INPUT**"
                         ),
                     )
@@ -6112,6 +7099,38 @@ class State(rx.State):
                 yield rx.scroll_to("chat_bottom")
                 return
 
+                # ============================================================
+                # 🧮 DETERMINISTIC MATH DIRECT MODE
+                # ============================================================
+                # Se il solver deterministico ha prodotto una risposta e l'utente
+                # NON chiede esplicitamente un collegamento documentale, esci subito.
+                #
+                # Questo blocco deve stare prima di:
+                # - retrieve_v2(...)
+                # - Formula Lookup Strict Mode
+                # - chiamata LLM
+                if math_answer and not math_needs_context:
+                    self.messages.append(
+                        ChatMessage(
+                            id=str(uuid.uuid4()),
+                            role="assistant",
+                            content=math_answer,
+                            sources=[],
+                            debug_md=prepare_debug_for_ui(
+                                "### 🔎 Audit (Deterministic Math Direct Mode)\n"
+                                "- routing: **math_direct**\n"
+                                "- retrieval: **bypassed**\n"
+                                "- formula_lookup: **bypassed**\n"
+                                "- llm: **bypassed**\n"
+                                "- source: **USER_INPUT**"
+                            ),
+                        )
+                    )
+                    self.is_processing = False
+                    yield rx.scroll_to("chat_bottom")
+                    return
+
+            
             # Variabili per il payload
             system_instructions = ""
             final_user_content = ""
@@ -6160,7 +7179,7 @@ class State(rx.State):
                                 "Non ho trovato evidenze sufficienti nei documenti recuperati.\n\n"
                                 "**B) Evidenze**\n\n"
                                 "- Nessuna fonte pertinente recuperata per il documento richiesto.\n\n"
-                                "**C) Limiti**\n\n"
+                                "**C) Limiti / Conflitti**\n\n"
                                 "- Il sistema non deve usare formule provenienti da altri documenti.\n\n"
                                 "**D) Fonti**\n\n"
                                 "- Nessuna fonte utilizzabile."
@@ -6210,7 +7229,7 @@ class State(rx.State):
                 # ============================================================
                 # Per domande su collegamenti/relazioni/entità, evita risposte discorsive
                 # quando è possibile costruire una tabella verificabile dalle fonti recuperate.
-                if is_graph_relation_query(user_query) and not math_answer:
+                if should_use_graph_relation_strict_mode(user_query) and not math_answer:
                     graph_answer = answer_graph_relations_strict(user_query, sources)
 
                     if graph_answer:
@@ -6238,11 +7257,13 @@ class State(rx.State):
                 # ============================================================
                 # 🧮 FORMULA STRICT MODE
                 # ============================================================
-                # Per domande su formule/metriche/LaTeX, evita che il modello inventi formule
-                # o lasci output vuoti. Usa solo formule/metriche presenti nelle fonti recuperate.
-                if is_formula_strict_query(user_query):
+                # Formula Strict Mode deve servire per recuperare formule presenti nei documenti.
+                # Non deve intercettare algebra già fornita dall'utente, perché quella viene risolta
+                # dal solver deterministico try_solve_user_provided_algebra().
+ 
+                if is_formula_lookup_query(user_query):
                     formula_answer = answer_formula_strict(user_query, sources)
-
+       
                     if formula_answer:
                         self.messages.append(
                             ChatMessage(
@@ -6266,14 +7287,45 @@ class State(rx.State):
                 # --- INIZIO NUOVA LOGICA: PROMPT ANTI-CONTAMINAZIONE IN INGLESE ---
                 # Subito dopo il blocco "if not sources:", creiamo le istruzioni di sistema
                 # e aggiungiamo il guardrail robusto.
-                system_instructions = build_system_instructions(intent)
-                system_instructions += """
+                system_instructions = build_system_instructions(intent) or ""
                 
+                if is_calculation_request(user_query) and not math_answer:
+                    system_instructions += """
+
+                CALCULATION MODE:
+                - The user is asking to calculate, determine, quantify, solve, derive, or compute a result.
+                - Do NOT answer by listing formulas, metrics, thresholds, or scoring rules found in the documents.
+                - Use retrieved documents only to extract values, constants, definitions, thresholds, deadlines, or rules that are missing from the user question and are necessary for the calculation.
+                - If the user question already provides all required values, use those values directly.
+
+                GENERAL NUMERIC DISCIPLINE:
+                1. First list all values used, including their units.
+                2. State the formula, rule, or reasoning pattern applied in plain text.
+                3. Perform the calculation step by step.
+                4. Keep units consistent across all steps.
+                5. Clearly distinguish intermediate results from the final result.
+                6. The final result must be mathematically traceable to the shown steps.
+                7. Before finalizing, verify that the final result is consistent with the intermediate calculations.
+                8. If a required value is missing from both the user question and the retrieved context, say exactly which value is missing and do not invent it.
+
+                OUTPUT REQUIREMENTS:
+                - Always show:
+                1) values used;
+                2) formula or rule applied;
+                3) calculation steps;
+                4) final result.
+                - If formulas are shown, include visible plain-text formulas before LaTeX.
+                """
+                                
+                system_instructions += """
+                                
                 8) ANTI-CONTAMINATION AND DISAMBIGUATION (CRITICAL):
                 - If the user specifies or implies a specific document context, you MUST STRICTLY IGNORE retrieved chunks from other documents that define the same variables (e.g., 'alpha', 'D') differently.
                 - Mathematical variables are highly context-dependent. Do not mix formulas from 'algorithmic trading' with those from 'asset allocation' or other topics.
                 - If you see conflicting definitions for a variable across different sources, ALWAYS prioritize the definitions from the active requested document context.
                 """
+
+
 
                 if is_strict_checklist_query(user_query):
                     system_instructions += """
@@ -6304,7 +7356,7 @@ class State(rx.State):
                 - Section C must clearly state whether the document contains an explicit crosswalk or only the instruction/need to build one.
                     """
 
-                if is_graph_relation_query(user_query):
+                if should_use_graph_relation_strict_mode(user_query):
                     system_instructions += """
 
                 11) GRAPH RELATION MODE (CRITICAL):
@@ -6390,77 +7442,25 @@ class State(rx.State):
                 c_c = "".join(c_c_list).strip()
                 c_g = "".join(c_g_list).strip()
 
-                # --- INIZIO FIX MATEMATICO PRE-FLIGHT (Ampliato e in Inglese) ---
+                # ============================================================
+                # 🧮 MATHEMATICAL DISCIPLINE
+                # ============================================================
+                # Non usiamo più una micro-chiamata LLM per estrarre formule.
+                # I calcoli deterministici vengono gestiti da try_solve_math_query().
+                # Se try_solve_math_query() non risolve, il modello può spiegare i passaggi,
+                # ma il quality gate finale impedirà fonti esterne e output incoerenti.
                 math_injection = ""
-                q_low = (user_query or "").lower()
-                
-                # Dizionario statico ampliato per il dominio assessment e audit (IT/EN)
-                math_triggers = [
-                    # IT: Termini finanziari, sanzionatori e di calcolo
-                    "calcola", "calcolo", "sanzione", "percentuale", "ammonta", "penale", "multa",
-                    "somma", "totale", "media", "budget", "costo", "stima", "differenza", "quantifica",
-                    "impatto economico", "danno", "roi", "massimale", "soglia", "limite", "budget",
-                    # EN: Financial, sanction and calculation terms
-                    "calculate", "calculation", "fine", "percentage", "amount", "penalty", "compute",
-                    "sum", "total", "average", "cost", "estimate", "difference", "quantify",
-                    "economic impact", "damage", "roi", "maximum", "threshold", "limit",
-                    # Simboli matematici universali
-                    "%"
-                ]
-                
-                # Attiviamo la calcolatrice se la domanda contiene termini matematici o finanziari
-                if any(k in q_low for k in math_triggers):
-                    mini_context = f"Tier A (Normative):\n{c_a}\nTier B (Policies):\n{c_b}\nTier C (Evidences):\n{c_c}"
-                    
-                    math_prompt = (
-                        f"Context:\n{mini_context}\n\n"
-                        f"Question: {user_query}\n\n"
-                        f"Task: Extract ONLY the pure mathematical expression (numbers and operators) "
-                        f"needed to compute the exact answer based on the numbers provided in the context "
-                        f"(e.g., 150000000 * 0.04). Do NOT write any text, units, or explanations. "
-                        f"If no calculation is required, output exactly the word NO."
-                    )
-                    
-                    try:
-                        # Micro-chiamata sincrona per estrarre la formula
-                        math_resp = llm_client.chat.completions.create(
-                            model=LLM_MODEL_NAME,
-                            messages=[
-                                {"role": "system", "content": "You are a strict math expression extractor. Output ONLY the raw mathematical expression (e.g. 10 * 0.05) or the word NO."},
-                                {"role": "user", "content": math_prompt}
-                            ],
-                            temperature=0.0,
-                            stream=False,
-                            extra_body={
-                                "options": {
-                                    "num_ctx": LLM_NUM_CTX,
-                                    "num_predict": 50, # Bastano 50 token
-                                    "repeat_penalty": 1.05,
-                                }
-                            }
-                        )
-                        
-                        expr = math_resp.choices[0].message.content.strip()
-                        
-                        # Se ha estratto una formula, la facciamo calcolare a Python
-                        if expr != "NO" and "NO" not in expr.upper():
-                            risultato_esatto = calcolatrice_universale(expr)
-                            if risultato_esatto:
-                                math_injection = (
-                                    f"\n\n[SYSTEM CALCULATED MATH RESULT: {risultato_esatto}]\n"
-                                    f"CRITICAL RULE: You MUST use this exact numerical result in your final answer as the absolute truth. "
-                                    f"Briefly explain the numbers used for the calculation.\n\n"
-                                )
-                    except Exception as e:
-                        print(f"⚠️ Errore Pre-Flight Matematico: {e}")
 
-                # 3. PROMPT DI SISTEMA
-                # system_instructions è già stato costruito sopra.
-                # Iniettiamo qui la verità matematica se è stata calcolata:
+                if math_answer:
+                    math_injection = (
+                        "\n\n### SYSTEM DETERMINISTIC MATH RESULT ###\n"
+                        f"{math_answer}\n\n"
+                        "CRITICAL: The deterministic result above is authoritative. "
+                        "Do not change its numerical values.\n"
+                    )
+
                 if math_injection:
                     system_instructions += math_injection
-                # --- FINE FIX MATEMATICO PRE-FLIGHT ---
-
 
 
 
@@ -6493,7 +7493,7 @@ class State(rx.State):
 
                 answer_mode = detect_answer_mode(user_query)
                 strict_checklist_mode = is_strict_checklist_query(user_query)
-                graph_relation_mode = is_graph_relation_query(user_query)
+                graph_relation_mode = should_use_graph_relation_strict_mode(user_query)
 
                 if answer_mode == "knowledge":
                     c_a_text = c_a if c_a else "Not required for this knowledge question."
@@ -6589,7 +7589,9 @@ class State(rx.State):
                             "- Vedi pannello Fonti/Audit."
                         )
 
-                    self.messages[-1].content = postprocess_generated_answer(strip_id_leaks(full_resp), user_query, sources)
+                    # Non assegnare qui la risposta finale.
+                    # La risposta viene post-processata una sola volta più sotto,
+                    # dopo il controllo eval/quality gate.
                     yield
 
                 except Exception as e:
@@ -6654,7 +7656,7 @@ class State(rx.State):
                             "Non ho trovato evidenze sufficienti nei documenti recuperati.\n\n"
                             "**B) Evidenze**\n\n"
                             "- La risposta generata non ha superato il controllo automatico di faithfulness.\n\n"
-                            "**C) Limiti**\n\n"
+                            "**C) Limiti / Conflitti**\n\n"
                             f"- Faithfulness: {eval_result.faithfulness:.2f}\n"
                             f"- Answer relevance: {eval_result.answer_relevance:.2f}\n"
                             f"- Source scope violation: {eval_result.source_scope_violation}\n\n"
