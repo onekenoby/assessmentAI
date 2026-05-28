@@ -1020,7 +1020,8 @@ def solve_control_coverage(query_text: str) -> Optional[str]:
         f"- Peso controlli parziali = `{partial_weight_pct:g}%`\n"
         f"- Controlli equivalenti = `{implemented} + {partial} × {partial_weight_pct:g}% = {equivalent_controls:g}`\n"
         f"- Copertura = `{equivalent_controls:g} / {total} × 100 = {coverage_pct:.2f}%`\n\n"
-        "**B) Evidenze**\n\n"
+        "\n\n**B) Evidenze**\n\n"
+        
         "- I valori numerici usati nel calcolo sono stati estratti dalla domanda dell'utente.\n"
         "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
         "**C) Limiti / Conflitti**\n\n"
@@ -1047,7 +1048,7 @@ def solve_risk_product(query_text: str) -> Optional[str]:
     return (
         "**A) Risposta**\n\n"
         f"Ordinamento dal rischio più critico al meno critico: **{ranking}**.\n\n"
-        "**B) Evidenze**\n\n"
+        "\n\n**B) Evidenze**\n\n"
         f"{evidence_lines}\n\n"
         "**C) Limiti / Conflitti**\n\n"
         "- La formula `rischio = probabilità × impatto` è stata fornita dall'utente nella domanda.\n"
@@ -1286,7 +1287,7 @@ def solve_percentage_remainder_allocation(query_text: str) -> Optional[str]:
         f"- Percentuali già allocate = `{pct_details} = {used_pct:g}%`\n"
         f"- Percentuale residua = `100% - {used_pct:g}% = {remaining_pct:g}%`\n"
         f"- Importo residuo = `{_format_euro_it(total)} × {remaining_pct:g}% = {_format_euro_it(remaining_amount)} euro`\n\n"
-        "**B) Evidenze**\n\n"
+        "\n\n**B) Evidenze**\n\n"
         "- I valori numerici usati nel calcolo sono stati estratti dalla domanda dell'utente.\n"
         "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
         "**C) Limiti / Conflitti**\n\n"
@@ -1385,7 +1386,7 @@ def try_solve_user_provided_algebra(query_text: str) -> Optional[str]:
             f"- Sostituzione: `{factor} × Vm ≤ ({factor} × V) / {denom}`\n"
             f"- Poiché `{factor}` è costante e positiva: `Vm ≤ V / {denom}`\n\n"
             f"- Formula LaTeX: `V_m \\leq \\frac{{V}}{{{denom}}}`\n\n"
-            "**B) Evidenze**\n\n"
+            "\n\n**B) Evidenze**\n\n"
             "- Le relazioni algebriche sono state estratte dalla domanda dell'utente.\n"
             "- La derivazione è stata eseguita in modo deterministico da Python, non dal modello LLM.\n\n"
             "**C) Limiti / Conflitti**\n\n"
@@ -1478,7 +1479,7 @@ def try_solve_user_provided_algebra(query_text: str) -> Optional[str]:
             f"- Divisione per `{fmt_num(pct_decimal)}`: `{variable} > {fmt_num(threshold_millions)} / {fmt_num(pct_decimal)}`\n"
             f"- Risultato = **{variable} > {fmt_num(result_millions)} milioni**, cioè **{_format_euro_it(result_euro)} euro**.\n\n"
             f"- Formula LaTeX: `{pct_decimal:g}{variable} > {threshold_millions:g}` ⇒ `{variable} > {result_millions:g}`\n\n"
-            "**B) Evidenze**\n\n"
+            "\n\n**B) Evidenze**\n\n"
             "- La percentuale, la variabile e la soglia sono state estratte dalla domanda dell'utente.\n"
             "- La derivazione è stata eseguita in modo deterministico da Python, non dal modello LLM.\n\n"
             "**C) Limiti / Conflitti**\n\n"
@@ -1554,7 +1555,7 @@ def solve_sla_cumulative_hours(query_text: str) -> Optional[str]:
         "**Calcolo deterministico:**\n\n"
         f"{evidence}\n"
         f"- Totale = **{total:g} ore**\n\n"
-        "**B) Evidenze**\n\n"
+        "\n\n**B) Evidenze**\n\n"
         "- I tempi massimi e il numero di incidenti sono stati estratti dalla domanda dell'utente.\n"
         "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
         "**C) Limiti / Conflitti**\n\n"
@@ -1631,7 +1632,7 @@ def solve_rosi_query(query_text: str) -> Optional[str]:
         f"- Beneficio lordo = `{_format_euro_it(ale_initial)} - {_format_euro_it(ale_after)} = {_format_euro_it(gross_benefit)} euro`\n"
         f"- Beneficio netto = `{_format_euro_it(gross_benefit)} - {_format_euro_it(cost)} = {_format_euro_it(net_benefit)} euro`\n"
         f"- ROSI = `{_format_euro_it(net_benefit)} / {_format_euro_it(cost)} × 100 = {rosi:.2f}%`\n\n"
-        "**B) Evidenze**\n\n"
+        "\n\n**B) Evidenze**\n\n"
         "- Impatto, probabilità iniziale, probabilità post-misura e costo sono stati estratti dalla domanda dell'utente.\n"
         "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
         "**C) Limiti / Conflitti**\n\n"
@@ -2633,7 +2634,7 @@ def answer_formula_strict(query_text: str, sources: List[SourceItem]) -> Optiona
         "**A) Risposta**\n\n"
         + "\n".join(table_lines)
         + "\n\n"
-        "**B) Evidenze**\n\n"
+        "\n\n**B) Evidenze**\n\n"
         "- Le formule/metriche sono state estratte in modo deterministico dai documenti recuperati e/o dal Knowledge Graph.\n"
         "- Se il campo formula riporta *'formula esplicita non recuperata'*, la metrica è citata nel testo ma senza la sua espressione matematica.\n\n"
         "**C) Limiti / Conflitti**\n\n"
@@ -3564,7 +3565,7 @@ def answer_glossary_terms_directly(query_text: str) -> Tuple[str, List[SourceIte
         "**A) Risposta**\n\n"
         + "\n".join(answer_lines)
         + "\n\n"
-        "**B) Evidenze**\n\n"
+        "\n\n**B) Evidenze**\n\n"
         + "\n".join(evidence_lines)
         + "\n\n"
         "**C) Limiti / Conflitti**\n\n"
@@ -4332,8 +4333,13 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
     q = query_text or ""
     concepts: List[str] = []
 
-    quoted = re.findall(r"[\"“']([^\"”']+)[\"”']", q)
-    concepts.extend([_clean_graph_concept(x) for x in quoted if len(_clean_graph_concept(x)) >= 3])
+
+    quoted = re.findall(r"[\"“”'‘’]([^\"“”'‘’]+)[\"“”'‘’]", q)
+    for item in quoted:
+        clean = _clean_graph_concept(item)
+        if len(clean) >= 3:
+            concepts.append(clean)
+
 
     relation_segment_patterns = [
         r"\b(?:tra|fra)\s+(.+?)(?:[\.?]|$)",
@@ -4507,32 +4513,45 @@ def _rank_sources_for_graph(concepts: List[str], sources: List[SourceItem]) -> L
     return ranked
 
 
-def _evidence_snippet_for_pair(content: str, a: str, b: str, max_chars: int = 260) -> str:
+def _evidence_snippet_for_pair(content: str, a: str, b: str, max_chars: int = 260) -> Tuple[str, str]:
     """
-    Restituisce uno snippet dove compaiono entrambi i concetti,
-    oppure almeno uno dei due.
+    Restituisce:
+    - snippet;
+    - livello evidenza: supporto_testuale_forte oppure co_occorrenza_debole.
+
+    Non usa termini di dominio.
+    Usa solo vicinanza testuale:
+    - stessa frase = supporto forte;
+    - stesso paragrafo/chunk = co-occorrenza debole.
     """
     if not content:
-        return ""
+        return "", "non_supportata"
 
-    chunks = re.split(r"(?<=[\.\!\?])\s+|\n+", content)
+    text = re.sub(r"\s+", " ", content or "").strip()
+    text_l = text.lower()
 
-    a_l = a.lower()
-    b_l = b.lower()
+    a_l = (a or "").lower()
+    b_l = (b or "").lower()
 
-    for chunk in chunks:
-        cl = chunk.lower()
+    sentences = re.split(r"(?<=[\.\!\?])\s+", text)
 
-        if a_l in cl and b_l in cl:
-            return _md_cell(chunk, max_chars)
+    for sent in sentences:
+        sl = sent.lower()
+        if a_l in sl and b_l in sl:
+            return _md_cell(sent, max_chars), "supporto_testuale_forte"
 
-    for chunk in chunks:
-        cl = chunk.lower()
+    if a_l in text_l and b_l in text_l:
+        pos_a = text_l.find(a_l)
+        pos_b = text_l.find(b_l)
 
-        if a_l in cl or b_l in cl:
-            return _md_cell(chunk, max_chars)
+        start = max(0, min(pos_a, pos_b) - 120)
+        end = min(len(text), max(pos_a, pos_b) + 180)
 
-    return _md_cell(content, max_chars)
+        snippet = text[start:end].strip()
+        return _md_cell(snippet, max_chars), "co_occorrenza_debole"
+
+    return "", "non_supportata"
+
 
 
 def _parse_graph_relation_table_from_source(source: SourceItem) -> List[Dict[str, Any]]:
@@ -4602,6 +4621,7 @@ def answer_graph_relations_strict(
     rows: List[Dict[str, Any]] = []
     unsupported_rows: List[Dict[str, Any]] = []
     seen = set()
+    seen_pairs = set()
 
     concept_canons = {
         _canonical_graph_concept(c)
@@ -4648,13 +4668,29 @@ def answer_graph_relations_strict(
         return direct_hits >= 2
 
     def add_row(row: Dict[str, Any]) -> None:
+        src = str(row.get("source", "")).strip()
+        tgt = str(row.get("target", "")).strip()
+        rel = str(row.get("relation", "")).strip()
+        status = str(row.get("status", "")).strip().lower()
+
+        src_can = _canonical_graph_concept(src)
+        tgt_can = _canonical_graph_concept(tgt)
+
+        pair_key = tuple(sorted([src_can, tgt_can])) + (status,)
+
+        # Per supporto testuale/co-occorrenza evita ripetizioni della stessa coppia.
+        if "testual" in status or "co-occorrenza" in status:
+            if pair_key in seen_pairs:
+                return
+            seen_pairs.add(pair_key)
+
         key = (
-            str(row.get("source", "")).lower(),
-            str(row.get("relation", "")).lower(),
-            str(row.get("target", "")).lower(),
+            src.lower(),
+            rel.lower(),
+            tgt.lower(),
             str(row.get("filename", "")).lower(),
             str(row.get("page", "")),
-            str(row.get("status", "")).lower(),
+            status,
         )
 
         if key in seen:
@@ -4714,7 +4750,7 @@ def answer_graph_relations_strict(
                         "filename": s.filename or "N/D",
                         "page": s.page or "",
                         "evidence": (text[:300] + "...") if len(text) > 300 else text,
-                        "status": "supportata testualmente, non esplicita come arco",
+                        "status": "supporto testuale forte, non esplicita come arco",
                     }
 
                     add_row(row)
@@ -4816,17 +4852,54 @@ def answer_graph_relations_strict(
     if has_not_found:
         evidence_notes.append("- Alcuni collegamenti richiesti non risultano supportati dalle fonti recuperate.")
 
+    is_multihop_request = any(t in (query_text or "").lower() for t in [
+        "multi-hop",
+        "multihop",
+        "catena",
+        "percorso",
+        "path",
+        "traversamento",
+        "chain",
+        "traversal",
+    ])
+
     limits = [
         "- Una relazione plausibile non viene trasformata in arco esplicito se non è presente nel grafo.",
         "- Relazioni vere ma non pertinenti alla domanda non sono usate come evidenza principale.",
         "- Se il grafo non contiene archi pertinenti, la risposta distingue supporto testuale, inferenza e relazione non trovata.",
     ]
 
+    if is_multihop_request:
+        explicit_graph_rows = [
+            r for r in rows
+            if "esplicita" in str(r.get("status", "")).lower()
+            or "grafo" in str(r.get("status", "")).lower()
+        ]
+
+        if len(explicit_graph_rows) < 2:
+            limits.append(
+                "- La richiesta è multi-hop, ma non sono stati recuperati abbastanza archi Neo4j espliciti per ricostruire una catena completa. "
+                "La risposta riporta solo collegamenti testuali o assenze."
+            )
+
+    if is_multihop_request:
+        explicit_graph_rows = [
+            r for r in rows
+            if "esplicita" in str(r.get("status", "")).lower()
+            or "grafo" in str(r.get("status", "")).lower()
+        ]
+
+        if len(explicit_graph_rows) < 2:
+            limits.append(
+                "- La richiesta è multi-hop, ma non sono stati recuperati abbastanza archi Neo4j espliciti per ricostruire una catena completa. "
+                "La risposta riporta solo collegamenti testuali o assenze."
+            )
+
     return (
         "**A) Risposta**\n\n"
         + "\n".join(table_lines)
         + "\n\n"
-        "**B) Evidenze**\n\n"
+        "\n\n**B) Evidenze**\n\n"
         + "\n".join(evidence_notes)
         + "\n\n"
         "**C) Limiti / Conflitti**\n\n"
@@ -4847,7 +4920,11 @@ def answer_graph_relations_strict(
 
         alias_a = _best_alias_for_text(a, text_l)
         alias_b = _best_alias_for_text(b, text_l)
-        snippet = _evidence_snippet_for_pair(content, alias_a, alias_b)
+        snippet, evidence_level = _evidence_snippet_for_pair(content, alias_a, alias_b)
+
+        if evidence_level == "non_supportata":
+            return False, "", "", ""
+
         return True, alias_a, alias_b, snippet
 
     doc_row_count: Dict[Tuple[str, int], int] = {}
@@ -4910,7 +4987,7 @@ def answer_graph_relations_strict(
                 "filename": s.filename,
                 "page": int(s.page or 0),
                 "evidence": snippet,
-                "status": "supportata testualmente, non esplicita come arco",
+                "status": "supporto testuale forte, non esplicita come arco",
             })
 
     # 3. Fallback deterministico: evita LLM e timeout anche se non ci sono relazioni forti.
@@ -4990,12 +5067,11 @@ def answer_graph_relations_strict(
         ])
 
 
-
     return (
         "**A) Risposta**\n\n"
         + "\n".join(table)
         + "\n\n"
-        "**B) Evidenze**\n\n"
+        "\n\n**B) Evidenze**\n\n"
         "- La tabella deve includere solo relazioni pertinenti alle entità richieste nella domanda.\n\n"
         "- Una relazione esplicita nel grafo è pertinente solo se collega direttamente due entità richieste, oppure se collega una entità richiesta a un nodo intermedio necessario per la catena richiesta.\n\n"
         "- Relazioni esplicite ma fuori target non devono essere presentate come risposta principale.\n\n"
@@ -7072,7 +7148,7 @@ def try_solve_date_offsets(query_text: str) -> Optional[str]:
         + "\n".join(rows)
         + delta_text
         + "\n\n"
-        "**B) Evidenze**\n\n"
+        "\n\n**B) Evidenze**\n\n"
         "- Il giorno, l'orario iniziale e gli offset in ore sono stati estratti dalla domanda dell'utente.\n"
         "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
         "**C) Limiti / Conflitti**\n\n"
@@ -7221,7 +7297,7 @@ def answer_formula_strict(query_text: str, sources: List[SourceItem]) -> Optiona
         return (
             "**A) Risposta**\n\n"
             "Non ho trovato formule computazionali, metriche definitorie o regole soglia sufficientemente esplicite nelle fonti recuperate.\n\n"
-            "**B) Evidenze**\n\n"
+            "\n\n**B) Evidenze**\n\n"
             "- Il sistema ha cercato formule, metriche e regole di scoring nei chunk recuperati e nel Knowledge Graph.\n\n"
             "**C) Limiti / Conflitti**\n\n"
             "- La risposta non inventa formule mancanti.\n"
@@ -7357,7 +7433,7 @@ def _repair_missing_abcd_headers(answer: str) -> str:
         return (
             "**A) Risposta**\n\n"
             "Risposta non disponibile.\n\n"
-            "**B) Evidenze**\n\n"
+            "\n\n**B) Evidenze**\n\n"
             "- Nessuna evidenza disponibile.\n\n"
             "**C) Limiti / Conflitti**\n\n"
             "- Risposta vuota o non generata.\n\n"
@@ -7405,7 +7481,7 @@ def quality_gate_postprocess(answer: str, query_text: str, sources: List[SourceI
             "La domanda richiede una spiegazione discorsiva. Le relazioni del grafo recuperate "
             "possono essere usate come supporto, ma non sono sufficienti da sole a costituire "
             "la risposta finale.\n\n"
-            "**B) Evidenze**\n\n"
+            "\n\n**B) Evidenze**\n\n"
             "- Il retrieval ha recuperato relazioni o co-occorrenze, ma il formato tabellare non è appropriato come unica risposta.\n\n"
             "**C) Limiti / Conflitti**\n\n"
             "- È necessario usare i chunk testuali recuperati per produrre una spiegazione motivata.\n"
@@ -7901,7 +7977,7 @@ class State(rx.State):
                             content=(
                                 "**A) Risposta**\n\n"
                                 "Non ho trovato evidenze sufficienti nei documenti recuperati.\n\n"
-                                "**B) Evidenze**\n\n"
+                                "\n\n**B) Evidenze**\n\n"
                                 "- Nessuna fonte pertinente recuperata per il documento richiesto.\n\n"
                                 "**C) Limiti / Conflitti**\n\n"
                                 "- Il sistema non deve usare formule provenienti da altri documenti.\n\n"
@@ -8306,7 +8382,7 @@ class State(rx.State):
                         full_resp = (
                             "**A) Risposta**\n\n"
                             "Il modello non ha restituito contenuto utile.\n\n"
-                            "**B) Evidenze**\n\n"
+                            "\n\n**B) Evidenze**\n\n"
                             "- Il retrieval ha prodotto fonti, ma la generazione LLM è risultata vuota.\n\n"
                             "**C) Limiti / Conflitti**\n\n"
                             "- Verificare modello Ollama, timeout e dimensione del contesto.\n\n"
@@ -8325,7 +8401,7 @@ class State(rx.State):
                     self.messages[-1].content = (
                         "**A) Risposta**\n\n"
                         "La generazione della risposta è andata in timeout o ha prodotto un errore.\n\n"
-                        "**B) Evidenze**\n\n"
+                        "\n\n**B) Evidenze**\n\n"
                         "- Il retrieval è stato completato, ma la chiamata al modello LLM non ha risposto correttamente.\n\n"
                         "**C) Limiti / Conflitti**\n\n"
                         f"- Errore tecnico: `{str(e)}`\n"
@@ -8379,7 +8455,7 @@ class State(rx.State):
                         self.messages[-1].content = (
                             "**A) Risposta**\n\n"
                             "Non ho trovato evidenze sufficienti nei documenti recuperati.\n\n"
-                            "**B) Evidenze**\n\n"
+                            "\n\n**B) Evidenze**\n\n"
                             "- La risposta generata non ha superato il controllo automatico di faithfulness.\n\n"
                             "**C) Limiti / Conflitti**\n\n"
                             f"- Faithfulness: {eval_result.faithfulness:.2f}\n"
@@ -9117,7 +9193,7 @@ def answer_formula_strict(query_text: str, sources: List[SourceItem]) -> Optiona
         return (
             "**A) Risposta**\n\n"
             "Non ho trovato formule computazionali, metriche definitorie o regole soglia sufficientemente esplicite nelle fonti recuperate.\n\n"
-            "**B) Evidenze**\n\n"
+            "\n\n**B) Evidenze**\n\n"
             "- Il sistema ha cercato formule, metriche e regole di scoring nei chunk recuperati e nel Knowledge Graph.\n\n"
             "**C) Limiti / Conflitti**\n\n"
             "- La risposta non inventa formule mancanti.\n"
@@ -9377,7 +9453,7 @@ def answer_formula_strict(query_text: str, sources: List[SourceItem]) -> Optiona
         return (
             "**A) Risposta**\n\n"
             "Non ho trovato formule computazionali, metriche definitorie o regole soglia sufficientemente esplicite nelle fonti recuperate.\n\n"
-            "**B) Evidenze**\n\n"
+            "\n\n**B) Evidenze**\n\n"
             "- Il sistema ha cercato formule, metriche e regole di scoring nei chunk recuperati e nel Knowledge Graph.\n\n"
             "**C) Limiti / Conflitti**\n\n"
             "- La risposta non inventa formule mancanti.\n"
@@ -9528,7 +9604,7 @@ def answer_formula_strict(query_text: str, sources: List[SourceItem]) -> Optiona
         return (
             "**A) Risposta**\n\n"
             "Non ho trovato formule computazionali, metriche definitorie o regole di scoring esplicite nelle fonti recuperate.\n\n"
-            "**B) Evidenze**\n\n"
+            "\n\n**B) Evidenze**\n\n"
             "- Il sistema ha cercato formule, metriche e regole di scoring nei chunk recuperati e nel Knowledge Graph.\n\n"
             "**C) Limiti / Conflitti**\n\n"
             "- La risposta non inventa formule mancanti.\n"
@@ -9747,7 +9823,7 @@ def answer_formula_strict(query_text: str, sources: List[SourceItem]) -> Optiona
         return (
             "**A) Risposta**\n\n"
             "Non ho trovato formule computazionali, metriche definitorie o regole di scoring esplicite nelle fonti recuperate.\n\n"
-            "**B) Evidenze**\n\n"
+            "\n\n**B) Evidenze**\n\n"
             "- Il sistema ha cercato formule, metriche e regole di scoring nei chunk recuperati e nel Knowledge Graph.\n\n"
             "**C) Limiti / Conflitti**\n\n"
             "- La risposta non inventa formule mancanti.\n"
