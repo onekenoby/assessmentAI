@@ -3756,37 +3756,43 @@ def filter_neo4j_relation_rows(
     limit: int,
 ) -> List[Dict[str, Any]]:
     """
-    Tiene solo relazioni Neo4j che coprono almeno due concetti rilevanti
-    della domanda.
-
-    Se la domanda contiene pochissimi concetti, accetta anche un solo match.
+    Tiene relazioni Neo4j pertinenti rispetto ai concetti richiesti.
+    Non è adattativa: usa concetti estratti dalla query e matching testuale
+    su sorgente, relazione, target, proprietà e filename.
     """
     if not rows:
         return []
 
+    concepts = extract_graph_concepts_from_query(query_text, max_concepts=12)
     tokens = graph_relevant_tokens(query_text)
 
-    if not tokens:
+    if not concepts and not tokens:
         return rows[:limit]
 
-    scored: List[Tuple[int, Dict[str, Any]]] = []
+    scored: List[Tuple[int, int, Dict[str, Any]]] = []
 
     for row in rows:
         text = _relation_row_text(row)
-        hits = {t for t in tokens if t in text}
-        hit_count = len(hits)
 
-        # Regola generale:
-        # - con 1-2 token rilevanti basta 1 hit;
-        # - con più token servono almeno 2 hit.
-        min_hits = 1 if len(tokens) <= 2 else 2
+        concept_hits = {
+            _canonical_graph_concept(c)
+            for c in concepts
+            if _concept_in_text(c, text)
+        }
 
-        if hit_count >= min_hits:
-            scored.append((hit_count, row))
+        token_hits = {t for t in tokens if t in text}
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+        # Priorità ai concetti forti; i token servono solo come supporto.
+        concept_score = len(concept_hits)
+        token_score = len(token_hits)
 
-    return [r for _, r in scored[:limit]]
+        if concept_score >= 1 or token_score >= 2:
+            scored.append((concept_score, token_score, row))
+
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    return [r for _, _, r in scored[:limit]]
+
 
 def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, Any]]:
     """Restituisce vere relazioni Entity-[:REL]->Entity dal KG, non solo chunk collegati."""
@@ -3975,20 +3981,34 @@ def _md_cell(value: Any, max_len: int = 600) -> str:
 def _clean_graph_concept(value: str) -> str:
     """
     Pulisce un concetto testuale prima della ricerca nel grafo.
-    Supporta articoli con apostrofo e combinazioni multiple di stopwords (es. "and the").
+    Non contiene logica adattativa: normalizza punteggiatura, virgolette,
+    articoli e parole di ruolo generiche.
     """
-    text = re.sub(r"\s+", " ", value or "").strip(" \t\n\r.,;:!?()[]{}\"'“”")
-    
-    # FIX 1: Supporto per apostrofi (es. l'entità, un'azienda) e parole multiple (es. "e il ").
-    # Usando (?:...)+ la regex "mangia" in loop tutti gli articoli/congiunzioni iniziali.
-    leading_noise = r"^(?:(?:e|ed|and|or|oppure|o|il|lo|la|i|gli|le|un|una|uno|the|a|an)\s+|(?:l|un)['’])+"
+    text = re.sub(r"\s+", " ", value or "").strip()
+
+    text = text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’`")
+
+    # Rimuove prefissi descrittivi generici:
+    # es. funzione “Respond” -> Respond
+    text = re.sub(
+        r"^(?:funzione|function|concetto|concept|termine|term|voce|entity|entità)\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Rimuove articoli/congiunzioni iniziali.
+    leading_noise = (
+        r"^(?:(?:e|ed|and|or|oppure|o|il|lo|la|i|gli|le|un|una|uno|the|a|an)\s+"
+        r"|(?:l|un)['’])+"
+    )
     text = re.sub(leading_noise, "", text, flags=re.IGNORECASE)
-    
-    # FIX 2: Rimuove eventuali congiunzioni rimaste appese alla fine del concetto
-    trailing_noise = r"\s+(?:e|ed|and|or|oppure|o)$"
-    text = re.sub(trailing_noise, "", text, flags=re.IGNORECASE)
-    
-    return text.strip()
+
+    # Rimuove congiunzioni finali residue.
+    text = re.sub(r"\s+(?:e|ed|and|or|oppure|o)$", "", text, flags=re.IGNORECASE)
+
+    return text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’`")
+
 
 
 def _split_relation_segment(segment: str) -> List[str]:
@@ -4085,23 +4105,25 @@ def _graph_concept_aliases(concept: str) -> List[str]:
 
     return out
 
-
 def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) -> List[str]:
     """
-    Estrae concetti forti dalla domanda per costruire relazioni testuali.
-    Evita token singoli deboli e non crea concetti dal contenuto dei documenti.
+    Estrae concetti forti dalla domanda per query relazionali/multi-hop.
+    Non è adattativa:
+    - non contiene nomi di test;
+    - non contiene nomi di documenti;
+    - usa solo pattern linguistici generali.
     """
     q = query_text or ""
     concepts: List[str] = []
 
-
+    # 1. Termini tra virgolette dritte o curve.
     quoted = re.findall(r"[\"“”'‘’]([^\"“”'‘’]+)[\"“”'‘’]", q)
     for item in quoted:
         clean = _clean_graph_concept(item)
-        if len(clean) >= 3:
+        if len(clean) >= 2:
             concepts.append(clean)
 
-
+    # 2. Segmenti dopo tra/fra/between/among.
     relation_segment_patterns = [
         r"\b(?:tra|fra)\s+(.+?)(?:[\.?]|$)",
         r"\bbetween\s+(.+?)(?:[\.?]|$)",
@@ -4112,44 +4134,40 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
         for m in re.finditer(pat, q, flags=re.IGNORECASE):
             concepts.extend(_split_relation_segment(m.group(1)))
 
-    generic_phrases = {
-        "assessment", "audit", "evidence", "evidenza", "evidenze",
-        "document", "documents", "documento", "documenti",
-        "source", "sources", "fonte", "fonti", "glossario", "glossary",
-        "compliance", "conformità", "controllo", "controlli", "control", "controls",
-        "requirement", "requirements", "requisito", "requisiti",
-        "metric", "metrics", "metrica", "metriche",
-    }
+    # 3. Segmenti multi-hop: "da X a Y passando per A, B, C".
+    from_to = re.search(
+        r"\b(?:da|from)\s+(.+?)\s+(?:a|to)\s+(.+?)(?:,|\s+passando\s+per|\s+through|\s+via|\.|\?|$)",
+        q,
+        flags=re.IGNORECASE,
+    )
 
+    if from_to:
+        concepts.append(_clean_graph_concept(from_to.group(1)))
+        concepts.append(_clean_graph_concept(from_to.group(2)))
 
+    via = re.search(
+        r"\b(?:passando\s+per|through|via)\s+(.+?)(?:[\.?]|$)",
+        q,
+        flags=re.IGNORECASE,
+    )
 
-    # Stopwords bilingui per evitare l'estrazione di "rumore" nel grafo
-    ignore_terms = {
-        "documento", "fonti", "fonte", "valutazione", "assessment", "audit", "entità", "relazione", "nodo", "grafo", "sistema", # IT
-        "document", "source", "sources", "entity", "entities", "relation", "relationship", "node", "graph", "system", "framework" # EN
-    }
+    if via:
+        concepts.extend(_split_relation_segment(via.group(1)))
 
-    # 1. Termini espliciti tra virgolette (priorità massima)
-    quoted = re.findall(r'["“”\']([^"“”\']+)["“”\']', q)
-    concepts.extend([_clean_graph_concept(x) for x in quoted if len(_clean_graph_concept(x)) >= 3])
-
-    # 2. Acronimi in maiuscolo (Agnostico rispetto alla lingua)
-    acronyms = re.findall(r"\b[A-Z][A-Z0-9]{1,9}\b", q)
+    # 4. Acronomi composti o semplici: GDPR, NIS2, CSIRT, CID, ACN-ZK.
+    acronyms = re.findall(r"\b[A-Z]{2,10}(?:[-_/][A-Z0-9]{1,10})?\b", q)
     concepts.extend(acronyms)
 
-    # 3. Frasi esatte note
+    # 5. Frasi esatte già recuperabili dal sistema.
     for p in extract_exact_phrases(q):
         clean = _clean_graph_concept(p)
-        if clean and clean.lower() not in ignore_terms:
+        if clean:
             concepts.append(clean)
 
-    acronyms = re.findall(r"\b[A-Z][A-Z0-9]{1,9}\b", q)
-    concepts.extend(acronyms)
-
-    # Fallback solo quando non ci sono concetti forti.
+    # 6. Fallback token solo se non ci sono concetti forti.
     if not concepts:
         for t in graph_relevant_tokens(q):
-            if len(t) >= 5:
+            if len(t) >= 4:
                 concepts.append(t)
 
     weak_single_terms = {
@@ -4159,6 +4177,7 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
         "autenticazione", "authentication",
         "rischio", "risk", "utente", "user", "identity", "identità",
         "documenti", "documents", "normativi", "normative",
+        "funzione", "function", "processo", "process",
     }
 
     cleaned: List[str] = []
@@ -4171,37 +4190,23 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
 
         cl = clean.lower()
         word_count = len(re.findall(r"[A-Za-zÀ-ÿ0-9]+", clean))
-        is_acronym = clean.upper() == clean and 2 <= len(clean) <= 10
+        is_acronym = bool(re.fullmatch(r"[A-Z]{2,10}(?:[-_/][A-Z0-9]{1,10})?", clean))
 
         if not is_acronym and word_count == 1 and cl in weak_single_terms:
             continue
 
         canonical = _canonical_graph_concept(clean)
+
         if canonical in seen_canonical:
             continue
 
         seen_canonical.add(canonical)
         cleaned.append(clean)
 
-    final: List[str] = []
-    lowered = [c.lower() for c in cleaned]
-
-    for c in cleaned:
-        cl = c.lower()
-        word_count = len(re.findall(r"[A-Za-zÀ-ÿ0-9]+", c))
-        is_acronym = c.upper() == c and 2 <= len(c) <= 10
-
-        if not is_acronym and word_count == 1:
-            if any(cl != other and cl in other and len(other.split()) > 1 for other in lowered):
-                continue
-
-        final.append(c)
-
-        if len(final) >= max_concepts:
+        if len(cleaned) >= max_concepts:
             break
 
-    return final
-
+    return cleaned
 
 def _concept_in_text(concept: str, text_l: str) -> bool:
     """Verifica presenza del concetto usando alias IT/EN e boundary per acronimi/parole singole."""
@@ -4606,8 +4611,16 @@ def answer_graph_relations_strict(
         "- Ogni riga distingue tra arco esplicito Neo4j, supporto testuale o relazione non trovata.",
     ]
 
+    has_explicit = any(
+        str(r.get("status", "")).strip().lower() == "esplicita nel grafo"
+        for r in rows
+    )
+    
     if has_explicit:
         evidence_notes.append("- Sono presenti relazioni esplicite recuperate dal Knowledge Graph.")
+    else:
+        evidence_notes.append("- Non sono stati recuperati archi Neo4j espliciti pertinenti; le relazioni riportate sono testuali o non trovate.")
+         
     if has_textual:
         evidence_notes.append("- Alcune relazioni sono supportate testualmente ma non risultano esplicite come archi Neo4j.")
     if has_not_found:
@@ -4637,24 +4650,13 @@ def answer_graph_relations_strict(
             or "grafo" in str(r.get("status", "")).lower()
         ]
 
-        if len(explicit_graph_rows) < 2:
-            limits.append(
-                "- La richiesta è multi-hop, ma non sono stati recuperati abbastanza archi Neo4j espliciti per ricostruire una catena completa. "
-                "La risposta riporta solo collegamenti testuali o assenze."
-            )
+        msg = (
+            "- La richiesta è multi-hop, ma non sono stati recuperati abbastanza archi Neo4j espliciti "
+            "per ricostruire una catena completa. La risposta riporta solo collegamenti testuali o assenze."
+        )
 
-    if is_multihop_request:
-        explicit_graph_rows = [
-            r for r in rows
-            if "esplicita" in str(r.get("status", "")).lower()
-            or "grafo" in str(r.get("status", "")).lower()
-        ]
-
-        if len(explicit_graph_rows) < 2:
-            limits.append(
-                "- La richiesta è multi-hop, ma non sono stati recuperati abbastanza archi Neo4j espliciti per ricostruire una catena completa. "
-                "La risposta riporta solo collegamenti testuali o assenze."
-            )
+        if len(explicit_graph_rows) < 2 and msg not in limits:
+            limits.append(msg)
 
     return (
         "**A) Risposta**\n\n"
