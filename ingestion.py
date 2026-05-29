@@ -4904,14 +4904,31 @@ def process_ai_and_db(file_path: str, source_type: str, doc_meta: dict, chunks: 
                         # Sanificazione con slicing sicuro
                         # La funzione _sanitize_graph ora deve gestire liste vuote internamente
                         clean_nodes, clean_edges = _sanitize_graph(graph_data)
+                        
+                        
 
                         clean_nodes, clean_edges = enrich_formula_nodes_and_edges(clean_nodes, clean_edges)
 
-                        final_edges = clean_edges
+                        # Canonizzazione non adattativa delle relazioni KG.
+                        # Usa funzioni già esistenti, senza introdurre wrapper o versioni duplicate.
+                        clean_edges = canonicalize_edges_to_verb_object(clean_edges)
+                        clean_edges = canonicalize_edges_by_base_presence(clean_edges)
 
+                        final_edges = clean_edges
                         
                         # Validazione Neo4j (essenziale: filtra nodi senza ID)
                         validated_nodes = [n for n in clean_nodes if isinstance(n, dict) and n.get("id")]
+                        
+                        for e in final_edges:
+                            if not isinstance(e, dict):
+                                continue
+
+                            props = dict(e.get("props") or {})
+                            props.setdefault("source_file", filename)
+                            props.setdefault("page_no", p_no)
+                            props.setdefault("source", "kg_extraction")
+                            props.setdefault("evidence_type", "explicit_kg_edge")
+                            e["props"] = props                        
                         
                         if validated_nodes:
                             for g_idx, _, _ in pages_map[p_no]:
