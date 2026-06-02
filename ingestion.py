@@ -917,42 +917,122 @@ Return ONLY valid JSON with this exact schema:
 
 
 REL_CANON_PROMPT = """
-You are a relation-type canonicalizer for a cybersecurity, compliance, privacy, and IT audit assessment knowledge graph.
+You are a relation-type canonicalizer for a cybersecurity, compliance, privacy, IT audit, and regulatory assessment knowledge graph.
 
-INPUT: a JSON array of relation types (UPPERCASE, snake_case, may be Italian or English).
+INPUT: a JSON array of relation types.
 
 OUTPUT: ONLY valid JSON, no markdown, no comments. Schema:
 {
   "map": {
     "<RAW>": {
-      "verb": "<ENGLISH_VERB_LEMMA>",
+      "verb": "<UPPERCASE_CANONICAL_RELATION>",
       "object": "<ASSESSMENT_OBJECT_OR_EMPTY>",
       "qualifier": "<QUALIFIER_OR_EMPTY>"
     }
   }
 }
 
-CANONICAL ASSESSMENT VOCABULARY:
-- Governance/compliance: COMPLY, VIOLATE, MANDATE, GOVERN, APPROVE, REVIEW, REQUIRE
-- Risk/security: MITIGATE, THREATEN, EXPLOIT, PROTECT, EXPOSE
-- Process/audit/evidence: IMPLEMENT, GENERATE, VERIFY, TEST, DEPEND, APPLY
-- Structure: BE, INCLUDE, CONTAIN, BELONG
+CANONICAL RELATION VOCABULARY:
+
+STRUCTURE:
+- IS_A
+- PART_OF
+- HAS_COMPONENT
+- CONTAINS
+- BELONGS_TO
+- APPLIES_TO
+- MAPS_TO
+- DEFINES
+- CLASSIFIES
+
+GOVERNANCE / COMPLIANCE:
+- COMPLIES_WITH
+- NON_COMPLIANT_WITH
+- HAS_COMPLIANCE_STATUS
+- HAS_GAP
+- REQUIRES_REMEDIATION
+- REMEDIATES
+- MANDATES
+- REQUIRES
+- GOVERNS
+- APPROVES
+- REVIEWS
+- ASSIGNS_RESPONSIBILITY_TO
+
+INCIDENT / PROCESS:
+- TRIGGERS
+- ACTIVATES
+- STARTS
+- FOLLOWS
+- PRECEDES
+- LEADS_TO
+- ESCALATES_TO
+- MANAGES
+- HANDLES
+- CONTAINS_INCIDENT
+- ERADICATES
+- RECOVERS
+- CLOSES
+- IMPROVES
+
+NOTIFICATION / AUTHORITY:
+- NOTIFIES
+- REPORTS_TO
+- RECEIVES_NOTIFICATION
+- REQUIRES_NOTIFICATION_TO
+- HAS_DEADLINE
+- HAS_RECIPIENT
+- COMMUNICATES_TO
+
+FRAMEWORK:
+- SUPPORTS
+- ENABLES
+- IMPLEMENTS
+- DEPENDS_ON
+- ALIGNS_WITH
+- CONTRIBUTES_TO
+- MEASURES
+- MONITORS
+
+RISK / SECURITY:
+- MITIGATES
+- REDUCES
+- THREATENS
+- EXPLOITS
+- PROTECTS
+- VULNERABLE_TO
+- COMPROMISES
+- IMPACTS
+- AFFECTS
+- EXPOSES
+
+AUDIT / EVIDENCE:
+- GENERATES
+- VERIFIES
+- TESTS
+- DEMONSTRATES
+- DOCUMENTS
+- SUPPORTS_EVIDENCE_FOR
+
+NORMALIZATION RULES:
+- COMPLIANT, COMPLIES, COMPLY, CONFORME_A, CONFORMITY_WITH -> COMPLIES_WITH
+- NON_COMPLIANT, NON_COMPLIANCE, NON_CONFORMITY, NOT_COMPLIANT, GAP_WITH, VIOLATES -> NON_COMPLIANT_WITH
+- STATUS, COMPLIANCE_STATUS, IMPLEMENTATION_STATUS, MATURITY_STATUS -> HAS_COMPLIANCE_STATUS
+- GAP, HAS_FINDING, HAS_DEFICIENCY, HAS_WEAKNESS -> HAS_GAP
+- REMEDIATION_REQUIRED, NEEDS_REMEDIATION, REQUIRES_CORRECTIVE_ACTION -> REQUIRES_REMEDIATION
+- REMEDIATES, CORRECTS, CLOSES_GAP -> REMEDIATES
+- NOTIFICATION_TO, SENDS_NOTIFICATION_TO, MUST_NOTIFY -> NOTIFIES
+- REPORT_TO, REPORTS, ESCALATES_REPORT_TO -> REPORTS_TO
+- DEADLINE, TIME_LIMIT, WITHIN_HOURS, WITHIN_DAYS -> HAS_DEADLINE
+- RESPONSIBLE, ACCOUNTABLE, OWNER, ASSIGNED_TO -> ASSIGNS_RESPONSIBILITY_TO
 
 RULES:
-- verb MUST be a SINGLE ENGLISH VERB in UPPERCASE lemma, e.g. MITIGATE, REQUIRE, VERIFY, PROTECT, COMPLY, VIOLATE, IMPLEMENT.
-- object MUST be a short assessment noun/noun phrase in UPPERCASE, e.g. RISK, CONTROL, POLICY, EVIDENCE, ASSET, REQUIREMENT, REGULATION, USER_ACCESS, VULNERABILITY.
-- If RAW encodes an object (e.g. MITIGA_RISCHIO, REDUCES_UNAUTHORIZED_ACCESS), extract it into object.
-- Convert Italian/English forms to the same English verb/object:
-  - MITIGA/RIDUCE/REDUCES -> verb MITIGATE
-  - RICHIEDE/REQUIRES -> verb REQUIRE
-  - VERIFICA/CONFIRMS/VALIDATES -> verb VERIFY
-  - PROTEGGE/PROTECTS -> verb PROTECT
-  - VIOLA/VIOLATES -> verb VIOLATE
-  - IMPLEMENTA/IMPLEMENTS -> verb IMPLEMENT
-  - CONFORME_A/COMPLIES_WITH -> verb COMPLY, object REGULATION or REQUIREMENT if explicit
-- If RAW contains extra trailing tokens such as _IN, _DURING, _TO, date, phase, or status, put ONLY the last token into qualifier and keep verb/object unchanged.
-- Never output unrelated objects from other domains unless they are explicitly present in the assessment document.
-- If unsure about object, leave object empty.
+- "verb" MUST be one of the canonical relations above.
+- If RAW already matches one canonical relation, return it unchanged as verb.
+- Put extra trailing tokens, phase names, dates, or status labels into qualifier.
+- If unsure, use DEFINES for definitional relations, APPLIES_TO for scope relations, or SUPPORTS_EVIDENCE_FOR for evidence relations.
+- Never invent unrelated objects.
+- If no object is explicit, leave object empty.
 
 Return JSON only.
 """
@@ -1971,10 +2051,41 @@ def _safe_reltype(t: str) -> str:
 def _cheap_lemma_en(verb: str) -> str:
     v = (verb or "").strip().upper()
 
+    # Le relazioni canoniche composte NON devono essere lemmatizzate.
+    # Sono già tipi Neo4j validi e semanticamente specifici.
+    canonical_compound_relations = {
+        "COMPLIES_WITH",
+        "NON_COMPLIANT_WITH",
+        "HAS_COMPLIANCE_STATUS",
+        "HAS_GAP",
+        "REQUIRES_REMEDIATION",
+        "ASSIGNS_RESPONSIBILITY_TO",
+        "CONTAINS_INCIDENT",
+        "ESCALATES_TO",
+        "REPORTS_TO",
+        "RECEIVES_NOTIFICATION",
+        "REQUIRES_NOTIFICATION_TO",
+        "HAS_DEADLINE",
+        "HAS_RECIPIENT",
+        "COMMUNICATES_TO",
+        "DEPENDS_ON",
+        "ALIGNS_WITH",
+        "CONTRIBUTES_TO",
+        "VULNERABLE_TO",
+        "SUPPORTS_EVIDENCE_FOR",
+    }
+
+    if v in canonical_compound_relations:
+        return v
+
+    # Se contiene underscore ed è già un tipo relazione pulito, non forzare lemma.
+    # Questo evita deformazioni su relazioni composte non ancora censite.
+    if "_" in v and RELTYPE_OK.match(v):
+        return v
+
     if len(v) <= 4:
         return v
 
-    # forme comuni
     if v.endswith("ING") and len(v) > 6:
         v = v[:-3]
     elif v.endswith("ED") and len(v) > 5:
@@ -1982,17 +2093,13 @@ def _cheap_lemma_en(verb: str) -> str:
     elif v.endswith("S") and len(v) > 5:
         v = v[:-1]
 
-    # fix "troncamenti" frequenti prodotti da LLM/JSON cleaning:
-    # ESTABLISHE -> ESTABLISH
     if v.endswith("ISHE") and len(v) >= 8:
-        v = v[:-1]  # drop final 'E'
+        v = v[:-1]
 
-    # DISCUS -> DISCUSS
     if v.endswith("CUS") and len(v) >= 6:
         v = v + "S"
 
     return v
-
 
 
 def canonicalize_edges_by_base_presence(edges: list[dict]) -> list[dict]:
@@ -3450,73 +3557,178 @@ def llm_extract_kg(filename: str, page_no, text: str, model_name: str):
     FLAT_KG_PROMPT = """You are an expert Compliance Auditor, Cybersecurity Analyst, and Data Engineer.
 
 CRITICAL DISAMBIGUATION RULES FOR NEO4J:
-- For generic parameters, assets, or rules, you MUST append the core topic of the current document in parentheses to the ID, e.g., "Firewall (Perimeter Security)" or "Backup (DRP)".
-- Do not create isolated generic nodes. Always disambiguate them.
-- Ensure each extracted entity is strictly relevant to IT security, risk management, or regulatory compliance.
+- For generic parameters, assets, controls, processes, or rules, append the core topic when needed, e.g., "Backup (Business Continuity)" or "Notification (Incident Management)".
+- Do not create isolated generic nodes.
+- Ensure each extracted entity is strictly relevant to IT security, risk management, audit, compliance, privacy, governance, or regulatory obligations.
+- Keep node IDs stable, human-readable, and close to the wording used in the text.
 
 CRITICAL JSON SCHEMA REQUIREMENT:
-Every node object MUST contain EXACTLY these 5 keys. Missing keys will crash the system.
-1. "id": Entity name, concept, or technical control (e.g., "MFA", "ISO 27001", "Data Breach").
+Every node object MUST contain EXACTLY these 5 keys:
+1. "id": Entity name, concept, control, process, function, authority, obligation, requirement, finding, or technical object.
 2. "category": Chosen from the Taxonomy.
-3. "description": Brief definition EXTRACTED FROM THE TEXT (keep the original language of the text). NEVER copy the placeholder examples.
-4. "formula": If there is a strict technical rule or mathematical formula, extract it here. Otherwise, use an empty string "".
+3. "description": Brief definition EXTRACTED FROM THE TEXT. Keep the original language of the text.
+4. "formula": If there is a strict technical rule or mathematical formula, extract it here. Otherwise, use "".
 5. "synonyms": Array of alternative names, acronyms, or translations explicitly present in the input text.
 
-TAXONOMY (Choose ONE for 'category'):
-- ORGANIZATION (e.g., Company, Department, Third-Party)
-- PERSON (e.g., CISO, DPO, Employee)
-- POLICY_OR_PROCEDURE (e.g., Password Policy, Incident Response Plan)
-- CONTROL (e.g., MFA, Firewall, Encryption, Backup)
-- RISK (e.g., Data Loss, Unauthorized Access, Cyber Attack)
-- EVIDENCE (e.g., Audit Log, Review Minutes, Vulnerability Scan)
-- ASSET (e.g., Server, Database, Workstation, Network)
-- REGULATION (e.g., GDPR, ISO 27001, NIS2, DORA)
-- CONCEPT (e.g., Confidentiality, Integrity, Business Continuity)
+TAXONOMY:
+- ORGANIZATION
+- PERSON
+- ROLE
+- AUTHORITY
+- REGULATION
+- FRAMEWORK
+- STANDARD
+- POLICY_OR_PROCEDURE
+- PROCESS
+- PHASE
+- FUNCTION
+- CONTROL
+- MEASURE
+- REQUIREMENT
+- OBLIGATION
+- NOTIFICATION
+- EVIDENCE
+- FINDING
+- GAP
+- REMEDIATION
+- COMPLIANCE_STATUS
+- ASSET
+- DATA
+- INCIDENT
+- EVENT
+- RISK
+- THREAT
+- VULNERABILITY
+- IMPACT
+- METRIC
+- FORMULA
+- CONCEPT
 
-RELATION VOCABULARY (Use ONLY these EXACT UPPERCASE relation types):
-- HIERARCHY / STRUCTURE: IS_A, PART_OF, HAS_COMPONENT, APPLIES_TO, BELONGS_TO
-- GOVERNANCE & COMPLIANCE: COMPLIES_WITH, VIOLATES, MANDATES, GOVERNS, APPROVES, REVIEWS
-- RISK & SECURITY: MITIGATES, THREATENS, EXPLOITS, PROTECTS, VULNERABLE_TO
-- PROCESS & AUDIT: IMPLEMENTS, GENERATES, VERIFIES, TESTS, REQUIRES, DEPENDS_ON
+RELATION VOCABULARY. Use ONLY these EXACT UPPERCASE relation types:
+
+STRUCTURE:
+- IS_A
+- PART_OF
+- HAS_COMPONENT
+- CONTAINS
+- BELONGS_TO
+- APPLIES_TO
+- MAPS_TO
+- DEFINES
+- CLASSIFIES
+
+GOVERNANCE / COMPLIANCE:
+- COMPLIES_WITH
+- NON_COMPLIANT_WITH
+- HAS_COMPLIANCE_STATUS
+- HAS_GAP
+- REQUIRES_REMEDIATION
+- REMEDIATES
+- MANDATES
+- REQUIRES
+- GOVERNS
+- APPROVES
+- REVIEWS
+- ASSIGNS_RESPONSIBILITY_TO
+
+INCIDENT / PROCESS:
+- TRIGGERS
+- ACTIVATES
+- STARTS
+- FOLLOWS
+- PRECEDES
+- LEADS_TO
+- ESCALATES_TO
+- MANAGES
+- HANDLES
+- CONTAINS_INCIDENT
+- ERADICATES
+- RECOVERS
+- CLOSES
+- IMPROVES
+
+NOTIFICATION / AUTHORITY:
+- NOTIFIES
+- REPORTS_TO
+- RECEIVES_NOTIFICATION
+- REQUIRES_NOTIFICATION_TO
+- HAS_DEADLINE
+- HAS_RECIPIENT
+- COMMUNICATES_TO
+
+NIST / FRAMEWORK:
+- SUPPORTS
+- ENABLES
+- IMPLEMENTS
+- DEPENDS_ON
+- ALIGNS_WITH
+- CONTRIBUTES_TO
+- MEASURES
+- MONITORS
+
+RISK / SECURITY:
+- MITIGATES
+- REDUCES
+- THREATENS
+- EXPLOITS
+- PROTECTS
+- VULNERABLE_TO
+- COMPROMISES
+- IMPACTS
+- AFFECTS
+- EXPOSES
+
+AUDIT / EVIDENCE:
+- GENERATES
+- VERIFIES
+- TESTS
+- DEMONSTRATES
+- DOCUMENTS
+- SUPPORTS_EVIDENCE_FOR
 
 GRAPH EXTRACTION RULES:
-1. Canonical node IDs: Use stable human-readable IDs. Prefer the canonical name used in the input text.
-2. Synonyms: Fill "synonyms" ONLY with alternative names or acronyms explicitly present in the input text (e.g., ["Disaster Recovery Plan", "DRP"]).
-3. Semantic edge density: Build a semantically useful graph. Every edge MUST be supported by evidence.
-4. Relation selection guide:
-   A) Use MITIGATES when a CONTROL reduces a RISK.
-   B) Use COMPLIES_WITH when a POLICY or CONTROL aligns with a REGULATION.
-   C) Use THREATENS or EXPLOITS when a RISK impacts an ASSET.
-   D) Use PROTECTS when a CONTROL defends an ASSET.
-   E) Use VERIFIES or TESTS when an EVIDENCE confirms a CONTROL.
-   F) Use MANDATES when a REGULATION requires a CONTROL or POLICY.
-
-5. Evidence: Provide an 'evidence' key for every edge explaining the connection. Keep the original language of the text.
+1. Every edge MUST be supported by explicit evidence in the input text.
+2. Do not infer relations that are only generally plausible.
+3. If the text describes conformity, compliance, non-compliance, audit gaps, findings, deviations, missing controls, partial implementation, or remediation actions, use:
+   - COMPLIES_WITH
+   - NON_COMPLIANT_WITH
+   - HAS_COMPLIANCE_STATUS
+   - HAS_GAP
+   - REQUIRES_REMEDIATION
+   - REMEDIATES
+4. If the text describes a sequence, obligation, responsibility, notification flow, incident lifecycle, authority interaction, deadline, or framework function, use PROCESS, OBLIGATION, NOTIFICATION, AUTHORITY, FUNCTION, INCIDENT, REQUIREMENT nodes when supported by the text.
+5. Do not force every relation into CONTROL/RISK vocabulary.
+6. Prefer process and obligation relations when the text describes procedures, deadlines, responsibilities, authorities, reporting, or lifecycle phases.
+7. Use HAS_DEADLINE only when a deadline, timing, or timeframe is explicitly stated.
+8. Use REPORTS_TO / NOTIFIES / RECEIVES_NOTIFICATION only when the recipient authority or role is explicit.
+9. Use NON_COMPLIANT_WITH only when the text explicitly states absence, failure, non-conformity, gap, deviation, or unmet requirement.
+10. Use HAS_COMPLIANCE_STATUS when the text explicitly states implemented, partially implemented, not implemented, compliant, non-compliant, partial, open, closed, or similar status.
+11. Use evidence text for every edge. Keep the original language of the text.
 
 Return ONLY valid JSON. Example of EXACT expected format:
 {
   "nodes": [
     {
-      "id": "Multi-Factor Authentication",
-      "category": "CONTROL",
-      "description": "Controllo di sicurezza che richiede due o più metodi di verifica.",
-      "formula": "",
-      "synonyms": ["MFA"]
-    },
-    {
-      "id": "Data Breach",
-      "category": "RISK",
-      "description": "Accesso non autorizzato ai dati personali.",
+      "id": "Registro dei trattamenti",
+      "category": "EVIDENCE",
+      "description": "Documento richiesto per censire i trattamenti di dati personali.",
       "formula": "",
       "synonyms": []
+    },
+    {
+      "id": "GDPR",
+      "category": "REGULATION",
+      "description": "Regolamento europeo sulla protezione dei dati personali.",
+      "formula": "",
+      "synonyms": ["General Data Protection Regulation"]
     }
   ],
   "edges": [
     {
-      "source": "Multi-Factor Authentication",
-      "target": "Data Breach",
-      "relation": "MITIGATES",
-      "evidence": "L'implementazione della MFA riduce significativamente il rischio di data breach."
+      "source": "Registro dei trattamenti",
+      "target": "GDPR",
+      "relation": "COMPLIES_WITH",
+      "evidence": "Il registro dei trattamenti è previsto dagli obblighi GDPR."
     }
   ]
 }
@@ -4875,10 +5087,16 @@ def process_ai_and_db(file_path: str, source_type: str, doc_meta: dict, chunks: 
                 if vecs_t is not None:
                     local_idxs = [local_j for _, local_j, _ in indexed_chunks]
                     page_vec = vecs_t[local_idxs].mean(dim=0)
-                    ok_kg = ai_gatekeeper_decision_from_vec(page_vec)
+
+                    # Tier A: documenti normativi/framework/procedure di riferimento.
+                    # Soglia più permissiva per non perdere pagine con obblighi, definizioni,
+                    # autorità, notifiche, scadenze, compliance/non-compliance.
+                    kg_threshold = 0.30 if str(tier).upper() == "A" else 0.38
+
+                    ok_kg = ai_gatekeeper_decision_from_vec(page_vec, threshold=kg_threshold)
                 else:
-                    # fallback (non dovrebbe quasi mai servire)
                     ok_kg = ai_gatekeeper_decision(text_clean)
+
 
                 if ok_kg:
                     futures_kg[p_no] = kg_executor.submit(
@@ -4930,10 +5148,12 @@ def process_ai_and_db(file_path: str, source_type: str, doc_meta: dict, chunks: 
                             props.setdefault("evidence_type", "explicit_kg_edge")
                             e["props"] = props                        
                         
+
                         if validated_nodes:
-                            for g_idx, _, _ in pages_map[p_no]:
-                                batch_kg_results[g_idx] = (validated_nodes, final_edges)
-                            
+                            # Associa il KG estratto dalla pagina solo al primo chunk della pagina.
+                            # Evita duplicazione logica degli stessi nodi/archi su ogni chunk della stessa pagina.
+                            first_g_idx = pages_map[p_no][0][0]
+                            batch_kg_results[first_g_idx] = (validated_nodes, final_edges)
                             print(f"   ✅ KG Exploded: {len(validated_nodes)} nodi e {len(final_edges)} archi a Pagina {p_no}")
                         else:
                             print(f"   ⚠️ KG Empty: Nessun nodo valido estratto a Pagina {p_no}")

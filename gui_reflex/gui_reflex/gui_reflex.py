@@ -6871,7 +6871,7 @@ def _repair_missing_abcd_headers(answer: str) -> str:
 
     if _has_required_abcd_headers(text):
         text = re.sub(r"(?im)^\s*(?:\*\*)?\s*A\s*[\)\.\-:]\s*Risposta(?:\*\*)?\s*$", "**A) Risposta**", text)
-        text = re.sub(r"(?im)^\s*(?:\*\*)?\s*B\s*[\)\.\-:]\s*Evidenze(?:\*\*)?\s*$", "**B) Evidenze**", text)
+        text = re.sub(r"(?im)^\s*(?:\*\*)?\s*B\s*[\)\.\-:]\s*Evidenze(?:\*\*)?\s*$", "\n\n**B) Evidenze**", text)
         text = re.sub(r"(?im)^\s*(?:\*\*)?\s*C\s*[\)\.\-:]\s*(?:Limiti\s*/\s*Conflitti|Limiti|Conflitti)(?:\*\*)?\s*$", "**C) Limiti / Conflitti**", text)
         text = re.sub(r"(?im)^\s*(?:\*\*)?\s*D\s*[\)\.\-:]\s*Fonti(?:\*\*)?\s*$", "**D) Fonti**", text)
         return text
@@ -7751,7 +7751,7 @@ class State(rx.State):
                     + f"### USER QUESTION ###\n{user_query}\n"
                     + f"{language_reminder}\n\n"
                     + "CRITICAL REMINDER: You MUST output EXACTLY these four headers and nothing else: "
-                    + "**A) Risposta**, **B) Evidenze**, **C) Limiti / Conflitti**, **D) Fonti**."
+                    + "**A) Risposta**, \n\n**B) Evidenze**, **C) Limiti / Conflitti**, **D) Fonti**."
                 )
             
             # --- COSTRUZIONE PAYLOAD CHAT ---
