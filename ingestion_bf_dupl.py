@@ -420,11 +420,11 @@ VISION_MAX_FORMULAS_PER_PAGE = int(os.getenv("VISION_MAX_FORMULAS_PER_PAGE", "10
 # --- SOGLIE ASSET VISUALI ---
 # Immagini più piccole di questo valore (in byte) verranno ignorate.
 # 7000 = icone/loghi | 2000 = molto permissivo | 15000 = molto sever
-PDF_EXTRACT_EMBEDDED_IMAGES = os.getenv("PDF_EXTRACT_EMBEDDED_IMAGES", "1") == "1" #= os.getenv("PDF_EXTRACT_EMBEDDED_IMAGES", "1") == "1"
-PDF_VISION_ON_EMBEDDED_IMAGES = os.getenv("PDF_VISION_ON_EMBEDDED_IMAGES", "1") == "1" # = os.getenv("PDF_VISION_ON_EMBEDDED_IMAGES", "1") == "1"
-PDF_MAX_IMAGES_PER_PAGE = int(os.getenv("PDF_MAX_IMAGES_PER_PAGE", "5"))
-MIN_IMAGE_BYTES = int(os.getenv("MIN_IMAGE_BYTES", "7000"))
-MIN_ASSET_SIZE = int(os.getenv("MIN_ASSET_SIZE", "7000"))
+PDF_EXTRACT_EMBEDDED_IMAGES = True #= os.getenv("PDF_EXTRACT_EMBEDDED_IMAGES", "1") == "1"
+PDF_VISION_ON_EMBEDDED_IMAGES = True # = os.getenv("PDF_VISION_ON_EMBEDDED_IMAGES", "1") == "1"
+PDF_MAX_IMAGES_PER_PAGE = int(os.getenv("PDF_MAX_IMAGES_PER_PAGE", "8"))
+MIN_IMAGE_BYTES = int(os.getenv("MIN_IMAGE_BYTES", "1"))
+MIN_ASSET_SIZE = int(os.getenv("MIN_ASSET_SIZE", "2000"))
 
 
 # Speed: Vision parallel + cache
@@ -655,19 +655,15 @@ NEO4J_ENABLED = os.getenv("NEO4J_ENABLED", "1") == "1"
 #qwen3-8b-gguf:latest
 #LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen3-vl-8b-instruct")
 
-#LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemma2:9b") 
-#LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen2.5:7b") 
-#LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen2.5:14b") 
-#LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama3.1:8b") 
+# LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemma2:9b") 
+# LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen2.5:7b") 
+# LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen2.5:14b") 
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama3.1:8b") 
 
 #VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "llama3.1:8b")
-#VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "qwen3.5:9b")
-#VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "ministral-3:8b")
-
-
-
-LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama3.1:8b")
 VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "ministral-3:8b")
+#VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "qwen3.5:9b")
+
 
 
 # Embeddings
@@ -1431,59 +1427,44 @@ def force_unload_ollama(model_name: str):
     except Exception:
         pass
 
-import os
-import time
-import shutil
-import subprocess
-import requests
-
 
 def force_restart_ollama(num_parallel: str = "1") -> bool:
     """
-    Riavvia Ollama su Windows ottimizzando l'uso VRAM.
-
-    Parametri:
-    - num_parallel: numero di richieste parallele gestite da Ollama.
-      Per GPU da 16GB è consigliato "1".
+    Riavvio Ottimizzato per GPU 16GB (P5000).
+    Forza OLLAMA_NUM_PARALLEL=1 per bilanciare Vision e Chat senza OOM.
     """
-
     print(f"🔄 Resetting Ollama Server (Target Parallelism={num_parallel})...")
 
-    # 1) Termina eventuali processi Ollama attivi
-    for process_name in ("ollama.exe", "ollama_app.exe"):
-        try:
-            subprocess.run(
-                ["taskkill", "/f", "/im", process_name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False
-            )
-        except Exception:
-            pass
+    # 1) Kill processi esistenti (Pulizia VRAM)
+    try:
+        subprocess.run(["taskkill", "/f", "/im", "ollama.exe"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["taskkill", "/f", "/im", "ollama_app.exe"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(3) # Un secondo in più per essere sicuri che la VRAM sia libera
+    except Exception:
+        pass
 
-    time.sleep(3)
-
-    # 2) Configura variabili ambiente
+    # 2) Configura l'ambiente P5000 Friendly
     env = os.environ.copy()
+    
+    # Su 16GB, UNO alla volta è meglio. Massimizza la VRAM per il contesto lungo.
     env["OLLAMA_NUM_PARALLEL"] = str(num_parallel)
+    
+    # Teniamo in memoria max 2 modelli (Vision e Brain) per evitare continui reload
     env["OLLAMA_MAX_LOADED_MODELS"] = "2"
-    env["OLLAMA_FLASH_ATTENTION"] = "1"
+    
+    # Opzionale: Flash Attention se supportato (spesso aiuta su Pascal/Volta/Ampere)
+    env["OLLAMA_FLASH_ATTENTION"] = "1" 
 
-    # 3) Individua eseguibile Ollama
+    # 3) Percorso Ollama
     ollama_path = shutil.which("ollama")
-
     if not ollama_path:
-        ollama_path = os.path.expandvars(
-            r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe"
-        )
+        ollama_path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama.exe")
 
-    if not os.path.exists(ollama_path):
-        print(f"❌ Ollama non trovato nel percorso: {ollama_path}")
-        return False
+    print(f"   🚀 Starting Ollama from: {ollama_path} with P5000 optimizations...")
 
-    print(f"🚀 Starting Ollama from: {ollama_path}")
-
-    # 4) Avvia il server Ollama
+    # 4) Avvio server
     try:
         subprocess.Popen(
             [ollama_path, "serve"],
@@ -1494,26 +1475,64 @@ def force_restart_ollama(num_parallel: str = "1") -> bool:
             shell=False
         )
     except Exception as e:
-        print(f"❌ Errore critico nell'avvio di Ollama: {e}")
+        print(f"   ❌ Errore critico avvio Ollama: {e}")
         return False
 
     # 5) Healthcheck
-    for i in range(20):
+    for i in range(20): # Aumentato timeout a 20 per dare tempo al caricamento VRAM
         try:
-            res = requests.get(
-                "http://127.0.0.1:11434/api/tags",
-                timeout=2
-            )
-
+            res = requests.get("http://127.0.0.1:11434/api/tags", timeout=2)
             if res.status_code == 200:
-                print(f"✨ Ollama is READY (Parallel={num_parallel})")
+                print(f"   ✨ Ollama is READY (Parallel={num_parallel})")
                 return True
-
-        except requests.RequestException:
-            print(f"...waiting for server ({i + 1}/20)")
+        except:
             time.sleep(1)
+            
+    print("   ⚠️ Ollama non ha risposto entro il timeout, ma potrebbe essere attivo.")
+    return True
 
-    print("⚠️ Ollama non ha risposto entro il timeout.")
+
+    # 2. Configura l'ambiente
+    env = os.environ.copy()
+    num_parallel=4
+    env["OLLAMA_NUM_PARALLEL"] = num_parallel
+    env["OLLAMA_MAX_LOADED_MODELS"] = "2"
+    
+    # 3. Individua il percorso di Ollama
+    # Cerchiamo ollama nel PATH; se non lo trova, usiamo il percorso standard di installazione su Windows
+    ollama_path = shutil.which("ollama")
+    if not ollama_path:
+        ollama_path = os.path.expandvars(r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe")
+
+    print(f"   🚀 Starting Ollama from: {ollama_path}")
+
+    # 4. Avvio del server con shell=True per risolvere i problemi di PATH su Windows
+    try:
+        subprocess.Popen(
+            [ollama_path, "serve"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            shell=True # Fondamentale per evitare il WinError 2
+        )
+    except Exception as e:
+        print(f"   ❌ Errore critico nell'avvio di Ollama: {e}")
+        return False
+
+    # 5. Verifica disponibilità (Invariato)
+# 5. Verifica disponibilità
+    for i in range(15):
+        try:
+            # FIX: Usiamo /api/tags che accetta GET e risponde 200 OK
+            res = requests.get("http://localhost:11434/api/tags", timeout=1)
+            if res.status_code == 200:
+                print(f"   ✨ Ollama is READY (Parallel={num_parallel})")
+                return True
+        except Exception:
+            time.sleep(2)
+            print(f"   ...waiting for server ({i+1}/15)")
+    
     return False
 
 
@@ -3381,18 +3400,7 @@ def extract_chart_via_vision(img_bytes: bytes, context_hint: str = "") -> Option
 
     # scegli output migliore
     best = js1 if _score_chart(js1) >= _score_chart(js2) else js2
-
     if not isinstance(best, dict) or not best:
-        return None
-
-    best_score = _score_chart(best)
-    best_title = str(best.get("title") or "").strip()
-    best_points = best.get("data_points") or []
-
-    if best_score <= 0:
-        return None
-
-    if not best_title and not best_points:
         return None
 
     # --- CLEANING (anni / geo) ---
@@ -3441,11 +3449,11 @@ def build_chart_semantic_chunk(page_no: int, chart_json: Dict[str, Any], prefix:
     Versione V8: Ministral-Ready.
     Accetta 'value' (singolare) e 'values' (plurale).
     """
-    page_human = page_no
+    page_human = (page_no + 1) if isinstance(page_no, int) else page_no
 
     if not isinstance(chart_json, dict):
         return normalize_ws(f"--- ANALISI VISUALE - Pagina {page_human} ---\n[Dati non validi]")
-    
+
     title = to_text(chart_json.get("title", ""))
     ctype = to_text(chart_json.get("chart_type", "Grafico"))
     discriminators = to_text(chart_json.get("series_discriminators") or chart_json.get("series_legend", ""))
@@ -4290,7 +4298,7 @@ def extract_file_chunks(file_path: str, log_id: int) -> List[Dict[str, Any]]:
                                 image_id = pg_save_image(log_id, img_bytes, "image/jpeg", img_name, cur=t_cur)
 
                                 analysis = None
-                                if PDF_VISION_ON_EMBEDDED_IMAGES and VISION_MODEL_NAME:
+                                if VISION_MODEL_NAME:
                                     try:
                                         analysis = extract_chart_via_vision(
                                             img_bytes,
@@ -4436,7 +4444,7 @@ def extract_pdf_as_markdown_assets(file_path: str, log_id: int) -> List[Dict[str
             if PDF_VISION_ENABLED:
                 images = page.get_images(full=True) or []
                 if images:
-                    for img_index, img in enumerate(images[:PDF_MAX_IMAGES_PER_PAGE]):
+                    for img_index, img in enumerate(images):
                         xref = img[0]
                         try:
                             base_image = doc.extract_image(xref)
@@ -4458,7 +4466,7 @@ def extract_pdf_as_markdown_assets(file_path: str, log_id: int) -> List[Dict[str
 
                             # prova Vision
                             c_js = None
-                            if PDF_VISION_ON_EMBEDDED_IMAGES and VISION_MODEL_NAME:
+                            if VISION_MODEL_NAME:
                                 try:
                                     c_js = extract_chart_via_vision(
                                         image_bytes,

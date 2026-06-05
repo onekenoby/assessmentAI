@@ -658,6 +658,10 @@ def detect_intent(query: str) -> str:
     q_raw = query or ""
     q = q_raw.lower()
 
+    if is_assessment_evidence_relevance_query(q_raw):
+        return "audit"
+
+
     # 0. INTENT: CLASSIFICAZIONE NORMATIVA
     # Deve venire prima della formula mode.
     # Esempio generale: "chi sono i soggetti/categorie e come varia il regime..."
@@ -814,6 +818,8 @@ def is_user_data_analytics(query: str) -> bool:
     con l'intento di farli analizzare o elaborare.
     """
     q = (query or "").lower()
+    if is_assessment_evidence_relevance_query(query):
+        return True
 
     # 1. RILEVAMENTO STRUTTURE DATI (Esteso)
     # A. Liste classiche: [1.2, 3, 4] o (1, 2, 3)
@@ -2128,7 +2134,10 @@ def detect_answer_mode(query_text: str) -> str:
     o eseguire un'analisi critica/valutazione (audit).
     """
     q = (query_text or "").lower()
-    
+
+    if is_assessment_evidence_relevance_query(query_text):
+        return "evidence_relevance"
+
     audit_eval_terms = [
         # ITALIANO
         "verifica conformità", "valutazione conformità", "non conformità", "non conforme", 
@@ -2481,6 +2490,201 @@ def get_payload_tier(payload: dict) -> str:
         return str(t)
     except Exception:
         return ""
+
+
+
+def is_assessment_evidence_relevance_query(query_text: str) -> bool:
+    """
+    Rileva richieste di valutazione attinenza/sufficienza di un documento-evidenza
+    rispetto a una domanda, requisito, controllo o item di assessment.
+
+    Non è adattativa:
+    - non contiene nomi di documenti specifici;
+    - non contiene query hard-coded;
+    - riconosce una classe generale evidence-vs-question / evidence-vs-requirement.
+    """
+    q = (query_text or "").lower().strip()
+
+    if not q:
+        return False
+
+    evidence_terms = [
+        # IT
+        "evidenza", "evidenze",
+        "prova", "prove",
+        "documento", "documenti",
+        "file", "pdf", "allegato", "allegati",
+        "upload", "caricato", "caricati", "documentazione",
+        "artefatto", "artefatti",
+        "record", "registrazione", "registrazioni",
+        "log", "screenshot", "report", "rapporto",
+        "procedura", "policy", "registro",
+
+        # EN
+        "evidence", "evidences",
+        "proof", "proofs",
+        "document", "documents",
+        "file", "pdf", "attachment", "attachments",
+        "upload", "uploaded", "documentation",
+        "artifact", "artifacts",
+        "record", "records",
+        "log", "logs", "screenshot", "report", "reports",
+        "procedure", "policy", "register",
+    ]
+
+    assessment_terms = [
+        # IT
+        "domanda", "domande",
+        "questionario", "questionari",
+        "assessment", "audit",
+        "requisito", "requisiti",
+        "controllo", "controlli",
+        "checklist", "item", "punto", "punti",
+        "criterio", "criteri",
+        "misura", "misure",
+        "obbligo", "obblighi",
+        "clausola", "clausole",
+        "capitolo", "sezione",
+
+        # EN
+        "question", "questions",
+        "questionnaire", "questionnaires",
+        "assessment", "audit",
+        "requirement", "requirements",
+        "control", "controls",
+        "checklist", "item", "items",
+        "criterion", "criteria",
+        "measure", "measures",
+        "obligation", "obligations",
+        "clause", "clauses",
+        "chapter", "section",
+    ]
+
+    relevance_terms = [
+        # IT
+        "attinente", "attinenza",
+        "inerente", "inerenza",
+        "pertinente", "pertinenza",
+        "rilevante", "rilevanza",
+        "correlato", "correlata", "correlazione",
+        "collegato", "collegata", "collegamento",
+        "coerente", "coerenza",
+        "adeguato", "adeguata", "adeguatezza",
+        "sufficiente", "sufficienza",
+        "idoneo", "idonea", "idoneità",
+        "applicabile", "applicabilità",
+        "supporta", "supportato", "supportata",
+        "dimostra", "dimostrato", "dimostrata",
+        "comprova", "comprovato", "comprovata",
+        "giustifica", "giustificato", "giustificata",
+        "copre", "copertura",
+        "risponde", "risposta",
+        "valuta", "valutare", "verifica", "verificare",
+
+        # EN
+        "relevant", "relevance",
+        "pertinent", "pertinence",
+        "related", "relation", "relationship",
+        "correlated", "correlation",
+        "linked", "link", "connection",
+        "consistent", "consistency",
+        "adequate", "adequacy",
+        "sufficient", "sufficiency",
+        "suitable", "suitability",
+        "applicable", "applicability",
+        "supports", "supported", "supporting",
+        "demonstrates", "demonstrated",
+        "proves", "proven",
+        "justifies", "justified",
+        "covers", "coverage",
+        "answers", "answer",
+        "evaluate", "assess", "verify", "check",
+    ]
+
+    gap_terms = [
+        # IT
+        "gap", "lacuna", "lacune",
+        "mancanza", "mancanze",
+        "manca", "mancano",
+        "carente", "carenti", "carenza", "carenze",
+        "debole", "debolezza", "debolezze",
+        "incompleto", "incompleta", "parziale",
+        "non sufficiente", "non adeguato", "non adeguata",
+        "non attinente", "poco attinente",
+        "scostamento", "scostamenti",
+        "non conformità", "non conforme","differenza", "differenze", "deviazione", "deviazioni",
+
+        # EN
+        "gap", "gaps",
+        "missing", "absence", "lack", "lacks",
+        "weak", "weakness", "weaknesses",
+        "deficiency", "deficiencies",
+        "incomplete", "partial",
+        "not sufficient", "insufficient",
+        "not adequate", "inadequate",
+        "not relevant", "poorly relevant",
+        "deviation", "deviations",
+        "non-compliance", "non-compliant","difference", "differences", "deviation", "deviations"
+    ]
+
+    remediation_terms = [
+        # IT
+        "remediation", "piano di remediation",
+        "piano correttivo", "azioni correttive",
+        "azione correttiva", "correzione", "correzioni",
+        "rimedio", "rimedi",
+        "miglioramento", "miglioramenti",
+        "integrazione", "integrare",
+        "raccomandazione", "raccomandazioni",
+        "cosa manca", "cosa integrare", "come migliorare",
+
+        # EN
+        "remediation", "remediation plan",
+        "corrective action", "corrective actions",
+        "correction", "corrections",
+        "remedy", "remedies",
+        "improvement", "improvements",
+        "integration", "integrate",
+        "recommendation", "recommendations",
+        "what is missing", "what to add", "how to improve",
+    ]
+
+    scoring_terms = [
+        # IT
+        "livello", "livelli",
+        "percentuale", "percentuali",
+        "score", "punteggio", "valutazione",
+        "grado", "classifica", "classificazione",
+        "basso", "medio", "alto",
+        "debole", "parziale", "forte",
+
+        # EN
+        "level", "levels",
+        "percentage", "percentages",
+        "score", "scoring", "rating",
+        "grade", "classification",
+        "low", "medium", "high",
+        "weak", "partial", "strong",
+    ]
+
+    has_evidence = any(t in q for t in evidence_terms)
+    has_assessment = any(t in q for t in assessment_terms)
+    has_relevance = any(t in q for t in relevance_terms)
+    has_gap = any(t in q for t in gap_terms)
+    has_remediation = any(t in q for t in remediation_terms)
+    has_scoring = any(t in q for t in scoring_terms)
+
+    return (
+        has_evidence
+        and has_assessment
+        and (
+            has_relevance
+            or has_gap
+            or has_remediation
+            or has_scoring
+        )
+    )
+
 
 def is_evidence_query(query: str) -> bool:
     q = (query or "").lower()
@@ -4696,20 +4900,32 @@ def normalize_doc_name(value: str) -> str:
 
 def extract_requested_document(query_text: str) -> str:
     """
-    Estrae il documento richiesto dalla query in modo sicuro.
-    Evita falsi positivi come "il documento consiglia...".
+    Estrae il documento richiesto dalla query in modo robusto.
+    Supporta:
+    - virgolette dritte: "file.pdf"
+    - virgolette curve: “file.pdf”
+    - apici: 'file.pdf'
+    - filename libero nel testo: file.pdf
     """
     q = query_text or ""
 
+    q = (
+        q.replace("“", '"')
+         .replace("”", '"')
+         .replace("‘", "'")
+         .replace("’", "'")
+    )
+
+    # 1. Documento/file/pdf seguito da nome tra virgolette
     patterns = [
-        # 1. Nome tra virgolette o apici: nel documento "Trading_Tesi"
-        r'\b(?:nel|nella|dal|dalla\s+)?(?:documento|file|pdf)\s+["\']([^"\']+)["\']',
-        
-        # 2. Nome con estensione esplicita: file report.pdf
-        r'\b(?:nel|nella|dal|dalla\s+)?(?:documento|file|pdf)\s+([A-Za-z0-9_\-\.]+\.(?:pdf|md|txt|docx|csv|html))\b',
-        
-        # 3. Nome tecnico con underscore o trattini: documento TRADING_ALGORITMICO
-        r'\b(?:nel|nella|dal|dalla\s+)?(?:documento|file|pdf)\s+([A-Za-z0-9]+[_\-][A-Za-z0-9_\-\.]+)\b',
+        r'\b(?:documento|file|pdf)\s+["\']([^"\']+\.(?:pdf|md|txt|docx|csv|html))["\']',
+        r'\b(?:nel|nella|dal|dalla)\s+(?:documento|file|pdf)\s+["\']([^"\']+\.(?:pdf|md|txt|docx|csv|html))["\']',
+
+        # 2. Documento/file/pdf seguito da filename non quotato
+        r'\b(?:documento|file|pdf)\s+([A-Za-z0-9_\-\s\.]+\.(?:pdf|md|txt|docx|csv|html))\b',
+
+        # 3. Qualunque filename esplicito nel testo
+        r'\b([A-Za-z0-9_\-]+(?:\s+[A-Za-z0-9_\-]+)*\.(?:pdf|md|txt|docx|csv|html))\b',
     ]
 
     for pattern in patterns:
@@ -7245,12 +7461,24 @@ class State(rx.State):
             await asyncio.sleep(0.1) 
             # -----------------------------------------------
 
-            intent = detect_intent(user_query)
-            math_answer = try_solve_math_query(user_query)
-            math_needs_context = bool(math_answer and needs_math_document_context(user_query))
-            analytics_mode = is_user_data_analytics(user_query) and not math_answer
+            is_evidence_relevance = is_assessment_evidence_relevance_query(user_query)
 
+            intent = "audit" if is_evidence_relevance else detect_intent(user_query)
 
+            math_answer = None if is_evidence_relevance else try_solve_math_query(user_query)
+
+            math_needs_context = bool(
+                math_answer
+                and needs_math_document_context(user_query)
+                and not is_evidence_relevance
+            )
+
+            analytics_mode = (
+                is_user_data_analytics(user_query)
+                and not math_answer
+                and not is_evidence_relevance
+            )
+            
             # tmp code added in v4.3 to debug routing issues in the test battery, to be removed in future versions
             print("========== ROUTING DEBUG ==========")
             print("QUERY:", user_query)
@@ -7383,7 +7611,15 @@ class State(rx.State):
                 # Usa memoria documento solo per follow-up reali, per evitare contaminazioni nella batteria test.
                 retrieval_query = user_query
 
-                if math_needs_context:
+                if is_assessment_evidence_relevance_query(user_query):
+                    retrieval_query = (
+                        user_query
+                        + "\n evidence relevance assessment question requirement control "
+                        + "attinenza evidenza domanda questionario requisito controllo "
+                        + "gap remediation corrective action sufficiency adequacy"
+                    )
+
+                elif math_needs_context:
                     retrieval_query = (
                         user_query
                         + "\n risk assessment evidence assessment valutazione del rischio controlli evidenze assessment integrato"
@@ -7737,9 +7973,58 @@ class State(rx.State):
                         "Use retrieved documents only to explain the assessment/risk/evidence context.\n\n"
                     )
 
+
+                evidence_relevance_block = ""
+
+                if answer_mode == "evidence_relevance":
+                    evidence_relevance_block = """
+                ### EVIDENCE RELEVANCE MODE ###
+                The user is asking whether a specific uploaded evidence document is relevant to an assessment questionnaire question.
+
+                You MUST evaluate ONLY the retrieved evidence document if a requested document scope is present.
+
+                Return the answer using this structure inside the standard four sections:
+
+                In **A) Risposta**, include:
+                - Livello di attinenza: 0 / 1 / 2 / 3
+                - Percentuale stimata: 0-100%
+                - Esito sintetico:
+                - 0 = Non attinente
+                - 1 = Debolmente attinente
+                - 2 = Parzialmente attinente
+                - 3 = Fortemente attinente
+
+                Scoring criteria:
+                - 3 / 76-100%: the evidence directly answers the assessment question.
+                - 2 / 51-75%: the evidence partially supports the question but misses relevant elements.
+                - 1 / 26-50%: the evidence is only indirectly related.
+                - 0 / 0-25%: the evidence does not support the question.
+
+                In **B) Evidenze**, cite only retrieved chunks from the requested document:
+                - filename
+                - page
+                - short supporting excerpt
+
+                In **C) Limiti / Conflitti**, list:
+                - missing evidence
+                - weak points
+                - assumptions
+                - whether the document is too generic
+
+                In **D) Fonti**, list only retrieved filenames.
+
+                If relevance is 0, 1, or 2, include a short remediation plan in section C.
+                Do NOT invent evidence.
+                Do NOT use documents outside the requested document scope.
+                Do NOT claim the evidence is sufficient if the retrieved text does not explicitly support the assessment question.
+                """
+
+
+
                 final_user_content = (
                     doc_scope_block
-                    + f"### ANSWER MODE ###\n{answer_mode}\n"
+                    + f"### ANSWER MODE ###\n{answer_mode}\n"  
+                    + evidence_relevance_block            
                     + "If mode is knowledge, section C MUST NOT mention missing Tier B or Tier C unless explicitly requested.\n\n"
                     + f"### STRICT_CHECKLIST_MODE ###\n{'ON' if strict_checklist_mode else 'OFF'}\n\n"
                     + f"### GRAPH_RELATION_MODE ###\n{'ON' if graph_relation_mode else 'OFF'}\n\n"
