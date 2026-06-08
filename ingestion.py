@@ -1174,22 +1174,6 @@ def clean_markdown_structure(md_content: str) -> str:
         cleaned_sections.append(section_text)
     return "".join(cleaned_sections)
 
-
-def to_text(x) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, str):
-        return x
-    if isinstance(x, (list, tuple, set)):
-        parts = [to_text(i) for i in x]
-        parts = [p.strip() for p in parts if p and str(p).strip()]
-        return "; ".join(parts)
-    if isinstance(x, dict):
-        return str(x)
-    return str(x)
-
-
-
 def set_toon_type(chunk: dict, *, is_image: bool) -> dict:
     chunk["toon_type"] = "image" if is_image else "text"
     return chunk
@@ -1255,20 +1239,6 @@ def fast_chunk_text(text: str, max_tokens: int = 2000) -> List[str]:
         start = max(start + 1, end - overlap_char)
 
     return chunks
-
-
-def prep_text_for_embedding(s: str, max_chars: int = 2200) -> str:
-    if not s:
-        return ""
-    # rimuove prefix tipo "Doc: ... | Sezione: ..."
-    s = re.sub(r"^Doc:\s.*?\n", "", s.strip(), flags=re.DOTALL)
-    # normalizza whitespace
-    s = re.sub(r"\s+", " ", s).strip()
-    # tronca (tokenizer cost cresce con la lunghezza)
-    if len(s) > max_chars:
-        s = s[:max_chars]
-    return s
-
 
 def page_has_vector_graphics(page: fitz.Page) -> bool:
     """
