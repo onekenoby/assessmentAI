@@ -226,8 +226,8 @@ OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "ollama")  # dummy key, Ollama non 
 # =========================
 # 🧠 LLM / OLLAMA CONTEXT
 # =========================
-LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "16384")) #8192
-LLM_NUM_PREDICT = int(os.getenv("LLM_NUM_PREDICT", "4096"))
+LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "8192"))
+LLM_NUM_PREDICT = int(os.getenv("LLM_NUM_PREDICT", "2048"))
 
 # =========================
 # 🧠 OLLAMA NATIVE CHAT - STABLE MODE
@@ -238,6 +238,55 @@ OLLAMA_NATIVE_CHAT_URL = os.getenv(
 )
 
 LLM_TIMEOUT_S = int(os.getenv("LLM_TIMEOUT_S", "300"))
+
+
+def compact_messages_for_retry(
+    messages: List[Dict[str, str]],
+    max_user_chars: int = 9000,
+) -> List[Dict[str, str]]:
+    """
+    Riduce il payload per il retry LLM senza cambiare la logica RAG.
+    Non è adattativa:
+    - non dipende dalla query;
+    - non dipende dai documenti;
+    - taglia solo il contenuto user troppo lungo.
+    """
+    compacted = []
+
+    for m in messages:
+        role = m.get("role", "")
+        content = m.get("content", "") or ""
+
+        if role == "user" and len(content) > max_user_chars:
+            head_chars = int(max_user_chars * 0.65)
+            tail_chars = max_user_chars - head_chars
+
+            content = (
+                content[:head_chars]
+                + "\n\n[...CONTESTO INTERMEDIO RIDOTTO AUTOMATICAMENTE PER RETRY LLM...]\n\n"
+                + content[-tail_chars:]
+            )
+
+        compacted.append({
+            "role": role,
+            "content": content,
+        })
+
+    return compacted
+
+def normalize_answer_sections(answer: str) -> str:
+    text = answer or ""
+
+    text = re.sub(r"\n\s*([ABCD]\)\s)", r"\n\n\1", text)
+
+    text = re.sub(
+        r"^\s*A\)\s*Risposta\s*\n+\s*A\)\s*Risposta\s*",
+        "A) Risposta\n\n",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    return text.strip()
 
 
 def call_ollama_chat_native(messages: List[Dict[str, str]]) -> str:
@@ -271,11 +320,54 @@ def call_ollama_chat_native(messages: List[Dict[str, str]]) -> str:
 
     data = response.json() or {}
     message = data.get("message") or {}
+    
+    print("\n-----------------MESSAGE-----------------------------\n")
+    print(message)
+    print("\n-----------------------------------------------------\n")
+    
     content = (message.get("content") or "").strip()
 
     print(f"✅ Ollama native call completed | chars={len(content)}")
 
+    if content:
+        return content
+
+    print("⚠️ Empty LLM response. Retrying with reduced output budget...")
+
+
+    retry_messages = compact_messages_for_retry(
+        messages,
+        max_user_chars=12000, #9000
+    )
+
+    retry_payload = {
+        "model": LLM_MODEL_NAME,
+        "messages": retry_messages,
+        "stream": False,
+        "options": {
+            "temperature": 0.05,
+            "num_ctx": 6144,
+            "num_predict": 1536,
+            "repeat_penalty": 1.05,
+        },
+    }
+
+    retry_response = requests.post(
+        OLLAMA_NATIVE_CHAT_URL,
+        json=retry_payload,
+        timeout=(300, LLM_TIMEOUT_S),
+    )
+    retry_response.raise_for_status()
+
+    retry_data = retry_response.json() or {}
+    retry_message = retry_data.get("message") or {}
+    content = (retry_message.get("content") or "").strip()
+
+    print(f"✅ Ollama retry completed | chars={len(content)}")
+
     return content
+
+
 
 
 MEMORY_LIMIT = int(os.getenv("MEMORY_LIMIT", "3"))  # number of turns (user+assistant)
@@ -304,8 +396,8 @@ GRAPH_MAX_FORMULAS = int(os.getenv("GRAPH_MAX_FORMULAS", "6"))
 GRAPH_MAX_NEIGHBOR_CHUNKS = int(os.getenv("GRAPH_MAX_NEIGHBOR_CHUNKS", "4"))
 
 # Prompt limits
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "24000"))  # 16000 - prevent prompt blow-ups
-MAX_ASSISTANT_CHARS = int(os.getenv("MAX_ASSISTANT_CHARS", "15000"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "12000"))  # prevent prompt blow-ups
+MAX_ASSISTANT_CHARS = int(os.getenv("MAX_ASSISTANT_CHARS", "12000"))
 
 AUDIT_ENABLED = True
 AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "./rag_audit.jsonl")
@@ -2675,9 +2767,62 @@ def is_assessment_evidence_relevance_query(query_text: str) -> bool:
     has_remediation = any(t in q for t in remediation_terms)
     has_scoring = any(t in q for t in scoring_terms)
 
+    has_explicit_file_reference = bool(
+        re.search(
+            r"\b[\w\-. ]+\.(pdf|md|txt|docx|csv|html|xlsx)\b",
+            query_text or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+    has_evidence_evaluation_action = any(t in q for t in [
+        # IT
+        "valuta se", "verifica se", "stima se",
+        "attinente alla", "pertinente alla", "inerente alla",
+        "supporta la domanda", "supporta il requisito",
+        "documento è attinente", "documento e attinente",
+        "evidenza è attinente", "evidenza e attinente",
+        "evidenza supporta", "documento supporta",
+
+        # EN
+        "evaluate whether", "assess whether", "verify whether",
+        "relevant to", "pertinent to",
+        "supports the question", "supports the requirement",
+        "document is relevant", "evidence is relevant",
+        "evidence supports", "document supports",
+    ])
+
+
+    has_explicit_file_reference = bool(
+        re.search(
+            r"\b[\w\-. ]+\.(pdf|md|txt|docx|csv|html|xlsx)\b",
+            query_text or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+    has_evidence_evaluation_action = any(t in q for t in [
+        # IT
+        "valuta se", "verifica se", "stima se",
+        "attinente alla", "pertinente alla", "inerente alla",
+        "supporta la domanda", "supporta il requisito",
+        "documento è attinente", "documento e attinente",
+        "evidenza è attinente", "evidenza e attinente",
+        "evidenza supporta", "documento supporta",
+
+        # EN
+        "evaluate whether", "assess whether", "verify whether",
+        "relevant to", "pertinent to",
+        "supports the question", "supports the requirement",
+        "document is relevant", "evidence is relevant",
+        "evidence supports", "document supports",
+    ])
+
     return (
         has_evidence
         and has_assessment
+        and has_explicit_file_reference
+        and has_evidence_evaluation_action
         and (
             has_relevance
             or has_gap
@@ -7871,14 +8016,13 @@ class State(rx.State):
                                 )
                             )
                                 
-                # 2. RAGGRUPPAMENTO FONTI (FIXED CON MAX_CONTEXT_CHARS)
+                # 2. RAGGRUPPAMENTO FONTI
                 c_a_list, c_b_list, c_c_list, c_g_list = [], [], [], []
-                current_context_length = 0
-                max_allowed_length = MAX_CONTEXT_CHARS # Es. 16000
 
                 for i, s in enumerate(sources, start=1):
                     tier_norm = normalize_tier_value(s.tier)
 
+                    # FIX: Usa "Source" e "Page" per allinearsi perfettamente al System Prompt
                     header = f"--- Source [{i}] — {s.filename} — Page {s.page} — ({s.type}) ---\n"
                     meta = f"(tier={tier_norm} | db={s.db_origin})\n"
                     body = (s.content or "").strip()
@@ -7887,11 +8031,6 @@ class State(rx.State):
                         continue
 
                     snippet = header + meta + body + "\n\n"
-                    
-                    # STOP SE SUPERIAMO IL LIMITE DEL PROMPT
-                    if current_context_length + len(snippet) > max_allowed_length:
-                        print(f"⚠️ Raggiunto MAX_CONTEXT_CHARS ({max_allowed_length}). Chunk {i} e successivi ignorati per LLM.")
-                        break
 
                     if tier_norm == "A":
                         c_a_list.append(snippet)
@@ -7900,18 +8039,16 @@ class State(rx.State):
                     elif tier_norm == "GRAPH":
                         c_g_list.append(snippet)
                     else:
+                        # FIX CRITICO: Qualsiasi tier non riconosciuto finisce qui. 
+                        # Nessun chunk recuperato verrà mai più perso.
                         c_c_list.append(snippet)
-                        
-                    current_context_length += len(snippet)
+
 
                 c_a = "".join(c_a_list).strip()
                 c_b = "".join(c_b_list).strip()
                 c_c = "".join(c_c_list).strip()
                 c_g = "".join(c_g_list).strip()
-                    
-                   
-                    
-                    
+
                 # ============================================================
                 # 🧮 MATHEMATICAL DISCIPLINE
                 # ============================================================
@@ -8104,7 +8241,7 @@ class State(rx.State):
                             "**D) Fonti**\n\n"
                             "- Vedi pannello Fonti/Audit."
                         )
-
+                    full_resp = normalize_answer_sections(full_resp)
                     # Non assegnare qui la risposta finale.
                     # La risposta viene post-processata una sola volta più sotto,
                     # dopo il controllo eval/quality gate.

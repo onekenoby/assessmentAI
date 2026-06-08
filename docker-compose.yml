@@ -39,7 +39,7 @@ services:
     profiles: ["finance"] # <--- 
     restart: always
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6334:6333"
     volumes:
       - ./data/finance/qdrant:/qdrant/storage
     networks:
@@ -51,8 +51,8 @@ services:
     profiles: ["finance"] # <---
     restart: always
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "127.0.0.1:7475:7474"
+      - "127.0.0.1:7687:7687"
     environment:
       NEO4J_AUTH: neo4j/admin_password
       NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
@@ -79,7 +79,7 @@ services:
       POSTGRES_PASSWORD: admin_password
       POSTGRES_DB: assessment_ingestion
     ports:
-      - "5433:5432" # Porta esterna 5433
+      - "127.0.0.1:5433:5432" # Porta esterna 5433
     volumes:
       - ./data/assessment/postgres:/var/lib/postgresql/data
     networks:
@@ -91,7 +91,7 @@ services:
     profiles: ["assessment"]
     restart: always
     ports:
-      - "6334:6333" # Porta esterna 6334
+      - "127.0.0.1:6334:6333" # Porta esterna 6334
     volumes:
       - ./data/assessment/qdrant:/qdrant/storage
     networks:
@@ -104,7 +104,7 @@ services:
     restart: always
     ports:
       - "7475:7474" # Browser su 7475
-      - "7688:7687" # Bolt su 7688
+      - "127.0.0.1:7688:7687" # Bolt su 7688
     environment:
       NEO4J_AUTH: neo4j/admin_password
       NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
@@ -132,10 +132,42 @@ services:
     volumes:
       - ./data/assessment/inbox:/config/workspace # Mappa la cartella dei documenti
     ports:
-      - "3001:3000" # Accedi via browser su http://localhost:3001
+      - "127.0.0.1:3001:3000" # Accedi via browser su http://localhost:3001
+    networks:
+      - ai_network
+
+
+  # ========================================================
+  # OLLAMA GPU - ASSESSMENT
+  # ========================================================
+
+  ollama_assessment:
+    image: ollama/ollama:latest
+    container_name: ai_ollama_assessment
+    profiles: ["assessment"]
+    restart: always
+
+    # Espone Ollama solo sulla macchina host.
+    # Da fuori: usare SSH tunnel o Vast Portal, non apertura pubblica diretta.
+    ports:
+      - "127.0.0.1:11434:11434"
+
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_FLASH_ATTENTION: "1"
+
+    volumes:
+      - ./data/assessment/ollama:/root/.ollama
+
+    gpus: all
+
     networks:
       - ai_network
 
 networks:
   ai_network:
     driver: bridge
+
+  

@@ -226,7 +226,7 @@ OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "ollama")  # dummy key, Ollama non 
 # =========================
 # 🧠 LLM / OLLAMA CONTEXT
 # =========================
-LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "16384")) #8192
+LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "8192"))
 LLM_NUM_PREDICT = int(os.getenv("LLM_NUM_PREDICT", "4096"))
 
 # =========================
@@ -304,8 +304,8 @@ GRAPH_MAX_FORMULAS = int(os.getenv("GRAPH_MAX_FORMULAS", "6"))
 GRAPH_MAX_NEIGHBOR_CHUNKS = int(os.getenv("GRAPH_MAX_NEIGHBOR_CHUNKS", "4"))
 
 # Prompt limits
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "24000"))  # 16000 - prevent prompt blow-ups
-MAX_ASSISTANT_CHARS = int(os.getenv("MAX_ASSISTANT_CHARS", "15000"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "16000"))  # prevent prompt blow-ups
+MAX_ASSISTANT_CHARS = int(os.getenv("MAX_ASSISTANT_CHARS", "12000"))
 
 AUDIT_ENABLED = True
 AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "./rag_audit.jsonl")
@@ -7871,14 +7871,13 @@ class State(rx.State):
                                 )
                             )
                                 
-                # 2. RAGGRUPPAMENTO FONTI (FIXED CON MAX_CONTEXT_CHARS)
+                # 2. RAGGRUPPAMENTO FONTI
                 c_a_list, c_b_list, c_c_list, c_g_list = [], [], [], []
-                current_context_length = 0
-                max_allowed_length = MAX_CONTEXT_CHARS # Es. 16000
 
                 for i, s in enumerate(sources, start=1):
                     tier_norm = normalize_tier_value(s.tier)
 
+                    # FIX: Usa "Source" e "Page" per allinearsi perfettamente al System Prompt
                     header = f"--- Source [{i}] — {s.filename} — Page {s.page} — ({s.type}) ---\n"
                     meta = f"(tier={tier_norm} | db={s.db_origin})\n"
                     body = (s.content or "").strip()
@@ -7887,11 +7886,6 @@ class State(rx.State):
                         continue
 
                     snippet = header + meta + body + "\n\n"
-                    
-                    # STOP SE SUPERIAMO IL LIMITE DEL PROMPT
-                    if current_context_length + len(snippet) > max_allowed_length:
-                        print(f"⚠️ Raggiunto MAX_CONTEXT_CHARS ({max_allowed_length}). Chunk {i} e successivi ignorati per LLM.")
-                        break
 
                     if tier_norm == "A":
                         c_a_list.append(snippet)
@@ -7900,18 +7894,16 @@ class State(rx.State):
                     elif tier_norm == "GRAPH":
                         c_g_list.append(snippet)
                     else:
+                        # FIX CRITICO: Qualsiasi tier non riconosciuto finisce qui. 
+                        # Nessun chunk recuperato verrà mai più perso.
                         c_c_list.append(snippet)
-                        
-                    current_context_length += len(snippet)
+
 
                 c_a = "".join(c_a_list).strip()
                 c_b = "".join(c_b_list).strip()
                 c_c = "".join(c_c_list).strip()
                 c_g = "".join(c_g_list).strip()
-                    
-                   
-                    
-                    
+
                 # ============================================================
                 # 🧮 MATHEMATICAL DISCIPLINE
                 # ============================================================
