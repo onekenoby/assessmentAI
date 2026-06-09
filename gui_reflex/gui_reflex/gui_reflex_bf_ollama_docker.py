@@ -201,7 +201,8 @@ NEO4J_ENABLED = os.getenv("NEO4J_ENABLED", "1") == "1"
 
 
 # AI Models
-LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemma3:12b")
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemma4:12b")
+#LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemma3:12b")
 VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", LLM_MODEL_NAME)
 
 # alternativa
@@ -225,7 +226,7 @@ OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "ollama")  # dummy key, Ollama non 
 # =========================
 # 🧠 LLM / OLLAMA CONTEXT
 # =========================
-LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "8192"))
+LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "16384")) #8192
 LLM_NUM_PREDICT = int(os.getenv("LLM_NUM_PREDICT", "4096"))
 
 # =========================
@@ -303,8 +304,8 @@ GRAPH_MAX_FORMULAS = int(os.getenv("GRAPH_MAX_FORMULAS", "6"))
 GRAPH_MAX_NEIGHBOR_CHUNKS = int(os.getenv("GRAPH_MAX_NEIGHBOR_CHUNKS", "4"))
 
 # Prompt limits
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "16000"))  # prevent prompt blow-ups
-MAX_ASSISTANT_CHARS = int(os.getenv("MAX_ASSISTANT_CHARS", "12000"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "24000"))  # 16000 - prevent prompt blow-ups
+MAX_ASSISTANT_CHARS = int(os.getenv("MAX_ASSISTANT_CHARS", "15000"))
 
 AUDIT_ENABLED = True
 AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "./rag_audit.jsonl")
@@ -658,6 +659,10 @@ def detect_intent(query: str) -> str:
     q_raw = query or ""
     q = q_raw.lower()
 
+    if is_assessment_evidence_relevance_query(q_raw):
+        return "audit"
+
+
     # 0. INTENT: CLASSIFICAZIONE NORMATIVA
     # Deve venire prima della formula mode.
     # Esempio generale: "chi sono i soggetti/categorie e come varia il regime..."
@@ -814,6 +819,8 @@ def is_user_data_analytics(query: str) -> bool:
     con l'intento di farli analizzare o elaborare.
     """
     q = (query or "").lower()
+    if is_assessment_evidence_relevance_query(query):
+        return True
 
     # 1. RILEVAMENTO STRUTTURE DATI (Esteso)
     # A. Liste classiche: [1.2, 3, 4] o (1, 2, 3)
@@ -879,8 +886,6 @@ def extract_search_tokens(query_text: str) -> List[str]:
         if is_acronym or is_mixed_acronym or is_useful_word:
             out.append(clean.lower())
     return list(dict.fromkeys(out))
-
-
 
 
 def is_math_query(query_text: str) -> bool:
@@ -1021,7 +1026,7 @@ def solve_control_coverage(query_text: str) -> Optional[str]:
         
         "- I valori numerici usati nel calcolo sono stati estratti dalla domanda dell'utente.\n"
         "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
-        "**C) Limiti / Conflitti**\n\n"
+        "\n\n**C) Limiti / Conflitti**\n\n"
         "- Il calcolo assume che i controlli implementati valgano al 100%.\n"
         "- Il peso dei controlli parziali è quello indicato nella domanda.\n\n"
         "**D) Fonti**\n\n"
@@ -1047,7 +1052,7 @@ def solve_risk_product(query_text: str) -> Optional[str]:
         f"Ordinamento dal rischio più critico al meno critico: **{ranking}**.\n\n"
         "\n\n**B) Evidenze**\n\n"
         f"{evidence_lines}\n\n"
-        "**C) Limiti / Conflitti**\n\n"
+        "\n\n**C) Limiti / Conflitti**\n\n"
         "- La formula `rischio = probabilità × impatto` è stata fornita dall'utente nella domanda.\n"
         "- Il risultato numerico non dimostra da solo la conformità: va collegato al risk assessment documentale.\n\n"
         "**D) Fonti**\n\n"
@@ -1287,7 +1292,7 @@ def solve_percentage_remainder_allocation(query_text: str) -> Optional[str]:
         "\n\n**B) Evidenze**\n\n"
         "- I valori numerici usati nel calcolo sono stati estratti dalla domanda dell'utente.\n"
         "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
-        "**C) Limiti / Conflitti**\n\n"
+        "\n\n**C) Limiti / Conflitti**\n\n"
         "- Il calcolo considera le percentuali come quote del totale indicato.\n"
         "- Eventuali costi indiretti, arrotondamenti contabili o imposte non sono considerati se non esplicitamente forniti.\n\n"
         "**D) Fonti**\n\n"
@@ -1386,7 +1391,7 @@ def try_solve_user_provided_algebra(query_text: str) -> Optional[str]:
             "\n\n**B) Evidenze**\n\n"
             "- Le relazioni algebriche sono state estratte dalla domanda dell'utente.\n"
             "- La derivazione è stata eseguita in modo deterministico da Python, non dal modello LLM.\n\n"
-            "**C) Limiti / Conflitti**\n\n"
+            "\n\n**C) Limiti / Conflitti**\n\n"
             f"- La semplificazione richiede che `{factor}` sia costante e positiva.\n"
             "- La relazione residua usa la stessa struttura moltiplicativa del rischio inerente, sostituendo `V` con `Vm`.\n"
             "- Il risultato è una derivazione matematica dei dati forniti, non una validazione empirica del modello di rischio.\n\n"
@@ -1479,7 +1484,7 @@ def try_solve_user_provided_algebra(query_text: str) -> Optional[str]:
             "\n\n**B) Evidenze**\n\n"
             "- La percentuale, la variabile e la soglia sono state estratte dalla domanda dell'utente.\n"
             "- La derivazione è stata eseguita in modo deterministico da Python, non dal modello LLM.\n\n"
-            "**C) Limiti / Conflitti**\n\n"
+            "\n\n**C) Limiti / Conflitti**\n\n"
             "- Il calcolo considera la soglia nella stessa unità indicata nella domanda.\n"
             "- Non interpreta ulteriori criteri normativi non presenti nella domanda.\n\n"
             "**D) Fonti**\n\n"
@@ -1555,7 +1560,7 @@ def solve_sla_cumulative_hours(query_text: str) -> Optional[str]:
         "\n\n**B) Evidenze**\n\n"
         "- I tempi massimi e il numero di incidenti sono stati estratti dalla domanda dell'utente.\n"
         "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
-        "**C) Limiti / Conflitti**\n\n"
+        "\n\n**C) Limiti / Conflitti**\n\n"
         "- Il calcolo somma i massimali per categoria.\n"
         "- Non considera sovrapposizioni operative o parallelizzazione se non esplicitamente indicate.\n\n"
         "**D) Fonti**\n\n"
@@ -1632,7 +1637,7 @@ def solve_rosi_query(query_text: str) -> Optional[str]:
         "\n\n**B) Evidenze**\n\n"
         "- Impatto, probabilità iniziale, probabilità post-misura e costo sono stati estratti dalla domanda dell'utente.\n"
         "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
-        "**C) Limiti / Conflitti**\n\n"
+        "\n\n**C) Limiti / Conflitti**\n\n"
         "- Il calcolo usa un modello annuo semplificato.\n"
         "- Non considera costi indiretti, attualizzazione o variazione temporale del rischio se non indicati nella domanda.\n\n"
         "**D) Fonti**\n\n"
@@ -2130,7 +2135,10 @@ def detect_answer_mode(query_text: str) -> str:
     o eseguire un'analisi critica/valutazione (audit).
     """
     q = (query_text or "").lower()
-    
+
+    if is_assessment_evidence_relevance_query(query_text):
+        return "evidence_relevance"
+
     audit_eval_terms = [
         # ITALIANO
         "verifica conformità", "valutazione conformità", "non conformità", "non conforme", 
@@ -2484,6 +2492,201 @@ def get_payload_tier(payload: dict) -> str:
     except Exception:
         return ""
 
+
+
+def is_assessment_evidence_relevance_query(query_text: str) -> bool:
+    """
+    Rileva richieste di valutazione attinenza/sufficienza di un documento-evidenza
+    rispetto a una domanda, requisito, controllo o item di assessment.
+
+    Non è adattativa:
+    - non contiene nomi di documenti specifici;
+    - non contiene query hard-coded;
+    - riconosce una classe generale evidence-vs-question / evidence-vs-requirement.
+    """
+    q = (query_text or "").lower().strip()
+
+    if not q:
+        return False
+
+    evidence_terms = [
+        # IT
+        "evidenza", "evidenze",
+        "prova", "prove",
+        "documento", "documenti",
+        "file", "pdf", "allegato", "allegati",
+        "upload", "caricato", "caricati", "documentazione",
+        "artefatto", "artefatti",
+        "record", "registrazione", "registrazioni",
+        "log", "screenshot", "report", "rapporto",
+        "procedura", "policy", "registro",
+
+        # EN
+        "evidence", "evidences",
+        "proof", "proofs",
+        "document", "documents",
+        "file", "pdf", "attachment", "attachments",
+        "upload", "uploaded", "documentation",
+        "artifact", "artifacts",
+        "record", "records",
+        "log", "logs", "screenshot", "report", "reports",
+        "procedure", "policy", "register",
+    ]
+
+    assessment_terms = [
+        # IT
+        "domanda", "domande",
+        "questionario", "questionari",
+        "assessment", "audit",
+        "requisito", "requisiti",
+        "controllo", "controlli",
+        "checklist", "item", "punto", "punti",
+        "criterio", "criteri",
+        "misura", "misure",
+        "obbligo", "obblighi",
+        "clausola", "clausole",
+        "capitolo", "sezione",
+
+        # EN
+        "question", "questions",
+        "questionnaire", "questionnaires",
+        "assessment", "audit",
+        "requirement", "requirements",
+        "control", "controls",
+        "checklist", "item", "items",
+        "criterion", "criteria",
+        "measure", "measures",
+        "obligation", "obligations",
+        "clause", "clauses",
+        "chapter", "section",
+    ]
+
+    relevance_terms = [
+        # IT
+        "attinente", "attinenza",
+        "inerente", "inerenza",
+        "pertinente", "pertinenza",
+        "rilevante", "rilevanza",
+        "correlato", "correlata", "correlazione",
+        "collegato", "collegata", "collegamento",
+        "coerente", "coerenza",
+        "adeguato", "adeguata", "adeguatezza",
+        "sufficiente", "sufficienza",
+        "idoneo", "idonea", "idoneità",
+        "applicabile", "applicabilità",
+        "supporta", "supportato", "supportata",
+        "dimostra", "dimostrato", "dimostrata",
+        "comprova", "comprovato", "comprovata",
+        "giustifica", "giustificato", "giustificata",
+        "copre", "copertura",
+        "risponde", "risposta",
+        "valuta", "valutare", "verifica", "verificare",
+
+        # EN
+        "relevant", "relevance",
+        "pertinent", "pertinence",
+        "related", "relation", "relationship",
+        "correlated", "correlation",
+        "linked", "link", "connection",
+        "consistent", "consistency",
+        "adequate", "adequacy",
+        "sufficient", "sufficiency",
+        "suitable", "suitability",
+        "applicable", "applicability",
+        "supports", "supported", "supporting",
+        "demonstrates", "demonstrated",
+        "proves", "proven",
+        "justifies", "justified",
+        "covers", "coverage",
+        "answers", "answer",
+        "evaluate", "assess", "verify", "check",
+    ]
+
+    gap_terms = [
+        # IT
+        "gap", "lacuna", "lacune",
+        "mancanza", "mancanze",
+        "manca", "mancano",
+        "carente", "carenti", "carenza", "carenze",
+        "debole", "debolezza", "debolezze",
+        "incompleto", "incompleta", "parziale",
+        "non sufficiente", "non adeguato", "non adeguata",
+        "non attinente", "poco attinente",
+        "scostamento", "scostamenti",
+        "non conformità", "non conforme","differenza", "differenze", "deviazione", "deviazioni",
+
+        # EN
+        "gap", "gaps",
+        "missing", "absence", "lack", "lacks",
+        "weak", "weakness", "weaknesses",
+        "deficiency", "deficiencies",
+        "incomplete", "partial",
+        "not sufficient", "insufficient",
+        "not adequate", "inadequate",
+        "not relevant", "poorly relevant",
+        "deviation", "deviations",
+        "non-compliance", "non-compliant","difference", "differences", "deviation", "deviations"
+    ]
+
+    remediation_terms = [
+        # IT
+        "remediation", "piano di remediation",
+        "piano correttivo", "azioni correttive",
+        "azione correttiva", "correzione", "correzioni",
+        "rimedio", "rimedi",
+        "miglioramento", "miglioramenti",
+        "integrazione", "integrare",
+        "raccomandazione", "raccomandazioni",
+        "cosa manca", "cosa integrare", "come migliorare",
+
+        # EN
+        "remediation", "remediation plan",
+        "corrective action", "corrective actions",
+        "correction", "corrections",
+        "remedy", "remedies",
+        "improvement", "improvements",
+        "integration", "integrate",
+        "recommendation", "recommendations",
+        "what is missing", "what to add", "how to improve",
+    ]
+
+    scoring_terms = [
+        # IT
+        "livello", "livelli",
+        "percentuale", "percentuali",
+        "score", "punteggio", "valutazione",
+        "grado", "classifica", "classificazione",
+        "basso", "medio", "alto",
+        "debole", "parziale", "forte",
+
+        # EN
+        "level", "levels",
+        "percentage", "percentages",
+        "score", "scoring", "rating",
+        "grade", "classification",
+        "low", "medium", "high",
+        "weak", "partial", "strong",
+    ]
+
+    has_evidence = any(t in q for t in evidence_terms)
+    has_assessment = any(t in q for t in assessment_terms)
+    has_relevance = any(t in q for t in relevance_terms)
+    has_gap = any(t in q for t in gap_terms)
+    has_remediation = any(t in q for t in remediation_terms)
+    has_scoring = any(t in q for t in scoring_terms)
+
+    return (
+        has_evidence
+        and has_assessment
+        and (
+            has_relevance
+            or has_gap
+            or has_remediation
+            or has_scoring
+        )
+    )
+
+
 def is_evidence_query(query: str) -> bool:
     q = (query or "").lower()
     
@@ -2598,10 +2801,6 @@ def append_audit_log(audit: AuditTrail):
             f.write(audit.model_dump_json() + "\n")
     except Exception as e:
         print(f"⚠️ Audit log write error: {e}")
-
-
-
-
 
 
 def get_graph_entities(chunk_ids: List[str]) -> Dict[str, List[GraphEntity]]:
@@ -3340,7 +3539,7 @@ def answer_glossary_terms_directly(query_text: str) -> Tuple[str, List[SourceIte
         "\n\n**B) Evidenze**\n\n"
         + "\n".join(evidence_lines)
         + "\n\n"
-        "**C) Limiti / Conflitti**\n\n"
+        "\n\n**C) Limiti / Conflitti**\n\n"
         "- Risposta generata in modalità deterministica di glossario: ogni voce è stata cercata separatamente.\n"
         "- Una voce viene dichiarata assente solo se il lookup atomico sul glossario non restituisce chunk pertinenti.\n\n"
         "**D) Fonti**\n\n"
@@ -3696,9 +3895,6 @@ def search_neo4j_formulas(query_text: str, limit: int = 20) -> List[Dict[str, An
     return out
 
 
-
-
-
 GRAPH_QUERY_NOISE_TERMS = {
     # IT generici
     "usa", "usare", "spiega", "spiegare", "collegamenti", "collegamento",
@@ -3765,37 +3961,43 @@ def filter_neo4j_relation_rows(
     limit: int,
 ) -> List[Dict[str, Any]]:
     """
-    Tiene solo relazioni Neo4j che coprono almeno due concetti rilevanti
-    della domanda.
-
-    Se la domanda contiene pochissimi concetti, accetta anche un solo match.
+    Tiene relazioni Neo4j pertinenti rispetto ai concetti richiesti.
+    Non è adattativa: usa concetti estratti dalla query e matching testuale
+    su sorgente, relazione, target, proprietà e filename.
     """
     if not rows:
         return []
 
+    concepts = extract_graph_concepts_from_query(query_text, max_concepts=12)
     tokens = graph_relevant_tokens(query_text)
 
-    if not tokens:
+    if not concepts and not tokens:
         return rows[:limit]
 
-    scored: List[Tuple[int, Dict[str, Any]]] = []
+    scored: List[Tuple[int, int, Dict[str, Any]]] = []
 
     for row in rows:
         text = _relation_row_text(row)
-        hits = {t for t in tokens if t in text}
-        hit_count = len(hits)
 
-        # Regola generale:
-        # - con 1-2 token rilevanti basta 1 hit;
-        # - con più token servono almeno 2 hit.
-        min_hits = 1 if len(tokens) <= 2 else 2
+        concept_hits = {
+            _canonical_graph_concept(c)
+            for c in concepts
+            if _concept_in_text(c, text)
+        }
 
-        if hit_count >= min_hits:
-            scored.append((hit_count, row))
+        token_hits = {t for t in tokens if t in text}
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+        # Priorità ai concetti forti; i token servono solo come supporto.
+        concept_score = len(concept_hits)
+        token_score = len(token_hits)
 
-    return [r for _, r in scored[:limit]]
+        if concept_score >= 1 or token_score >= 2:
+            scored.append((concept_score, token_score, row))
+
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    return [r for _, _, r in scored[:limit]]
+
 
 def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, Any]]:
     """Restituisce vere relazioni Entity-[:REL]->Entity dal KG, non solo chunk collegati."""
@@ -3900,8 +4102,6 @@ def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, A
         return []
 
 
-
-
 def clean_graph_relation_label(value: Any) -> str:
     """
     Pulisce il nome della relazione Neo4j prima di mostrarla in tabella.
@@ -3986,20 +4186,34 @@ def _md_cell(value: Any, max_len: int = 600) -> str:
 def _clean_graph_concept(value: str) -> str:
     """
     Pulisce un concetto testuale prima della ricerca nel grafo.
-    Supporta articoli con apostrofo e combinazioni multiple di stopwords (es. "and the").
+    Non contiene logica adattativa: normalizza punteggiatura, virgolette,
+    articoli e parole di ruolo generiche.
     """
-    text = re.sub(r"\s+", " ", value or "").strip(" \t\n\r.,;:!?()[]{}\"'“”")
-    
-    # FIX 1: Supporto per apostrofi (es. l'entità, un'azienda) e parole multiple (es. "e il ").
-    # Usando (?:...)+ la regex "mangia" in loop tutti gli articoli/congiunzioni iniziali.
-    leading_noise = r"^(?:(?:e|ed|and|or|oppure|o|il|lo|la|i|gli|le|un|una|uno|the|a|an)\s+|(?:l|un)['’])+"
+    text = re.sub(r"\s+", " ", value or "").strip()
+
+    text = text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’`")
+
+    # Rimuove prefissi descrittivi generici:
+    # es. funzione “Respond” -> Respond
+    text = re.sub(
+        r"^(?:funzione|function|concetto|concept|termine|term|voce|entity|entità)\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Rimuove articoli/congiunzioni iniziali.
+    leading_noise = (
+        r"^(?:(?:e|ed|and|or|oppure|o|il|lo|la|i|gli|le|un|una|uno|the|a|an)\s+"
+        r"|(?:l|un)['’])+"
+    )
     text = re.sub(leading_noise, "", text, flags=re.IGNORECASE)
-    
-    # FIX 2: Rimuove eventuali congiunzioni rimaste appese alla fine del concetto
-    trailing_noise = r"\s+(?:e|ed|and|or|oppure|o)$"
-    text = re.sub(trailing_noise, "", text, flags=re.IGNORECASE)
-    
-    return text.strip()
+
+    # Rimuove congiunzioni finali residue.
+    text = re.sub(r"\s+(?:e|ed|and|or|oppure|o)$", "", text, flags=re.IGNORECASE)
+
+    return text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’`")
+
 
 
 def _split_relation_segment(segment: str) -> List[str]:
@@ -4096,23 +4310,25 @@ def _graph_concept_aliases(concept: str) -> List[str]:
 
     return out
 
-
 def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) -> List[str]:
     """
-    Estrae concetti forti dalla domanda per costruire relazioni testuali.
-    Evita token singoli deboli e non crea concetti dal contenuto dei documenti.
+    Estrae concetti forti dalla domanda per query relazionali/multi-hop.
+    Non è adattativa:
+    - non contiene nomi di test;
+    - non contiene nomi di documenti;
+    - usa solo pattern linguistici generali.
     """
     q = query_text or ""
     concepts: List[str] = []
 
-
+    # 1. Termini tra virgolette dritte o curve.
     quoted = re.findall(r"[\"“”'‘’]([^\"“”'‘’]+)[\"“”'‘’]", q)
     for item in quoted:
         clean = _clean_graph_concept(item)
-        if len(clean) >= 3:
+        if len(clean) >= 2:
             concepts.append(clean)
 
-
+    # 2. Segmenti dopo tra/fra/between/among.
     relation_segment_patterns = [
         r"\b(?:tra|fra)\s+(.+?)(?:[\.?]|$)",
         r"\bbetween\s+(.+?)(?:[\.?]|$)",
@@ -4123,44 +4339,40 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
         for m in re.finditer(pat, q, flags=re.IGNORECASE):
             concepts.extend(_split_relation_segment(m.group(1)))
 
-    generic_phrases = {
-        "assessment", "audit", "evidence", "evidenza", "evidenze",
-        "document", "documents", "documento", "documenti",
-        "source", "sources", "fonte", "fonti", "glossario", "glossary",
-        "compliance", "conformità", "controllo", "controlli", "control", "controls",
-        "requirement", "requirements", "requisito", "requisiti",
-        "metric", "metrics", "metrica", "metriche",
-    }
+    # 3. Segmenti multi-hop: "da X a Y passando per A, B, C".
+    from_to = re.search(
+        r"\b(?:da|from)\s+(.+?)\s+(?:a|to)\s+(.+?)(?:,|\s+passando\s+per|\s+through|\s+via|\.|\?|$)",
+        q,
+        flags=re.IGNORECASE,
+    )
 
+    if from_to:
+        concepts.append(_clean_graph_concept(from_to.group(1)))
+        concepts.append(_clean_graph_concept(from_to.group(2)))
 
+    via = re.search(
+        r"\b(?:passando\s+per|through|via)\s+(.+?)(?:[\.?]|$)",
+        q,
+        flags=re.IGNORECASE,
+    )
 
-    # Stopwords bilingui per evitare l'estrazione di "rumore" nel grafo
-    ignore_terms = {
-        "documento", "fonti", "fonte", "valutazione", "assessment", "audit", "entità", "relazione", "nodo", "grafo", "sistema", # IT
-        "document", "source", "sources", "entity", "entities", "relation", "relationship", "node", "graph", "system", "framework" # EN
-    }
+    if via:
+        concepts.extend(_split_relation_segment(via.group(1)))
 
-    # 1. Termini espliciti tra virgolette (priorità massima)
-    quoted = re.findall(r'["“”\']([^"“”\']+)["“”\']', q)
-    concepts.extend([_clean_graph_concept(x) for x in quoted if len(_clean_graph_concept(x)) >= 3])
-
-    # 2. Acronimi in maiuscolo (Agnostico rispetto alla lingua)
-    acronyms = re.findall(r"\b[A-Z][A-Z0-9]{1,9}\b", q)
+    # 4. Acronomi composti o semplici: GDPR, NIS2, CSIRT, CID, ACN-ZK.
+    acronyms = re.findall(r"\b[A-Z]{2,10}(?:[-_/][A-Z0-9]{1,10})?\b", q)
     concepts.extend(acronyms)
 
-    # 3. Frasi esatte note
+    # 5. Frasi esatte già recuperabili dal sistema.
     for p in extract_exact_phrases(q):
         clean = _clean_graph_concept(p)
-        if clean and clean.lower() not in ignore_terms:
+        if clean:
             concepts.append(clean)
 
-    acronyms = re.findall(r"\b[A-Z][A-Z0-9]{1,9}\b", q)
-    concepts.extend(acronyms)
-
-    # Fallback solo quando non ci sono concetti forti.
+    # 6. Fallback token solo se non ci sono concetti forti.
     if not concepts:
         for t in graph_relevant_tokens(q):
-            if len(t) >= 5:
+            if len(t) >= 4:
                 concepts.append(t)
 
     weak_single_terms = {
@@ -4170,6 +4382,7 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
         "autenticazione", "authentication",
         "rischio", "risk", "utente", "user", "identity", "identità",
         "documenti", "documents", "normativi", "normative",
+        "funzione", "function", "processo", "process",
     }
 
     cleaned: List[str] = []
@@ -4182,37 +4395,23 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
 
         cl = clean.lower()
         word_count = len(re.findall(r"[A-Za-zÀ-ÿ0-9]+", clean))
-        is_acronym = clean.upper() == clean and 2 <= len(clean) <= 10
+        is_acronym = bool(re.fullmatch(r"[A-Z]{2,10}(?:[-_/][A-Z0-9]{1,10})?", clean))
 
         if not is_acronym and word_count == 1 and cl in weak_single_terms:
             continue
 
         canonical = _canonical_graph_concept(clean)
+
         if canonical in seen_canonical:
             continue
 
         seen_canonical.add(canonical)
         cleaned.append(clean)
 
-    final: List[str] = []
-    lowered = [c.lower() for c in cleaned]
-
-    for c in cleaned:
-        cl = c.lower()
-        word_count = len(re.findall(r"[A-Za-zÀ-ÿ0-9]+", c))
-        is_acronym = c.upper() == c and 2 <= len(c) <= 10
-
-        if not is_acronym and word_count == 1:
-            if any(cl != other and cl in other and len(other.split()) > 1 for other in lowered):
-                continue
-
-        final.append(c)
-
-        if len(final) >= max_concepts:
+        if len(cleaned) >= max_concepts:
             break
 
-    return final
-
+    return cleaned
 
 def _concept_in_text(concept: str, text_l: str) -> bool:
     """Verifica presenza del concetto usando alias IT/EN e boundary per acronimi/parole singole."""
@@ -4617,8 +4816,16 @@ def answer_graph_relations_strict(
         "- Ogni riga distingue tra arco esplicito Neo4j, supporto testuale o relazione non trovata.",
     ]
 
+    has_explicit = any(
+        str(r.get("status", "")).strip().lower() == "esplicita nel grafo"
+        for r in rows
+    )
+    
     if has_explicit:
         evidence_notes.append("- Sono presenti relazioni esplicite recuperate dal Knowledge Graph.")
+    else:
+        evidence_notes.append("- Non sono stati recuperati archi Neo4j espliciti pertinenti; le relazioni riportate sono testuali o non trovate.")
+         
     if has_textual:
         evidence_notes.append("- Alcune relazioni sono supportate testualmente ma non risultano esplicite come archi Neo4j.")
     if has_not_found:
@@ -4648,24 +4855,13 @@ def answer_graph_relations_strict(
             or "grafo" in str(r.get("status", "")).lower()
         ]
 
-        if len(explicit_graph_rows) < 2:
-            limits.append(
-                "- La richiesta è multi-hop, ma non sono stati recuperati abbastanza archi Neo4j espliciti per ricostruire una catena completa. "
-                "La risposta riporta solo collegamenti testuali o assenze."
-            )
+        msg = (
+            "- La richiesta è multi-hop, ma non sono stati recuperati abbastanza archi Neo4j espliciti "
+            "per ricostruire una catena completa. La risposta riporta solo collegamenti testuali o assenze."
+        )
 
-    if is_multihop_request:
-        explicit_graph_rows = [
-            r for r in rows
-            if "esplicita" in str(r.get("status", "")).lower()
-            or "grafo" in str(r.get("status", "")).lower()
-        ]
-
-        if len(explicit_graph_rows) < 2:
-            limits.append(
-                "- La richiesta è multi-hop, ma non sono stati recuperati abbastanza archi Neo4j espliciti per ricostruire una catena completa. "
-                "La risposta riporta solo collegamenti testuali o assenze."
-            )
+        if len(explicit_graph_rows) < 2 and msg not in limits:
+            limits.append(msg)
 
     return (
         "**A) Risposta**\n\n"
@@ -4674,186 +4870,11 @@ def answer_graph_relations_strict(
         "\n\n**B) Evidenze**\n\n"
         + "\n".join(evidence_notes)
         + "\n\n"
-        "**C) Limiti / Conflitti**\n\n"
+        "\n\n**C) Limiti / Conflitti**\n\n"
         + "\n".join(limits)
         + "\n\n"
         "**D) Fonti**\n\n"
         + sources_text
-    )
-
-
-    # 2. Relazioni testuali: cerca coppie di concetti richiesti presenti nello stesso chunk.
-    def source_supports_pair(s: SourceItem, a: str, b: str) -> Tuple[bool, str, str, str]:
-        content = s.content or ""
-        text_l = content.lower()
-
-        if not (_concept_in_text(a, text_l) and _concept_in_text(b, text_l)):
-            return False, "", "", ""
-
-        alias_a = _best_alias_for_text(a, text_l)
-        alias_b = _best_alias_for_text(b, text_l)
-        snippet, evidence_level = _evidence_snippet_for_pair(content, alias_a, alias_b)
-
-        if evidence_level == "non_supportata":
-            return False, "", "", ""
-
-        return True, alias_a, alias_b, snippet
-
-    doc_row_count: Dict[Tuple[str, int], int] = {}
-
-    if len(rows) < max_rows and len(concepts) >= 2:
-        pairs: List[Tuple[str, str]] = []
-
-        for i in range(len(concepts)):
-            for j in range(i + 1, len(concepts)):
-                a = concepts[i]
-                b = concepts[j]
-                if _canonical_graph_concept(a) == _canonical_graph_concept(b):
-                    continue
-                pairs.append((a, b))
-
-        for a, b in pairs:
-            if len(rows) >= max_rows:
-                break
-
-            best_match: Optional[Tuple[float, SourceItem, str, str, str]] = None
-
-            for s in sources:
-                if normalize_tier_value(s.tier) == "GRAPH":
-                    continue
-
-                ok, alias_a, alias_b, snippet = source_supports_pair(s, a, b)
-                if not ok:
-                    continue
-
-                score = float(s.score or 0.0)
-                candidate = (score, s, alias_a, alias_b, snippet)
-
-                if best_match is None or candidate[0] > best_match[0]:
-                    best_match = candidate
-
-            if not best_match:
-                unsupported_rows.append({
-                    "source": a,
-                    "relation": "collegamento richiesto",
-                    "target": b,
-                    "filename": "N/D",
-                    "page": 0,
-                    "evidence": "Relazione non trovata nello stesso chunk recuperato.",
-                    "status": "non supportata dalle fonti recuperate come relazione diretta",
-                })
-                continue
-
-            _, s, alias_a, alias_b, snippet = best_match
-            doc_key = (s.filename, int(s.page or 0))
-
-            if doc_row_count.get(doc_key, 0) >= 3:
-                continue
-
-            doc_row_count[doc_key] = doc_row_count.get(doc_key, 0) + 1
-
-            add_row({
-                "source": a,
-                "relation": "collegamento testuale",
-                "target": b,
-                "filename": s.filename,
-                "page": int(s.page or 0),
-                "evidence": snippet,
-                "status": "supporto testuale forte, non esplicita come arco",
-            })
-
-    # 3. Fallback deterministico: evita LLM e timeout anche se non ci sono relazioni forti.
-    if not rows and unsupported_rows:
-        rows = unsupported_rows[:max_rows]
-
-    if not rows:
-        rows = [{
-            "source": "Concetti relazionali",
-            "relation": "non determinabile",
-            "target": "Fonti recuperate",
-            "filename": "N/D",
-            "page": 0,
-            "evidence": "Non sono state trovate relazioni esplicite o co-occorrenze testuali sufficienti nei chunk recuperati.",
-            "status": "non supportata dalle fonti recuperate",
-        }]
-
-    table = [
-        "| Entità sorgente | Relazione | Entità target | Documento | Pagina | Evidenza | Stato |",
-        "|---|---|---|---|---:|---|---|",
-    ]
-
-    for r in rows[:max_rows]:
-        table.append(
-            "| "
-            + _md_cell(r.get("source"))
-            + " | "
-            + _md_cell(r.get("relation"))
-            + " | "
-            + _md_cell(r.get("target"))
-            + " | "
-            + _md_cell(r.get("filename"))
-            + " | "
-            + _md_cell(r.get("page"))
-            + " | "
-            + _md_cell(r.get("evidence"), 320)
-            + " | "
-            + _md_cell(r.get("status"))
-            + " |"
-        )
-
-    used_files = sorted({
-        str(r.get("filename") or "").strip()
-        for r in rows
-        if str(r.get("filename") or "").strip() and str(r.get("filename") or "").strip() != "N/D"
-    })
-
-    has_graph_rows = any(r.get("status") == "esplicita nel grafo" for r in rows)
-    has_text_rows = any("testualmente" in str(r.get("status", "")) for r in rows)
-    has_unsupported = any("non supportata" in str(r.get("status", "")) for r in rows)
-
-    limits: List[str] = []
-
-    if has_text_rows:
-        limits.append(
-            "- Alcune relazioni sono supportate testualmente dai chunk recuperati, "
-            "ma non risultano esplicitate come archi Neo4j."
-        )
-
-    if not has_graph_rows:
-        limits.append(
-            "- Non sono state trovate relazioni Neo4j sufficientemente pertinenti; "
-            "la tabella usa supporto testuale oppure dichiara l'assenza di supporto diretto."
-        )
-
-    if has_unsupported:
-        limits.append(
-            "- Le righe marcate come non supportate indicano collegamenti richiesti dalla domanda "
-            "ma non dimostrati direttamente dalle fonti recuperate."
-        )
-
-    if not limits:
-        limits.extend([
-            "- Le relazioni elencate sono riportate solo se pertinenti alle entità richieste nella domanda.",
-            "- Eventuali archi Neo4j recuperati ma non pertinenti alla domanda non devono essere usati come evidenza principale.",
-            "- Se il grafo non contiene archi pertinenti, la risposta distingue supporto testuale, inferenza e relazione non trovata.",
-        ])
-
-
-    return (
-        "**A) Risposta**\n\n"
-        + "\n".join(table)
-        + "\n\n"
-        "\n\n**B) Evidenze**\n\n"
-        "- La tabella deve includere solo relazioni pertinenti alle entità richieste nella domanda.\n\n"
-        "- Una relazione esplicita nel grafo è pertinente solo se collega direttamente due entità richieste, oppure se collega una entità richiesta a un nodo intermedio necessario per la catena richiesta.\n\n"
-        "- Relazioni esplicite ma fuori target non devono essere presentate come risposta principale.\n\n"
-        "- Se non sono presenti archi Neo4j pertinenti, dichiarare: \"Nessun arco Neo4j esplicito pertinente recuperato\", e usare solo supporto testuale o inferenze marcate come tali.\n\n"
-        "- Ogni riga deve distinguere tra: arco esplicito Neo4j, supporto testuale, inferenza, non trovato.\n\n"
-        "**C) Limiti / Conflitti**\n\n"
-        + "\n".join(limits)
-        + "\n\n"
-        "**D) Fonti**\n\n"
-        + ("\n".join(f"- {f}" for f in used_files) if used_files else "- Nessuna fonte documentale diretta utilizzabile.")
     )
 
 
@@ -4880,20 +4901,32 @@ def normalize_doc_name(value: str) -> str:
 
 def extract_requested_document(query_text: str) -> str:
     """
-    Estrae il documento richiesto dalla query in modo sicuro.
-    Evita falsi positivi come "il documento consiglia...".
+    Estrae il documento richiesto dalla query in modo robusto.
+    Supporta:
+    - virgolette dritte: "file.pdf"
+    - virgolette curve: “file.pdf”
+    - apici: 'file.pdf'
+    - filename libero nel testo: file.pdf
     """
     q = query_text or ""
 
+    q = (
+        q.replace("“", '"')
+         .replace("”", '"')
+         .replace("‘", "'")
+         .replace("’", "'")
+    )
+
+    # 1. Documento/file/pdf seguito da nome tra virgolette
     patterns = [
-        # 1. Nome tra virgolette o apici: nel documento "Trading_Tesi"
-        r'\b(?:nel|nella|dal|dalla\s+)?(?:documento|file|pdf)\s+["\']([^"\']+)["\']',
-        
-        # 2. Nome con estensione esplicita: file report.pdf
-        r'\b(?:nel|nella|dal|dalla\s+)?(?:documento|file|pdf)\s+([A-Za-z0-9_\-\.]+\.(?:pdf|md|txt|docx|csv|html))\b',
-        
-        # 3. Nome tecnico con underscore o trattini: documento TRADING_ALGORITMICO
-        r'\b(?:nel|nella|dal|dalla\s+)?(?:documento|file|pdf)\s+([A-Za-z0-9]+[_\-][A-Za-z0-9_\-\.]+)\b',
+        r'\b(?:documento|file|pdf)\s+["\']([^"\']+\.(?:pdf|md|txt|docx|csv|html))["\']',
+        r'\b(?:nel|nella|dal|dalla)\s+(?:documento|file|pdf)\s+["\']([^"\']+\.(?:pdf|md|txt|docx|csv|html))["\']',
+
+        # 2. Documento/file/pdf seguito da filename non quotato
+        r'\b(?:documento|file|pdf)\s+([A-Za-z0-9_\-\s\.]+\.(?:pdf|md|txt|docx|csv|html))\b',
+
+        # 3. Qualunque filename esplicito nel testo
+        r'\b([A-Za-z0-9_\-]+(?:\s+[A-Za-z0-9_\-]+)*\.(?:pdf|md|txt|docx|csv|html))\b',
     ]
 
     for pattern in patterns:
@@ -6429,8 +6462,6 @@ def ui_safe_float(value, default: float = 0.0) -> float:
         return default
 
 
-
-
 def _short_content_hash(text: str, n: int = 900) -> str:
     """
     Hash breve del contenuto per deduplicare fonti quasi identiche.
@@ -6705,10 +6736,6 @@ def normalize_sources_for_modal(raw_sources) -> List[SourceItem]:
     return prepare_sources_for_ui(normalized)
 
 
-
-
-
-
 # ============================================================
 # ✅ v4.4 MINIMAL NON-ADAPTIVE FIXES
 # - formula classifier / cleaner
@@ -6923,7 +6950,7 @@ def try_solve_date_offsets(query_text: str) -> Optional[str]:
         "\n\n**B) Evidenze**\n\n"
         "- Il giorno, l'orario iniziale e gli offset in ore sono stati estratti dalla domanda dell'utente.\n"
         "- Il calcolo è stato eseguito in modo deterministico da Python, non dal modello LLM.\n\n"
-        "**C) Limiti / Conflitti**\n\n"
+        "\n\n**C) Limiti / Conflitti**\n\n"
         "- Il calcolo considera gli offset come ore solari continue.\n"
         "- Non considera festività, sospensioni operative o calendari lavorativi se non indicati nella domanda.\n\n"
         "**D) Fonti**\n\n"
@@ -7053,7 +7080,7 @@ def _repair_missing_abcd_headers(answer: str) -> str:
             "Risposta non disponibile.\n\n"
             "\n\n**B) Evidenze**\n\n"
             "- Nessuna evidenza disponibile.\n\n"
-            "**C) Limiti / Conflitti**\n\n"
+            "\n\n**C) Limiti / Conflitti**\n\n"
             "- Risposta vuota o non generata.\n\n"
             "**D) Fonti**\n\n"
             "- Nessuna fonte disponibile."
@@ -7061,7 +7088,7 @@ def _repair_missing_abcd_headers(answer: str) -> str:
 
     if _has_required_abcd_headers(text):
         text = re.sub(r"(?im)^\s*(?:\*\*)?\s*A\s*[\)\.\-:]\s*Risposta(?:\*\*)?\s*$", "**A) Risposta**", text)
-        text = re.sub(r"(?im)^\s*(?:\*\*)?\s*B\s*[\)\.\-:]\s*Evidenze(?:\*\*)?\s*$", "**B) Evidenze**", text)
+        text = re.sub(r"(?im)^\s*(?:\*\*)?\s*B\s*[\)\.\-:]\s*Evidenze(?:\*\*)?\s*$", "\n\n**B) Evidenze**", text)
         text = re.sub(r"(?im)^\s*(?:\*\*)?\s*C\s*[\)\.\-:]\s*(?:Limiti\s*/\s*Conflitti|Limiti|Conflitti)(?:\*\*)?\s*$", "**C) Limiti / Conflitti**", text)
         text = re.sub(r"(?im)^\s*(?:\*\*)?\s*D\s*[\)\.\-:]\s*Fonti(?:\*\*)?\s*$", "**D) Fonti**", text)
         return text
@@ -7071,7 +7098,7 @@ def _repair_missing_abcd_headers(answer: str) -> str:
         + text
         + "\n\n**B) Evidenze**\n\n"
         "- Vedi fonti recuperate nel pannello Fonti/Audit.\n\n"
-        "**C) Limiti / Conflitti**\n\n"
+        "\n\n**C) Limiti / Conflitti**\n\n"
         "- La struttura della risposta è stata normalizzata automaticamente.\n\n"
         "**D) Fonti**\n\n"
         "- Vedi pannello Fonti/Audit."
@@ -7435,12 +7462,24 @@ class State(rx.State):
             await asyncio.sleep(0.1) 
             # -----------------------------------------------
 
-            intent = detect_intent(user_query)
-            math_answer = try_solve_math_query(user_query)
-            math_needs_context = bool(math_answer and needs_math_document_context(user_query))
-            analytics_mode = is_user_data_analytics(user_query) and not math_answer
+            is_evidence_relevance = is_assessment_evidence_relevance_query(user_query)
 
+            intent = "audit" if is_evidence_relevance else detect_intent(user_query)
 
+            math_answer = None if is_evidence_relevance else try_solve_math_query(user_query)
+
+            math_needs_context = bool(
+                math_answer
+                and needs_math_document_context(user_query)
+                and not is_evidence_relevance
+            )
+
+            analytics_mode = (
+                is_user_data_analytics(user_query)
+                and not math_answer
+                and not is_evidence_relevance
+            )
+            
             # tmp code added in v4.3 to debug routing issues in the test battery, to be removed in future versions
             print("========== ROUTING DEBUG ==========")
             print("QUERY:", user_query)
@@ -7478,10 +7517,6 @@ class State(rx.State):
                 self.is_processing = False
                 yield rx.scroll_to("chat_bottom")
                 return
-
-
-
-
 
 
             pure_glossary_trigger = any(t in user_query.lower() for t in [
@@ -7577,7 +7612,15 @@ class State(rx.State):
                 # Usa memoria documento solo per follow-up reali, per evitare contaminazioni nella batteria test.
                 retrieval_query = user_query
 
-                if math_needs_context:
+                if is_assessment_evidence_relevance_query(user_query):
+                    retrieval_query = (
+                        user_query
+                        + "\n evidence relevance assessment question requirement control "
+                        + "attinenza evidenza domanda questionario requisito controllo "
+                        + "gap remediation corrective action sufficiency adequacy"
+                    )
+
+                elif math_needs_context:
                     retrieval_query = (
                         user_query
                         + "\n risk assessment evidence assessment valutazione del rischio controlli evidenze assessment integrato"
@@ -7597,7 +7640,7 @@ class State(rx.State):
                                 "Non ho trovato evidenze sufficienti nei documenti recuperati.\n\n"
                                 "\n\n**B) Evidenze**\n\n"
                                 "- Nessuna fonte pertinente recuperata per il documento richiesto.\n\n"
-                                "**C) Limiti / Conflitti**\n\n"
+                                "\n\n**C) Limiti / Conflitti**\n\n"
                                 "- Il sistema non deve usare formule provenienti da altri documenti.\n\n"
                                 "**D) Fonti**\n\n"
                                 "- Nessuna fonte utilizzabile."
@@ -7828,13 +7871,14 @@ class State(rx.State):
                                 )
                             )
                                 
-                # 2. RAGGRUPPAMENTO FONTI
+                # 2. RAGGRUPPAMENTO FONTI (FIXED CON MAX_CONTEXT_CHARS)
                 c_a_list, c_b_list, c_c_list, c_g_list = [], [], [], []
+                current_context_length = 0
+                max_allowed_length = MAX_CONTEXT_CHARS # Es. 16000
 
                 for i, s in enumerate(sources, start=1):
                     tier_norm = normalize_tier_value(s.tier)
 
-                    # FIX: Usa "Source" e "Page" per allinearsi perfettamente al System Prompt
                     header = f"--- Source [{i}] — {s.filename} — Page {s.page} — ({s.type}) ---\n"
                     meta = f"(tier={tier_norm} | db={s.db_origin})\n"
                     body = (s.content or "").strip()
@@ -7843,6 +7887,11 @@ class State(rx.State):
                         continue
 
                     snippet = header + meta + body + "\n\n"
+                    
+                    # STOP SE SUPERIAMO IL LIMITE DEL PROMPT
+                    if current_context_length + len(snippet) > max_allowed_length:
+                        print(f"⚠️ Raggiunto MAX_CONTEXT_CHARS ({max_allowed_length}). Chunk {i} e successivi ignorati per LLM.")
+                        break
 
                     if tier_norm == "A":
                         c_a_list.append(snippet)
@@ -7851,16 +7900,18 @@ class State(rx.State):
                     elif tier_norm == "GRAPH":
                         c_g_list.append(snippet)
                     else:
-                        # FIX CRITICO: Qualsiasi tier non riconosciuto finisce qui. 
-                        # Nessun chunk recuperato verrà mai più perso.
                         c_c_list.append(snippet)
-
+                        
+                    current_context_length += len(snippet)
 
                 c_a = "".join(c_a_list).strip()
                 c_b = "".join(c_b_list).strip()
                 c_c = "".join(c_c_list).strip()
                 c_g = "".join(c_g_list).strip()
-
+                    
+                   
+                    
+                    
                 # ============================================================
                 # 🧮 MATHEMATICAL DISCIPLINE
                 # ============================================================
@@ -7880,9 +7931,6 @@ class State(rx.State):
 
                 if math_injection:
                     system_instructions += math_injection
-
-
-
 
 
                 # 3. PROMPT DI SISTEMA
@@ -7934,9 +7982,58 @@ class State(rx.State):
                         "Use retrieved documents only to explain the assessment/risk/evidence context.\n\n"
                     )
 
+
+                evidence_relevance_block = ""
+
+                if answer_mode == "evidence_relevance":
+                    evidence_relevance_block = """
+                ### EVIDENCE RELEVANCE MODE ###
+                The user is asking whether a specific uploaded evidence document is relevant to an assessment questionnaire question.
+
+                You MUST evaluate ONLY the retrieved evidence document if a requested document scope is present.
+
+                Return the answer using this structure inside the standard four sections:
+
+                In **A) Risposta**, include:
+                - Livello di attinenza: 0 / 1 / 2 / 3
+                - Percentuale stimata: 0-100%
+                - Esito sintetico:
+                - 0 = Non attinente
+                - 1 = Debolmente attinente
+                - 2 = Parzialmente attinente
+                - 3 = Fortemente attinente
+
+                Scoring criteria:
+                - 3 / 76-100%: the evidence directly answers the assessment question.
+                - 2 / 51-75%: the evidence partially supports the question but misses relevant elements.
+                - 1 / 26-50%: the evidence is only indirectly related.
+                - 0 / 0-25%: the evidence does not support the question.
+
+                In **B) Evidenze**, cite only retrieved chunks from the requested document:
+                - filename
+                - page
+                - short supporting excerpt
+
+                In **C) Limiti / Conflitti**, list:
+                - missing evidence
+                - weak points
+                - assumptions
+                - whether the document is too generic
+
+                In **D) Fonti**, list only retrieved filenames.
+
+                If relevance is 0, 1, or 2, include a short remediation plan in section C.
+                Do NOT invent evidence.
+                Do NOT use documents outside the requested document scope.
+                Do NOT claim the evidence is sufficient if the retrieved text does not explicitly support the assessment question.
+                """
+
+
+
                 final_user_content = (
                     doc_scope_block
-                    + f"### ANSWER MODE ###\n{answer_mode}\n"
+                    + f"### ANSWER MODE ###\n{answer_mode}\n"  
+                    + evidence_relevance_block            
                     + "If mode is knowledge, section C MUST NOT mention missing Tier B or Tier C unless explicitly requested.\n\n"
                     + f"### STRICT_CHECKLIST_MODE ###\n{'ON' if strict_checklist_mode else 'OFF'}\n\n"
                     + f"### GRAPH_RELATION_MODE ###\n{'ON' if graph_relation_mode else 'OFF'}\n\n"
@@ -7948,7 +8045,7 @@ class State(rx.State):
                     + f"### USER QUESTION ###\n{user_query}\n"
                     + f"{language_reminder}\n\n"
                     + "CRITICAL REMINDER: You MUST output EXACTLY these four headers and nothing else: "
-                    + "**A) Risposta**, **B) Evidenze**, **C) Limiti / Conflitti**, **D) Fonti**."
+                    + "**A) Risposta**, \n\n**B) Evidenze**, **C) Limiti / Conflitti**, **D) Fonti**."
                 )
             
             # --- COSTRUZIONE PAYLOAD CHAT ---
@@ -8002,7 +8099,7 @@ class State(rx.State):
                             "Il modello non ha restituito contenuto utile.\n\n"
                             "\n\n**B) Evidenze**\n\n"
                             "- Il retrieval ha prodotto fonti, ma la generazione LLM è risultata vuota.\n\n"
-                            "**C) Limiti / Conflitti**\n\n"
+                            "\n\n**C) Limiti / Conflitti**\n\n"
                             "- Verificare modello Ollama, timeout e dimensione del contesto.\n\n"
                             "**D) Fonti**\n\n"
                             "- Vedi pannello Fonti/Audit."
@@ -8021,7 +8118,7 @@ class State(rx.State):
                         "La generazione della risposta è andata in timeout o ha prodotto un errore.\n\n"
                         "\n\n**B) Evidenze**\n\n"
                         "- Il retrieval è stato completato, ma la chiamata al modello LLM non ha risposto correttamente.\n\n"
-                        "**C) Limiti / Conflitti**\n\n"
+                        "\n\n**C) Limiti / Conflitti**\n\n"
                         f"- Errore tecnico: `{str(e)}`\n"
                         "- Riduci temporaneamente `LLM_NUM_CTX`, `LLM_NUM_PREDICT` e `MAX_CONTEXT_CHARS`.\n\n"
                         "**D) Fonti**\n\n"
@@ -8075,7 +8172,7 @@ class State(rx.State):
                             "Non ho trovato evidenze sufficienti nei documenti recuperati.\n\n"
                             "\n\n**B) Evidenze**\n\n"
                             "- La risposta generata non ha superato il controllo automatico di faithfulness.\n\n"
-                            "**C) Limiti / Conflitti**\n\n"
+                            "\n\n**C) Limiti / Conflitti**\n\n"
                             f"- Faithfulness: {eval_result.faithfulness:.2f}\n"
                             f"- Answer relevance: {eval_result.answer_relevance:.2f}\n"
                             f"- Source scope violation: {eval_result.source_scope_violation}\n\n"
@@ -8602,8 +8699,6 @@ def index():
     )
 
 
-
-
 #app = rx.App(theme=rx.theme(appearance="light", accent_color="indigo", radius="large"))
 #app.add_page(index, on_load=State.on_load)
 
@@ -8981,34 +9076,81 @@ def _threshold_rules_table(title: str, rows: List[Dict[str, Any]]) -> str:
         )
     return "\n".join(lines)
 
-
 def expand_assessment_query(query_text: str) -> str:
-    """v4.12 override: preserve current expansion and add threshold aliases when relevant."""
-    expanded = _ORIGINAL_expand_assessment_query_v412(query_text)
-    aliases = _threshold_metric_aliases_v412(query_text)
+    """
+    Versione finale senza alias _ORIGINAL_*.
+
+    Integra in modo esplicito:
+    - comportamento base: nessuna espansione hardcoded, query originale normalizzata;
+    - richiamo semantico v4.10 per metriche temporali MTTD/MTTR;
+    - richiamo semantico v4.12 per soglie/obblighi di notifica quando la query è formula/metric-oriented.
+    """
+    expanded = (query_text or "").strip()
+
+    aliases: List[str] = []
+    try:
+        aliases.extend(_temporal_metric_aliases_v410(query_text))
+    except Exception:
+        pass
+
+    try:
+        aliases.extend(_threshold_metric_aliases_v412(query_text))
+    except Exception:
+        pass
+
     if not aliases:
         return expanded
-    return (expanded + "\n" + " ".join(aliases)).strip()
 
+    seen = set()
+    clean_aliases: List[str] = []
+    for alias in aliases:
+        clean = str(alias or "").strip()
+        key = clean.lower()
+        if clean and key not in seen:
+            seen.add(key)
+            clean_aliases.append(clean)
+
+    return (expanded + "\n" + " ".join(clean_aliases)).strip()
 
 def extract_exact_phrases(query_text: str) -> List[str]:
-    """v4.12 override: exact phrase search also receives threshold aliases when relevant."""
-    phrases = list(_ORIGINAL_extract_exact_phrases_v412(query_text) or [])
-    phrases.extend(_threshold_metric_aliases_v412(query_text))
+    """
+    Versione finale senza alias _ORIGINAL_*.
+
+    Estrae:
+    - frasi tra virgolette;
+    - acronimi maiuscoli;
+    - alias metrici temporali v4.10;
+    - alias soglie/notifiche v4.12.
+    """
+    q = query_text or ""
+    phrases: List[str] = []
+
+    quoted = re.findall(r"[\"“']([^\"”']+)[\"”']", q)
+    phrases.extend([x.strip().lower() for x in quoted if len(x.strip()) > 2])
+
+    acronyms = re.findall(r"\b[A-Z]{2,8}\b", q)
+    phrases.extend([x.lower() for x in acronyms])
+
+    try:
+        phrases.extend(_temporal_metric_aliases_v410(query_text))
+    except Exception:
+        pass
+
+    try:
+        phrases.extend(_threshold_metric_aliases_v412(query_text))
+    except Exception:
+        pass
 
     out: List[str] = []
     seen = set()
     for p in phrases:
-        clean = str(p or "").strip().lower()
-        if clean and clean not in seen:
-            seen.add(clean)
-            out.append(str(p).strip())
+        clean = str(p or "").strip()
+        key = clean.lower()
+        if clean and key not in seen:
+            seen.add(key)
+            out.append(clean)
+
     return out
-
-
-
-
-
 
 def _is_formula_metric_intent_v410(query_text: str) -> bool:
     """True only when the query is about formulas/metrics/scoring/calculation."""
@@ -9067,26 +9209,52 @@ def _temporal_metric_aliases_v410(query_text: str) -> List[str]:
             out.append(a)
     return out
 
-
 def _requested_formula_terms_missing(query_text: str, rows: List[Dict[str, Any]]) -> List[str]:
     """
-    v4.10 override:
-    keep previous missing-term logic and also report generic severity/severità
-    when explicitly requested and no computational formula is recovered.
+    Versione finale senza alias _ORIGINAL_*.
+
+    Integra:
+    - logica base per termini generici richiesti ma non recuperati;
+    - estensione v4.10 per severity/severità e MTTD/MTTR.
     """
-    missing = list(_ORIGINAL_requested_formula_terms_missing_v410(query_text, rows) or [])
     ql = (query_text or "").lower()
-    found_text = " ".join([str(r.get("name", "")) + " " + str(r.get("latex", "")) + " " + str(r.get("meaning", "")) for r in rows]).lower()
+    found_text = " ".join([
+        str(r.get("name", "")) + " " +
+        str(r.get("latex", "")) + " " +
+        str(r.get("meaning", ""))
+        for r in rows or []
+    ]).lower()
+
+    requested_generic = [
+        "cvss", "rischio", "risk", "maturità", "maturity", "copertura", "coverage"
+    ]
+
+    missing: List[str] = []
+
+    for term in requested_generic:
+        if term in ql and term not in found_text:
+            missing.append(term)
 
     for term in ["severity", "severità"]:
         if term in ql and term not in found_text:
             missing.append(term)
 
-    # If temporal metric aliases were requested but still not recovered, make the limitation explicit.
-    temporal_aliases = _temporal_metric_aliases_v410(query_text)
+    try:
+        temporal_aliases = _temporal_metric_aliases_v410(query_text)
+    except Exception:
+        temporal_aliases = []
+
     if temporal_aliases:
-        wants_detection = any(a.lower() in {"mttd", "mean time to detect"} or "rileva" in a.lower() for a in temporal_aliases)
-        wants_resolution = any(a.lower() in {"mttr", "mean time to resolution", "mean time to repair"} or "risolvere" in a.lower() or "riparazione" in a.lower() for a in temporal_aliases)
+        wants_detection = any(
+            a.lower() in {"mttd", "mean time to detect"} or "rileva" in a.lower()
+            for a in temporal_aliases
+        )
+        wants_resolution = any(
+            a.lower() in {"mttr", "mean time to resolution", "mean time to repair"}
+            or "risolvere" in a.lower()
+            or "riparazione" in a.lower()
+            for a in temporal_aliases
+        )
         if wants_detection and "mttd" not in found_text:
             missing.append("MTTD")
         if wants_resolution and "mttr" not in found_text:
@@ -9103,9 +9271,6 @@ def _requested_formula_terms_missing(query_text: str, rows: List[Dict[str, Any]]
 #   (e.g. "tempi di rilevamento/risoluzione") without explicitly writing MTTD/MTTR.
 # - Keep this as a generic alias expansion, not tied to one test question.
 
-_ORIGINAL_expand_assessment_query_v410 = expand_assessment_query
-_ORIGINAL_extract_exact_phrases_v410 = extract_exact_phrases
-_ORIGINAL_requested_formula_terms_missing_v410 = _requested_formula_terms_missing
 
 # ============================================================
 # 🧮 FORMULA STRICT MODE HOTFIX - v4.11
@@ -9291,36 +9456,112 @@ def clean_formula_rows(rows: List[Dict[str, Any]], max_rows: int = 10) -> List[D
 
     return filtered[:max_rows]
 
+def _answer_formula_strict_core(query_text: str, sources: List[SourceItem]) -> Optional[str]:
+    """
+    v4.8:
+    - keeps formulas/definitional metrics separate from normative thresholds;
+    - threshold rows use Elemento/Criterio/Ambito to avoid semantic ambiguity;
+    - no corpus-specific hardcoded mappings.
+    """
+    rows = clean_formula_rows(extract_formula_rows_from_sources(sources), max_rows=20)
+
+    if not rows:
+        return (
+            "**A) Risposta**\n\n"
+            "Non ho trovato formule computazionali, metriche definitorie o regole di scoring esplicite nelle fonti recuperate.\n\n"
+            "\n\n**B) Evidenze**\n\n"
+            "- Il sistema ha cercato formule, metriche e regole di scoring nei chunk recuperati e nel Knowledge Graph.\n\n"
+            "\n\n**C) Limiti / Conflitti**\n\n"
+            "- La risposta non inventa formule mancanti.\n"
+            "- Percentuali isolate, intestazioni o righe generiche non sono state considerate formule.\n\n"
+            "**D) Fonti**\n\n"
+            "- Vedi pannello Fonti/Audit per i chunk recuperati."
+        )
+
+    computational = [r for r in rows if str(r.get("tipo") or "").lower() == "formula computazionale"]
+    definitional = [r for r in rows if str(r.get("tipo") or "").lower() == "metrica definitoria"]
+    thresholds = _aggregate_threshold_rules(rows)
+    cited = [r for r in rows if str(r.get("tipo") or "").lower() == "metrica/elemento citato"]
+
+    primary_rows = computational + definitional
+    blocks: List[str] = []
+
+    if primary_rows:
+        blocks.append(_formula_metrics_table("Formule computazionali e metriche recuperate", primary_rows[:8]))
+
+    if thresholds:
+        blocks.append(_threshold_rules_table("Soglie normative recuperate ma non classificabili come scoring", thresholds[:4]))
+
+    if cited and not primary_rows and not thresholds:
+        blocks.append(_formula_metrics_table("Elementi citati senza formula esplicita", cited[:6]))
+
+    if not blocks:
+        blocks.append("Non ho trovato formule computazionali o metriche sufficientemente esplicite nelle fonti recuperate.")
+
+    rows_for_sources: List[Dict[str, Any]] = primary_rows + thresholds + cited
+    used_files = []
+    seen_files = set()
+    for r in rows_for_sources:
+        fname = str(r.get("filename") or "").strip()
+        page = int(r.get("page") or 0)
+        if not fname:
+            continue
+        label = f"{fname} (p.{page})" if page else fname
+        if label not in seen_files:
+            seen_files.add(label)
+            used_files.append(label)
+
+    missing_terms = _requested_formula_terms_missing(query_text, primary_rows + thresholds + cited)
+
+    evidence_lines = [
+        "- Gli elementi sono stati classificati in modo deterministico.",
+        "- Le metriche definitorie sono distinte dalle formule computazionali.",
+    ]
+    if thresholds:
+        evidence_lines.append("- Le soglie normative sono riportate in una tabella separata con criterio e ambito, perché non sono formule né regole di scoring.")
+    if missing_terms:
+        evidence_lines.append("- Non sono state recuperate formule computazionali esplicite per: " + ", ".join(missing_terms) + ".")
+
+    return (
+        "**A) Risposta**\n\n"
+        + "\n\n".join(blocks)
+        + "\n\n**B) Evidenze**\n\n"
+        + "\n".join(evidence_lines)
+        + "\n\n**C) Limiti / Conflitti**\n\n"
+        + "- La risposta non inventa formule mancanti.\n"
+        + "- Una metrica definitoria non viene trattata come formula computazionale se la fonte non contiene un calcolo esplicito.\n"
+        + "- Una soglia normativa indica una condizione/criterio; non misura automaticamente un punteggio o una maturità.\n\n"
+        + "**D) Fonti**\n\n"
+        + ("\n".join(f"- {f}" for f in used_files) if used_files else "- Fonti non disponibili.")
+    )
 
 
 def answer_formula_strict(query_text: str, sources: List[SourceItem]) -> Optional[str]:
     """
-    v4.12 wrapper:
-    - Uses the stable v4.11/v4.9 formula classifier.
-    - If the user asks for threshold/user/notification criteria and the first retrieved
-      source set does not contain threshold rows, performs a small supplemental retrieval
-      and lets the same classifier build the answer.
+    Versione finale senza alias _ORIGINAL_*.
+
+    Integra:
+    - core v4.8/v4.11 per classificazione formule/metriche/soglie;
+    - supplemento v4.12 per recuperare soglie normative se la prima retrieval non le contiene.
     """
     try:
         current_rows = clean_formula_rows(extract_formula_rows_from_sources(sources), max_rows=30)
         has_threshold = any(str(r.get("tipo") or "").lower() == "regola soglia" for r in current_rows)
     except Exception:
-        current_rows = []
         has_threshold = False
 
-    wants_threshold = bool(_threshold_metric_aliases_v412(query_text))
+    try:
+        wants_threshold = bool(_threshold_metric_aliases_v412(query_text))
+    except Exception:
+        wants_threshold = False
 
     if wants_threshold and not has_threshold:
         extra_sources = _threshold_supplemental_sources_v412(query_text)
         if extra_sources:
             merged = dedupe_sources_for_answer(list(sources or []) + extra_sources)
-            return _ORIGINAL_answer_formula_strict_v412(query_text, merged)
+            return _answer_formula_strict_core(query_text, merged)
 
-    return _ORIGINAL_answer_formula_strict_v412(query_text, sources)
-
-
-
-
+    return _answer_formula_strict_core(query_text, sources)
 
 # ============================================================
 # 🔎 FORMULA / THRESHOLD CATEGORY PRESERVATION PATCH - v4.12
@@ -9332,9 +9573,6 @@ def answer_formula_strict(query_text: str, sources: List[SourceItem]) -> Optiona
 # - Keep this non-adaptive: it is a generic synonym/recall expansion for threshold-style
 #   formula/metric queries, not a hardcoded answer.
 
-_ORIGINAL_expand_assessment_query_v412 = expand_assessment_query
-_ORIGINAL_extract_exact_phrases_v412 = extract_exact_phrases
-_ORIGINAL_answer_formula_strict_v412 = answer_formula_strict
 
 
 def _threshold_metric_aliases_v412(query_text: str) -> List[str]:
@@ -9385,9 +9623,6 @@ def _threshold_metric_aliases_v412(query_text: str) -> List[str]:
             seen.add(key)
             out.append(a)
     return out
-
-
-
 
 
 def _threshold_supplemental_sources_v412(query_text: str, limit: int = 18) -> List[SourceItem]:
@@ -9459,9 +9694,6 @@ def _threshold_supplemental_sources_v412(query_text: str, limit: int = 18) -> Li
     return sources_extra
 
 
-
-
-
 def _threshold_rule_segments_v413(text: str, max_segments: int = 8) -> List[str]:
     """Extract readable threshold-rule segments from arbitrary text."""
     raw = str(text or "")
@@ -9510,15 +9742,148 @@ def _threshold_rule_segments_v413(text: str, max_segments: int = 8) -> List[str]
 
     return out
 
+def _extract_formula_rows_from_sources_core(sources: List[SourceItem]) -> List[Dict[str, Any]]:
+    """
+    Estrae formule o metriche dai SourceItem recuperati.
+
+    Non inventa formule:
+    - se trova LaTeX esplicito, lo usa;
+    - se trova una formula testuale esplicita tipo X = Y / Z, la riporta;
+    - se trova solo una metrica/indicatore, dichiara che la formula esplicita non è recuperata.
+    """
+    rows: List[Dict[str, Any]] = []
+    seen = set()
+
+    latex_pat = re.compile(r"(?<!\\)(\$\$.*?\$\$|\$[^$\n]{2,300}\$)", re.DOTALL)
+    explicit_equation_pat = re.compile(
+        r"(?i)\b([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9_\-/ ]{1,80})\s*=\s*([^;\n]{2,260})"
+    )
+    metric_line_pat = re.compile(
+        r"(?i)\b("
+        r"formula|formulas|formulae|equation|equations|"
+        r"formule|equazione|equazioni|"
+        r"metric|metrics|metrica|metriche|"
+        r"indicator|indicators|indicatore|indicatori|"
+        r"score|scoring|punteggio|"
+        r"calculation|calculation model|calcolo|modello di calcolo|"
+        r"mean time|tempo medio|index|indice|ratio|coverage|copertura|"
+        r"maturity|maturità|severity|severità"
+        r")\b"
+    )
+
+    for s in sources or []:
+        content = s.content or ""
+        filename = s.filename or "N/D"
+        page = int(s.page or 0)
+        source_type = normalize_source_type(getattr(s, "type", "") or "")
+
+        # Caso 1: formule LaTeX esplicite nel contenuto.
+        for lx in latex_pat.findall(content):
+            latex = lx.strip()
+            key = ("latex", latex.lower(), filename.lower(), page)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "name": "Formula recuperata",
+                "latex": latex,
+                "meaning": "Formula LaTeX esplicita presente nella fonte recuperata.",
+                "filename": filename,
+                "page": page,
+            })
+
+        # Caso 2: contenuti provenienti da Neo4j Formula Search.
+        if "Formula from Knowledge Graph" in content or source_type == "formula":
+            latex = ""
+            plain = ""
+            meaning = ""
+
+            for line in content.splitlines():
+                clean = line.strip()
+                low = clean.lower()
+                if low.startswith("latex:"):
+                    latex = clean.split(":", 1)[1].strip()
+                elif low.startswith("plain:"):
+                    plain = clean.split(":", 1)[1].strip()
+                elif low.startswith("meaning:"):
+                    meaning = clean.split(":", 1)[1].strip()
+
+            name = plain or meaning or "Formula/metric"
+            key = ("kg", name.lower(), latex.lower(), filename.lower(), page)
+
+            if key not in seen:
+                seen.add(key)
+                rows.append({
+                    "name": name,
+                    "latex": latex if latex else "formula esplicita non recuperata",
+                    "meaning": meaning,
+                    "filename": filename,
+                    "page": page,
+                })
+
+        # Caso 3: equazioni testuali esplicite tipo "X = Y / Z".
+        for m in explicit_equation_pat.finditer(content):
+            left = re.sub(r"\s+", " ", m.group(1)).strip()
+            right = re.sub(r"\s+", " ", m.group(2)).strip()
+
+            if len(left) < 2 or len(right) < 2:
+                continue
+
+            latex = f"{left} = {right}"
+            key = ("eq", left.lower(), latex.lower(), filename.lower(), page)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "name": left,
+                "latex": latex,
+                "meaning": "Formula testuale esplicita presente nella fonte recuperata.",
+                "filename": filename,
+                "page": page,
+            })
+
+        # Caso 4: righe che citano metriche/indicatori senza formula esplicita.
+        for raw_line in content.splitlines():
+            line = re.sub(r"\s+", " ", raw_line or "").strip()
+            if not line or not metric_line_pat.search(line):
+                continue
+
+            name = "Metrica/indicatore citato"
+            m_name = re.match(r"^[-*•\s]*([A-Za-zÀ-ÿ0-9_\-/ ]{2,80})\s*[:=–-]", line)
+            if m_name:
+                name = m_name.group(1).strip()
+
+            key = ("metric", name.lower(), filename.lower(), page, line[:120].lower())
+            if key in seen:
+                continue
+            seen.add(key)
+
+            rows.append({
+                "name": name,
+                "latex": "formula esplicita non recuperata",
+                "meaning": (
+                    "Metrica/indicatore citato nelle fonti recuperate; "
+                    "nessuna formula esplicita è stata individuata nello stesso chunk."
+                ),
+                "filename": filename,
+                "page": page,
+            })
+
+            if len(rows) >= 20:
+                return rows
+
+    return rows
+
 
 def extract_formula_rows_from_sources(sources: List[SourceItem]) -> List[Dict[str, Any]]:
     """
-    v4.13 override:
-    use the previous extractor and add plain-text threshold-rule rows.
-    This lets Formula Strict Mode preserve normative thresholds even when they are
-    not encoded as LaTeX/formula nodes.
+    Versione finale senza alias _ORIGINAL_*.
+
+    Integra:
+    - estrazione base di formule/metriche da SourceItem;
+    - estensione v4.13 per aggiungere regole soglia da testo semplice.
     """
-    rows = list(_ORIGINAL_extract_formula_rows_from_sources_v413(sources) or [])
+    rows = list(_extract_formula_rows_from_sources_core(sources) or [])
     seen = {
         (
             str(r.get("name") or "").lower(),
@@ -9549,7 +9914,6 @@ def extract_formula_rows_from_sources(sources: List[SourceItem]) -> List[Dict[st
 
     return rows
 
-
 # ============================================================
 # 🔎 FORMULA / THRESHOLD RECALL PATCH - v4.13
 # ============================================================
@@ -9558,11 +9922,6 @@ def extract_formula_rows_from_sources(sources: List[SourceItem]) -> List[Dict[st
 # - Improve threshold recall when threshold-like chunks are present as plain text
 #   and not as LaTeX/formula nodes.
 # - Non-adaptive: generic threshold-rule extraction + PostgreSQL regex recall.
-
-_ORIGINAL_extract_formula_rows_from_sources_v413 = extract_formula_rows_from_sources
-_ORIGINAL_threshold_supplemental_sources_v412_v413 = _threshold_supplemental_sources_v412
-
-
 
 
 def _search_pg_threshold_regex_v413(limit: int = 12) -> List[SourceItem]:
@@ -9649,4 +10008,3 @@ def _search_pg_threshold_regex_v413(limit: int = 12) -> List[SourceItem]:
 
 app = rx.App()
 app.add_page(index, on_load=State.on_load)
-
