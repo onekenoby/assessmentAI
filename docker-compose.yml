@@ -1,14 +1,34 @@
 ##########################################
-### DOCKER COMPOSE - ASSESSMENT STACK (Con LibreOffice + Neo4j Plugins)
+### DOCKER COMPOSE - ASSESSMENT STACK
+### Con LibreOffice + Neo4j Plugins + Ollama GPU + Python Ingestion
 ##########################################
 
 ##########################################
 #
-# Per avviare:
+# AVVIO STACK ASSESSMENT BASE
 #
-#
-# docker compose --profile finance down   
 # docker compose --profile assessment up -d
+#
+# BUILD CONTAINER PYTHON INGESTION
+#
+# docker compose --profile assessment --profile ingestion build ingestion_assessment
+#
+# VERIFICA VERSIONE PYTHON
+#
+# docker compose --profile assessment --profile ingestion run --rm ingestion_assessment python --version
+#
+# VERIFICA MODELLI OLLAMA
+#
+# curl http://127.0.0.1:11434/api/tags
+#
+# LANCIO INGESTION CONTAINERIZZATA
+#
+# docker compose --profile assessment --profile ingestion run --rm ingestion_assessment
+#
+# STOP STACK ASSESSMENT
+#
+# docker compose --profile assessment down
+#
 ##########################################
 
 services:
@@ -16,11 +36,11 @@ services:
   # ========================================================
   # STACK FINANCE
   # ========================================================
-  
+
   timescaledb_finance:
     image: timescale/timescaledb:latest-pg16
     container_name: ai_timescale_finance
-    profiles: ["finance"] # <---
+    profiles: ["finance"]
     restart: always
     environment:
       POSTGRES_USER: admin
@@ -36,10 +56,10 @@ services:
   qdrant_finance:
     image: qdrant/qdrant:latest
     container_name: ai_qdrant_finance
-    profiles: ["finance"] # <--- 
+    profiles: ["finance"]
     restart: always
     ports:
-      - "127.0.0.1:6334:6333"
+      - "6333:6333"
     volumes:
       - ./data/finance/qdrant:/qdrant/storage
     networks:
@@ -48,11 +68,11 @@ services:
   neo4j_finance:
     image: neo4j:latest
     container_name: ai_neo4j_finance
-    profiles: ["finance"] # <---
+    profiles: ["finance"]
     restart: always
     ports:
-      - "127.0.0.1:7475:7474"
-      - "127.0.0.1:7687:7687"
+      - "7474:7474"
+      - "7687:7687"
     environment:
       NEO4J_AUTH: neo4j/admin_password
       NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
@@ -64,9 +84,8 @@ services:
     networks:
       - ai_network
 
-
   # ========================================================
-  # STACK ASSESSMENT (Nuovo POC)
+  # STACK ASSESSMENT
   # ========================================================
 
   timescaledb_assessment:
@@ -79,7 +98,7 @@ services:
       POSTGRES_PASSWORD: admin_password
       POSTGRES_DB: assessment_ingestion
     ports:
-      - "127.0.0.1:5433:5432" # Porta esterna 5433
+      - "127.0.0.1:5433:5432"
     volumes:
       - ./data/assessment/postgres:/var/lib/postgresql/data
     networks:
@@ -91,7 +110,7 @@ services:
     profiles: ["assessment"]
     restart: always
     ports:
-      - "127.0.0.1:6334:6333" # Porta esterna 6334
+      - "127.0.0.1:6334:6333"
     volumes:
       - ./data/assessment/qdrant:/qdrant/storage
     networks:
@@ -103,8 +122,8 @@ services:
     profiles: ["assessment"]
     restart: always
     ports:
-      - "7475:7474" # Browser su 7475
-      - "127.0.0.1:7688:7687" # Bolt su 7688
+      - "127.0.0.1:7475:7474"
+      - "127.0.0.1:7688:7687"
     environment:
       NEO4J_AUTH: neo4j/admin_password
       NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
@@ -117,7 +136,7 @@ services:
       - ai_network
 
   # ========================================================
-  # OFFICE COMPONENT (LibreOffice Web Interface)
+  # OFFICE COMPONENT - LibreOffice Web Interface
   # ========================================================
 
   libreoffice:
@@ -130,15 +149,15 @@ services:
       - PGID=1000
       - TZ=Europe/Rome
     volumes:
-      - ./data/assessment/inbox:/config/workspace # Mappa la cartella dei documenti
+      - ./data/assessment/INBOX:/config/workspace
     ports:
-      - "127.0.0.1:3001:3000" # Accedi via browser su http://localhost:3001
+      - "127.0.0.1:3001:3000"
     networks:
       - ai_network
 
-
   # ========================================================
   # OLLAMA GPU - ASSESSMENT
+  # Servizio LLM/Vision usato da ingestion.py e gui_reflex.py
   # ========================================================
 
   ollama_assessment:
@@ -146,22 +165,189 @@ services:
     container_name: ai_ollama_assessment
     profiles: ["assessment"]
     restart: always
-
-    # Espone Ollama solo sulla macchina host.
-    # Da fuori: usare SSH tunnel o Vast Portal, non apertura pubblica diretta.
     ports:
       - "127.0.0.1:11434:11434"
-
     environment:
       OLLAMA_HOST: "0.0.0.0:11434"
       OLLAMA_NUM_PARALLEL: "1"
       OLLAMA_MAX_LOADED_MODELS: "2"
       OLLAMA_FLASH_ATTENTION: "1"
-
+      TZ: "Europe/Rome"
     volumes:
       - ./data/assessment/ollama:/root/.ollama
-
     gpus: all
+    networks:
+      - ai_network
+
+  # ========================================================
+  # OLLAMA MODEL PULL - ASSESSMENT
+  # Scarica automaticamente i modelli usati da ingestion.py e gui_reflex.py
+  # ========================================================
+
+  ollama_pull_assessment:
+    image: curlimages/curl:latest
+    container_name: ai_ollama_pull_assessment
+    profiles: ["assessment"]
+    depends_on:
+      - ollama_assessment
+    restart: "no"
+    environment:
+      # ingestion.py
+      INGESTION_LLM_MODEL_NAME: ${INGESTION_LLM_MODEL_NAME:-llama3.1:8b}
+      INGESTION_VISION_MODEL_NAME: ${INGESTION_VISION_MODEL_NAME:-ministral-3:8b}
+
+      # gui_reflex.py
+      GUI_LLM_MODEL_NAME: ${GUI_LLM_MODEL_NAME:-gemma4:12b}
+
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "
+      echo '⏳ Attendo Ollama...';
+      until curl -fsS http://ollama_assessment:11434/api/tags >/dev/null; do
+        sleep 3;
+      done;
+
+      echo \"📦 Pull ingestion LLM: $${INGESTION_LLM_MODEL_NAME}\";
+      curl -fsS http://ollama_assessment:11434/api/pull
+      -H 'Content-Type: application/json'
+      -d \"{\\\"model\\\":\\\"$${INGESTION_LLM_MODEL_NAME}\\\"}\";
+
+      echo \"📦 Pull ingestion Vision: $${INGESTION_VISION_MODEL_NAME}\";
+      curl -fsS http://ollama_assessment:11434/api/pull
+      -H 'Content-Type: application/json'
+      -d \"{\\\"model\\\":\\\"$${INGESTION_VISION_MODEL_NAME}\\\"}\";
+
+      echo \"📦 Pull GUI LLM: $${GUI_LLM_MODEL_NAME}\";
+      curl -fsS http://ollama_assessment:11434/api/pull
+      -H 'Content-Type: application/json'
+      -d \"{\\\"model\\\":\\\"$${GUI_LLM_MODEL_NAME}\\\"}\";
+
+      echo '✅ Modelli Ollama pronti.';
+      "
+    networks:
+      - ai_network
+
+  # ========================================================
+  # PYTHON INGESTION WORKER - ASSESSMENT
+  # ========================================================
+
+  ingestion_assessment:
+
+    environment:
+      LLM_MODEL_NAME: "llama3.1:8b"
+      VISION_MODEL_NAME: "ministral-3:8b"
+
+    build:
+      context: .
+      dockerfile: Dockerfile.ingestion
+
+    profiles: ["ingestion"]
+    restart: "no"
+
+    depends_on:
+      - timescaledb_assessment
+      - qdrant_assessment
+      - neo4j_assessment
+      - ollama_assessment
+      - ollama_pull_assessment
+
+  rag_gui_assessment:
+    build:
+      context: .
+      dockerfile: Dockerfile.gui_reflex
+
+    container_name: ai_rag_gui_assessment
+    profiles: ["rag_gui"]
+    restart: unless-stopped
+
+    working_dir: /app/gui_reflex
+
+    command: >
+      reflex run
+      --env dev
+      --backend-host 0.0.0.0
+      --backend-port 8000
+      --frontend-port 3000
+
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:8000:8000"
+
+    environment:
+      # ====================================================
+      # Modelli RAG GUI
+      # ====================================================
+      LLM_MODEL_NAME: "gemma4:12b"
+      VISION_MODEL_NAME: "gemma4:12b"
+
+      # ====================================================
+      # Ollama dentro Docker network
+      # ====================================================
+      OLLAMA_URL: "http://ollama_assessment:11434/v1"
+      OLLAMA_NATIVE_CHAT_URL: "http://ollama_assessment:11434/api/chat"
+      OLLAMA_API_KEY: "ollama"
+
+      USE_REMOTE_OLLAMA: "1"
+      OLLAMA_AUTOSTART: "0"
+
+      # ====================================================
+      # Postgres / Timescale dentro Docker network
+      # ====================================================
+      PG_ENRICH_ENABLED: "1"
+      PG_HOST: "timescaledb_assessment"
+      PG_PORT: "5432"
+      PG_DB: "assessment_ingestion"
+      PG_USER: "admin"
+      PG_PASS: "admin_password"
+
+      # ====================================================
+      # Qdrant dentro Docker network
+      # ====================================================
+      QDRANT_HOST: "qdrant_assessment"
+      QDRANT_PORT: "6333"
+      QDRANT_COLLECTION: "assessment_docs"
+
+      # ====================================================
+      # Neo4j dentro Docker network
+      # ====================================================
+      NEO4J_URI: "bolt://neo4j_assessment:7687"
+      NEO4J_USER: "neo4j"
+      NEO4J_PASS: "admin_password"
+      NEO4J_ENABLED: "1"
+
+      # ====================================================
+      # Path Linux container
+      # ====================================================
+      EMBEDDING_MODEL_NAME: "/workspace/models/bge-m3"
+      RERANKER_MODEL_NAME: "/workspace/models/ms-marco-reranker"
+
+      # ====================================================
+      # Log RAG
+      # ====================================================
+      RAG_LOG_DIR: "/workspace/logs/rag"
+
+      # ====================================================
+      # Performance safe defaults
+      # ====================================================
+      TOKENIZERS_PARALLELISM: "false"
+      EMBED_CPU_THREADS: "4"
+      EMBED_DEVICE: "cpu"
+      RERANK_DEVICE: "cpu"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      OPENBLAS_NUM_THREADS: "4"
+      NUMEXPR_NUM_THREADS: "4"
+
+    volumes:
+      - ./gui_reflex:/app/gui_reflex
+      - ./models:/workspace/models:ro
+      - ./data/assessment/logs:/workspace/logs
+
+    depends_on:
+      - timescaledb_assessment
+      - qdrant_assessment
+      - neo4j_assessment
+      - ollama_assessment
 
     networks:
       - ai_network
@@ -169,5 +355,3 @@ services:
 networks:
   ai_network:
     driver: bridge
-
-  

@@ -1,0 +1,11 @@
+requests
+pillow
+pytesseract
+PyMuPDF
+pdfminer.six
+psycopg2-binary
+sentence-transformers
+qdrant-client
+neo4j
+openai
+ollama

@@ -1,13 +1,12 @@
-import os
 import psycopg2
 from qdrant_client import QdrantClient, models
 from neo4j import GraphDatabase
-
+import os
 
 # ==========================================
 # --- CONFIGURAZIONE STACK ASSESSMENT ---
 # ==========================================
-'''
+
 # Postgres (Porta 5433, DB assessment_ingestion)
 PG_DSN = "dbname=assessment_ingestion user=admin password=admin_password host=localhost port=5433"
 
@@ -19,31 +18,6 @@ QDRANT_COLLECTION = "assessment_docs"
 # Neo4j (Porta 7688, Auth admin_password)
 NEO4J_URI = "bolt://localhost:7688"
 NEO4J_AUTH = ("neo4j", "admin_password")
-'''
-
-PG_HOST = os.getenv("PG_HOST", "localhost")
-PG_PORT = int(os.getenv("PG_PORT", "5433"))
-PG_DB = os.getenv("PG_DB", "assessment_ingestion")
-PG_USER = os.getenv("PG_USER", "admin")
-PG_PASS = os.getenv("PG_PASS", "admin_password")
-
-PG_DSN = (
-    f"dbname={PG_DB} "
-    f"user={PG_USER} "
-    f"password={PG_PASS} "
-    f"host={PG_HOST} "
-    f"port={PG_PORT}"
-)
-
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6334"))
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "assessment_docs")
-
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7688")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASS = os.getenv("NEO4J_PASS", "admin_password")
-NEO4J_AUTH = (NEO4J_USER, NEO4J_PASS)
-
 
 def clean_postgres_targeted(filename):
     print(f"🐘 Postgres: Rimozione record per {filename}...", end=" ")

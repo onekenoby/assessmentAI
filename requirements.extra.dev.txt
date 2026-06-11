@@ -1,0 +1,20 @@
+# ==========================================================
+# EXTRA DEV / NOTEBOOK / DEBUG
+# Da usare solo in immagini di sviluppo, non runtime ingestion
+# ==========================================================
+
+ipykernel
+ipython
+jupyter_client
+jupyter_core
+debugpy
+traitlets
+pyzmq
+matplotlib-inline
+stack-data
+asttokens
+executing
+pure_eval
+prompt_toolkit
+jedi
+parso

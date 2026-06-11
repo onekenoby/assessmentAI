@@ -1,0 +1,36 @@
+# ==========================================================
+# EXTRA MAIN - runtime/document/data utilities
+# Dipendenze transitive lasciate gestire a pip
+# ==========================================================
+
+python-dotenv
+PyYAML
+pydantic
+pydantic-settings
+
+pandas
+openpyxl
+xlsxwriter
+pyarrow
+
+python-docx
+python-pptx
+pypdf
+pypdfium2
+lxml
+beautifulsoup4
+
+matplotlib
+networkx
+tabulate
+tqdm
+
+SQLAlchemy
+sqlmodel
+redis
+
+langchain-core
+langchain-text-splitters
+jsonlines
+jsonpatch
+jsonref

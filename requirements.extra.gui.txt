@@ -1,0 +1,16 @@
+# ==========================================================
+# EXTRA GUI / WEB APP
+# Da usare per container dedicati a gui_reflex.py, Streamlit o UI
+# Non consigliato nel container ingestion minimale
+# ==========================================================
+
+reflex
+reflex-hosting-cli
+streamlit
+granian
+python-multipart
+python-engineio
+python-socketio
+simple-websocket
+websocket-client
+watchfiles

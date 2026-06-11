@@ -1,0 +1,18 @@
+# ==========================================================
+# EXTRA AI / DOCUMENT / OCR - pacchetti più pesanti
+# Usare solo se ingestion.py o moduli futuri li richiedono davvero
+# ==========================================================
+
+docling
+rapidocr
+opencv-python
+onnxruntime
+faster-whisper
+accelerate
+
+tree-sitter
+tree-sitter-python
+tree-sitter-java
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-c

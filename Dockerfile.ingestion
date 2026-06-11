@@ -1,0 +1,75 @@
+FROM python:3.11.9-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+ENV TOKENIZERS_PARALLELISM=false
+ENV OMP_NUM_THREADS=4
+ENV MKL_NUM_THREADS=4
+ENV OPENBLAS_NUM_THREADS=4
+ENV NUMEXPR_NUM_THREADS=4
+
+ENV TESSERACT_CMD=/usr/bin/tesseract
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    tesseract-ocr \
+    tesseract-ocr-ita \
+    poppler-utils \
+    libglib2.0-0 \
+    libgl1 \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.ingestion.txt /app/requirements.ingestion.txt
+COPY requirements.extra.main.txt /app/requirements.extra.main.txt
+COPY requirements.extra.ai_docs.txt /app/requirements.extra.ai_docs.txt
+COPY requirements.extra.gui.txt /app/requirements.extra.gui.txt
+COPY requirements.extra.dev.txt /app/requirements.extra.dev.txt
+
+ARG INSTALL_EXTRA_MAIN=0
+ARG INSTALL_EXTRA_AI_DOCS=0
+ARG INSTALL_EXTRA_GUI=0
+ARG INSTALL_EXTRA_DEV=0
+
+RUN pip install --upgrade pip setuptools wheel
+
+# Torch CPU-only: evita dipendenze CUDA dentro il container ingestion
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && rm -rf /tmp/pip-* /root/.cache/pip
+
+# Base ingestion: sempre installato
+RUN pip install --no-cache-dir -r /app/requirements.ingestion.txt \
+    && rm -rf /tmp/pip-* /root/.cache/pip
+
+# Extra runtime principali: opzionale
+RUN if [ "$INSTALL_EXTRA_MAIN" = "1" ]; then \
+        pip install --no-cache-dir -r /app/requirements.extra.main.txt; \
+    fi \
+    && rm -rf /tmp/pip-* /root/.cache/pip
+
+# Extra AI/documentale pesante: opzionale
+RUN if [ "$INSTALL_EXTRA_AI_DOCS" = "1" ]; then \
+        pip install --no-cache-dir -r /app/requirements.extra.ai_docs.txt; \
+    fi \
+    && rm -rf /tmp/pip-* /root/.cache/pip
+
+# Extra GUI/web: opzionale, preferibilmente in container separato
+RUN if [ "$INSTALL_EXTRA_GUI" = "1" ]; then \
+        pip install --no-cache-dir -r /app/requirements.extra.gui.txt; \
+    fi \
+    && rm -rf /tmp/pip-* /root/.cache/pip
+
+# Extra dev/notebook/debug: opzionale, non consigliato in runtime
+RUN if [ "$INSTALL_EXTRA_DEV" = "1" ]; then \
+        pip install --no-cache-dir -r /app/requirements.extra.dev.txt; \
+    fi \
+    && rm -rf /tmp/pip-* /root/.cache/pip
+
+COPY ingestion.py /app/ingestion.py
+
+CMD ["python", "ingestion.py"]

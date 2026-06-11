@@ -1,15 +1,32 @@
-*.py[cod]
-assets/external/
+# Python
 __pycache__/
-.web
-.states
-*.db
-*.json
-*.log
-*.sqlite
-*.sqlite3
-*.bak
-*.tmp
+*.py[cod]
+*$py.class
+*.so
+.env
+
+# Ambienti Virtuali
+venv/
+env/
+ENV/
+
+# Cartelle Dati e Modelli (MOLTO IMPORTANTE)
+data/
+INBOX_DIR/
+modelli/
+models/
+*.gguf
+
+# IDEs
+.idea/
+.vscode/
 *.swp
-*.swo
-*.DS_Store
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+bak/
+.web
+.zip
+.rar

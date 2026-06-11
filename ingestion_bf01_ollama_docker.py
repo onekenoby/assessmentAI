@@ -52,16 +52,8 @@ import gc
 import queue
 import threading
 
-'''
 import pytesseract
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-'''
-
-import pytesseract
-TESSERACT_CMD = os.getenv("TESSERACT_CMD", "")
-
-if TESSERACT_CMD:
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 
 import unicodedata
@@ -678,39 +670,9 @@ LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama3.1:8b")
 VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "ministral-3:8b")
 
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-
-OLLAMA_API_GENERATE = os.getenv(
-    "OLLAMA_API_GENERATE",
-    f"{OLLAMA_BASE_URL}/api/generate"
-)
-
-OLLAMA_API_CHAT = os.getenv(
-    "OLLAMA_API_CHAT",
-    f"{OLLAMA_BASE_URL}/api/chat"
-)
-
-OLLAMA_API_TAGS = os.getenv(
-    "OLLAMA_API_TAGS",
-    f"{OLLAMA_BASE_URL}/api/tags"
-)
-
-USE_REMOTE_OLLAMA = os.getenv("USE_REMOTE_OLLAMA", "0") == "1"
-OLLAMA_AUTOSTART = os.getenv("OLLAMA_AUTOSTART", "1") == "1"
-
-
-
-
 # Embeddings
 #EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
-'''
 EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
-'''
-EMBEDDING_MODEL_NAME = os.getenv(
-    "EMBEDDING_MODEL_NAME",
-    "/workspace/models/bge-m3"
-)
-
 
 QDRANT_TEXT_MAX_CHARS = int(os.getenv("QDRANT_TEXT_MAX_CHARS", "2500"))
 
@@ -2888,7 +2850,6 @@ def llm_chat(prompt: str, text: str, model: str, max_tokens: int = LLM_MAX_TOKEN
 # producer e consumer non devono chiamare Ollama contemporaneamente.
 OLLAMA_CALL_LOCK = Lock()
 
-'''
 OLLAMA_API_GENERATE = os.getenv(
     "OLLAMA_API_GENERATE",
     "http://127.0.0.1:11434/api/generate"
@@ -2898,11 +2859,6 @@ OLLAMA_API_CHAT = os.getenv(
     "OLLAMA_API_CHAT",
     "http://127.0.0.1:11434/api/chat"
 )
-'''
-
-OLLAMA_API_CHAT="http://ollama_assessment:11434/api/chat"
-OLLAMA_API_GENERATE="http://ollama_assessment:11434/api/generate"
-
 
 # Timeout separati: evitano che una singola chiamata Ollama sembri bloccare tutta l'ingestion.
 OLLAMA_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT_S", "240"))
@@ -5353,15 +5309,10 @@ def main():
     os.makedirs(FAILED_DIR, exist_ok=True)
     ensure_inbox_structure(INBOX_DIR)
 
-
-
     # 2. Reset Ollama
-    if not USE_REMOTE_OLLAMA and OLLAMA_AUTOSTART:
-        if not force_restart_ollama(num_parallel=os.getenv("OLLAMA_NUM_PARALLEL", "1")):
-            print("   ❌ Errore: Impossibile avviare Ollama in modalità ottimizzata.")
-            print("   ⚠️ L'ingestion potrebbe fallire o risultare estremamente lenta.")
-    else:
-        print("   ☁️ Ollama remoto/containerizzato: skip restart locale.")
+    if not force_restart_ollama(num_parallel="1"):
+        print("   ❌ Errore: Impossibile avviare Ollama in modalità ottimizzata.")
+        print("   ⚠️ L'ingestion potrebbe fallire o risultare estremamente lenta.")
 
     print("\n" + "=" * 60)
     print("=== Ingestion Engine v2.5 (Producer/Consumer Edition) ===")
