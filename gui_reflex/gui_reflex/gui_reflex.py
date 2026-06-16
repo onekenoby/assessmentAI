@@ -208,13 +208,14 @@ VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", LLM_MODEL_NAME)
 # alternativa
 #LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama3.1:8b")
 #VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "ministral-3:8b")
-'''
 #EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
-EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
+#EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
 
 #RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-RERANKER_MODEL_NAME = "E:/Modelli/ms-marco-reranker"
-'''
+#RERANKER_MODEL_NAME = "E:/Modelli/ms-marco-reranker"
+
+
+
 # conf. docker 
 EMBEDDING_MODEL_NAME = os.getenv(
     "EMBEDDING_MODEL_NAME",

@@ -703,9 +703,9 @@ OLLAMA_AUTOSTART = os.getenv("OLLAMA_AUTOSTART", "1") == "1"
 
 # Embeddings
 #EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
-'''
-EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
-'''
+
+# EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
+
 EMBEDDING_MODEL_NAME = os.getenv(
     "EMBEDDING_MODEL_NAME",
     "/workspace/models/bge-m3"
