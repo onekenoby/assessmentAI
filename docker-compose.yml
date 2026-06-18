@@ -328,12 +328,17 @@ services:
 
     working_dir: /app/gui_reflex
 
+
     command: >
       reflex run
       --env dev
+      --frontend-host 0.0.0.0
       --backend-host 0.0.0.0
-      --backend-port 8000
       --frontend-port 3000
+      --backend-port 8000
+
+
+
 
     ports:
       - "127.0.0.1:3000:3000"

@@ -9,8 +9,8 @@ echo Questo comando avvia la GUI Reflex del RAG
 echo usando i profili assessment + rag_gui.
 echo.
 
-docker compose --profile assessment --profile rag_gui up -d rag_gui_assessment
-
+rem docker compose --profile assessment --profile rag_gui up -d rag_gui_assessment
+docker compose --profile assessment --profile rag_gui up -d --force-recreate rag_gui_assessment
 echo.
 echo ======================================================
 echo RAG GUI avviata.

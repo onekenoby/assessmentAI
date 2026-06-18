@@ -1,22 +1,68 @@
 venv/
 .venv/
-__pycache__/
+
+# Python cache
+
+**pycache**/
+**/**pycache**/
 *$py.class
 *.pyc
 *.pyo
 *.pyd
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Git e IDE
+
 .git/
 .gitignore
+.vscode/
+.idea/
+
+# Dati e modelli non necessari nel build context
+
 data/
 db/
 models/
+
+# Log e file temporanei
+
 *.log
 *.tmp
-.env
 .DS_Store
 Thumbs.db
 
+# Backup e archivi
+
 bak/
-.web
-.zip
-.rar
+*.bak
+*.zip
+*.rar
+
+# Reflex: frontend generato automaticamente
+
+.web/
+.web/**
+**/.web/
+**/.web/**
+gui_reflex/.web/
+gui_reflex/.web/**
+
+# Reflex cache
+
+.reflex/
+.reflex/**
+**/.reflex/
+**/.reflex/**
+gui_reflex/.reflex/
+gui_reflex/.reflex/**
+
+# Node.js
+
+node_modules/
+node_modules/**
+**/node_modules/
+**/node_modules/**
+gui_reflex/node_modules/
+gui_reflex/node_modules/**

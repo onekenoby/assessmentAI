@@ -474,7 +474,6 @@ class GraphEntity(BaseModel):
     type: str
     relation: str = "MENTIONED"
 
-
 class SourceItem(BaseModel):
     id: str
     content: str
@@ -504,6 +503,7 @@ class SourceItem(BaseModel):
     pg_toon_type: str = ""
 
     db_origin: str = "Unknown"
+
 
 class RetrievalDebug(BaseModel):
     query: str = ""
@@ -1962,7 +1962,7 @@ def extract_requested_terms(query_text: str) -> List[str]:
     terms: List[str] = []
 
     # 1) Frasi esplicite tra virgolette.
-    quoted = re.findall(r"[\"“'«]([^\"”'»]+)[\"”'»]", q)
+    quoted = re.findall(r"[\"“']([^\"”']+)[\"”']", q)
     for item in quoted:
         clean = item.strip()
         if len(clean) > 2 and not _looks_like_filename(clean):
@@ -3331,88 +3331,52 @@ def search_pg_bm25(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
 
 
 def search_pg_exact_phrases(query_text: str, limit: int = 30) -> List[Dict[str, Any]]:
-    """
-    Ricerca deterministica bilanciata per ciascuna frase o acronimo.
-
-    Ogni termine estratto riceve una quota propria di risultati, evitando che
-    un solo termine o il documento ingerito più di recente saturi tutto il limite.
-    """
+    """Ricerca ILIKE deterministica per frasi/acronimi che non devono dipendere dal vettoriale."""
     if not PG_ENRICH_ENABLED or not pg_pool:
         return []
-
     phrases = extract_exact_phrases(query_text)
     if not phrases:
         return []
-
-    phrases = phrases[:12]
-    per_phrase_limit = max(3, limit // len(phrases))
-
-    sql_template = """
-    SELECT
-        chunk_uuid::text,
-        content_raw,
-        content_semantic,
-        metadata_json,
-        ingestion_ts
+    clauses = []
+    params: List[Any] = []
+    for p in phrases[:12]:
+        like = f"%{p.lower()}%"
+        clauses.append("""(
+            lower(COALESCE(content_semantic, '')) LIKE %s OR
+            lower(COALESCE(content_raw, '')) LIKE %s OR
+            lower(COALESCE(metadata_json::text, '')) LIKE %s
+        )""")
+        params.extend([like, like, like])
+    sql = f"""
+    SELECT chunk_uuid::text, content_raw, content_semantic, metadata_json, ingestion_ts
     FROM public.document_chunks
-    WHERE {condition}
+    WHERE {' OR '.join(clauses)}
     ORDER BY ingestion_ts DESC
     LIMIT %s;
     """
-
+    params.append(limit)
     conn = pg_pool.getconn()
-
     try:
-        found: Dict[str, Dict[str, Any]] = {}
-
         with conn.cursor() as cur:
-            for phrase in phrases:
-                condition, condition_params = _term_sql_condition(phrase)
-                if not condition:
-                    continue
-
-                cur.execute(
-                    sql_template.format(condition=condition),
-                    [*condition_params, per_phrase_limit],
-                )
-
-                for chunk_uuid, content_raw, content_semantic, metadata_json, ingestion_ts in cur.fetchall():
-                    if isinstance(metadata_json, str):
-                        try:
-                            metadata_json = json.loads(metadata_json)
-                        except Exception:
-                            metadata_json = {}
-
-                    if metadata_json is None:
-                        metadata_json = {}
-
-                    uid = str(chunk_uuid)
-                    existing = found.get(uid)
-
-                    if existing is None:
-                        found[uid] = {
-                            "id": uid,
-                            "content": content_semantic or content_raw or "",
-                            "metadata": metadata_json,
-                            "score": 2.0,
-                            "origin": "PostgresExactPhrase",
-                            "ingestion_ts": ingestion_ts.isoformat() if ingestion_ts else "",
-                        }
-                    else:
-                        existing["score"] = float(existing.get("score", 2.0)) + 1.0
-
-        return sorted(
-            found.values(),
-            key=lambda x: float(x.get("score", 0.0)),
-            reverse=True,
-        )[:limit]
-
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        out: List[Dict[str, Any]] = []
+        for chunk_uuid, content_raw, content_semantic, metadata_json, ingestion_ts in rows:
+            if isinstance(metadata_json, str):
+                try:
+                    metadata_json = json.loads(metadata_json)
+                except Exception:
+                    metadata_json = {}
+            if metadata_json is None:
+                metadata_json = {}
+            out.append({"id": str(chunk_uuid), "content": content_semantic or content_raw or "", "metadata": metadata_json, "score": 2.0, "origin": "PostgresExactPhrase", "ingestion_ts": ingestion_ts.isoformat() if ingestion_ts else ""})
+        return out
     except Exception as e:
         print(f"⚠️ Exact phrase search error: {e}")
         return []
-
     finally:
         pg_pool.putconn(conn)
+
 
 def _term_sql_condition(alias: str) -> Tuple[str, List[Any]]:
     """
@@ -4000,19 +3964,15 @@ def search_neo4j_formulas(query_text: str, limit: int = 20) -> List[Dict[str, An
     return out
 
 GRAPH_QUERY_NOISE_TERMS = {
-    # IT generici / istruzionali
+    # IT generici
     "usa", "usare", "spiega", "spiegare", "collegamenti", "collegamento",
     "relazioni", "relazione", "documenti", "documento", "normativi",
-    "normativo", "glossario", "fonti", "fonte", "tabella", "catena",
-    "percorso", "passaggio", "traversamento", "ricostruisci", "traccia",
-    "mostra", "verifica", "grafo", "neo4j", "multihop", "multi-hop",
+    "normativo", "glossario", "fonti", "fonte", "tabella",
 
-    # EN generici / istruzionali
+    # EN generici
     "using", "use", "explain", "relationship", "relationships",
     "relation", "relations", "retrieved", "documents", "document",
-    "sources", "source", "glossary", "table", "chain", "path", "step",
-    "traversal", "reconstruct", "trace", "show", "verify", "graph",
-    "multihop", "multi-hop",
+    "sources", "source", "glossary", "table",
 }
 
 
@@ -4069,9 +4029,9 @@ def filter_neo4j_relation_rows(
     limit: int,
 ) -> List[Dict[str, Any]]:
     """
-    Mantiene solo archi i cui due estremi corrispondono a due concetti distinti
-    richiesti nella query. I token generici sono usati solo come fallback quando
-    non sono stati estratti concetti strutturati.
+    Tiene relazioni Neo4j pertinenti rispetto ai concetti richiesti.
+    Non è adattativa: usa concetti estratti dalla query e matching testuale
+    su sorgente, relazione, target, proprietà e filename.
     """
     if not rows:
         return []
@@ -4085,31 +4045,27 @@ def filter_neo4j_relation_rows(
     scored: List[Tuple[int, int, Dict[str, Any]]] = []
 
     for row in rows:
-        source_text = str(row.get("source") or "").lower()
-        target_text = str(row.get("target") or "").lower()
-        relation_text = _relation_row_text(row)
+        text = _relation_row_text(row)
 
-        source_hits = {
+        concept_hits = {
             _canonical_graph_concept(c)
             for c in concepts
-            if _concept_in_text(c, source_text)
+            if _concept_in_text(c, text)
         }
-        target_hits = {
-            _canonical_graph_concept(c)
-            for c in concepts
-            if _concept_in_text(c, target_text)
-        }
-        endpoint_hits = source_hits | target_hits
-        token_hits = {t for t in tokens if t in relation_text}
 
-        if concepts:
-            if source_hits and target_hits and len(endpoint_hits) >= 2:
-                scored.append((len(endpoint_hits), len(token_hits), row))
-        elif len(token_hits) >= 2:
-            scored.append((0, len(token_hits), row))
+        token_hits = {t for t in tokens if t in text}
+
+        # Priorità ai concetti forti; i token servono solo come supporto.
+        concept_score = len(concept_hits)
+        token_score = len(token_hits)
+
+        if concept_score >= 1 or token_score >= 2:
+            scored.append((concept_score, token_score, row))
 
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    return [row for _, _, row in scored[:limit]]
+
+    return [r for _, _, r in scored[:limit]]
+
 
 def search_neo4j_relations(query_text: str, limit: int = 60) -> List[Dict[str, Any]]:
     """Restituisce relazioni Entity-[:REL]->Entity con provenance dell'ingestion."""
@@ -4121,6 +4077,54 @@ def search_neo4j_relations(query_text: str, limit: int = 60) -> List[Dict[str, A
         tokens = extract_rag_tokens(query_text)
     if not tokens:
         return []
+
+    q_low = (query_text or "").lower()
+
+    customer_terms = [
+        "cliente", "account cliente", "azienda cliente", "organizzazione", "tenant", "sottoscrittore",
+        "client", "customer", "customer account", "client organization", "subscriber"
+    ]
+    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in customer_terms):
+        tokens.append("customer_account")
+
+    admin_terms = [
+        "amministratore", "admin", "chi compra la licenza", "acquirente della licenza",
+        "titolare della licenza", "responsabile licenza", "administrator",
+        "license buyer", "license purchaser", "license owner", "license manager"
+    ]
+    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in admin_terms):
+        tokens.append("admin")
+
+    incident_terms = [
+        "incidente", "violazione", "breach", "data breach", "compromissione",
+        "attacco informatico", "evento di sicurezza", "fuga di dati", "incident",
+        "compromise", "cyber attack", "security event", "data leak", "security incident"
+    ]
+    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in incident_terms):
+        tokens.append("securityincident")
+
+    control_terms = [
+        "controllo", "misura", "mitigazione", "salvaguardia", "contromisura",
+        "presidio", "misura di sicurezza", "policy", "procedura", "control",
+        "measure", "mitigation", "safeguard", "countermeasure",
+        "security measure", "security control", "procedure"
+    ]
+    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in control_terms):
+        tokens.append("securitycontrol")
+
+    asset_terms = [
+        "asset", "risorsa", "dispositivo", "bene", "infrastruttura", "sistema",
+        "resource", "device", "infrastructure", "system", "equipment"
+    ]
+    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in asset_terms):
+        tokens.append("asset")
+
+    risk_terms = [
+        "rischio", "minaccia", "vulnerabilità", "falla", "impatto", "criticita",
+        "criticità", "risk", "threat", "vulnerability", "flaw", "impact", "criticality"
+    ]
+    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in risk_terms):
+        tokens.append("risk")
 
     tokens = list(dict.fromkeys(tokens))
 
@@ -4280,7 +4284,7 @@ def _clean_graph_concept(value: str) -> str:
     """
     text = re.sub(r"\s+", " ", value or "").strip()
 
-    text = text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’«»`")
+    text = text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’`")
 
     # Rimuove prefissi descrittivi generici:
     # es. funzione “Respond” -> Respond
@@ -4301,7 +4305,7 @@ def _clean_graph_concept(value: str) -> str:
     # Rimuove congiunzioni finali residue.
     text = re.sub(r"\s+(?:e|ed|and|or|oppure|o)$", "", text, flags=re.IGNORECASE)
 
-    return text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’«»`")
+    return text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’`")
 
 
 
@@ -4336,7 +4340,7 @@ def _canonical_graph_concept(concept: str) -> str:
     Canonicalizza solo usando alias già presenti nel glossario.
     Evita relazioni tra sinonimi dello stesso concetto, es. MFA ↔ autenticazione a più fattori.
     """
-    c = _clean_graph_concept(concept).lower().strip()
+    c = (concept or "").lower().strip()
 
     for canonical, aliases in GLOSSARY_TERM_ALIASES.items():
         all_aliases = [canonical] + list(aliases or [])
@@ -4411,7 +4415,7 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
     concepts: List[str] = []
 
     # 1. Termini tra virgolette dritte o curve.
-    quoted = re.findall(r"[\"“'‘«]([^\"”'’»]+)[\"”'’»]", q)
+    quoted = re.findall(r"[\"“”'‘’]([^\"“”'‘’]+)[\"“”'‘’]", q)
     for item in quoted:
         clean = _clean_graph_concept(item)
         if len(clean) >= 2:
@@ -4472,9 +4476,6 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
         "rischio", "risk", "utente", "user", "identity", "identità",
         "documenti", "documents", "normativi", "normative",
         "funzione", "function", "processo", "process",
-        "catena", "chain", "percorso", "path", "passaggio", "step",
-        "traversamento", "traversal", "grafo", "graph", "neo4j",
-        "multi-hop", "multihop",
     }
 
     cleaned: List[str] = []
@@ -4694,25 +4695,41 @@ def answer_graph_relations_strict(
 
     def is_edge_relevant(src: str, tgt: str, relation: str = "") -> bool:
         """
-        Un arco è pertinente solo quando sorgente e target corrispondono a due
-        concetti distinti richiesti dall'utente. Il nome della relazione non può
-        compensare un estremo fuori target.
+        Un arco è pertinente solo se:
+        - collega almeno un concetto richiesto;
+        - e preferibilmente collega due concetti richiesti oppure un concetto richiesto
+          a un nodo intermedio semanticamente presente nella query.
         """
-        src_text = str(src or "").lower()
-        tgt_text = str(tgt or "").lower()
+        src_can = _canonical_graph_concept(src)
+        tgt_can = _canonical_graph_concept(tgt)
 
-        src_hits = {
-            _canonical_graph_concept(c)
-            for c in concepts
-            if _concept_in_text(c, src_text)
-        }
-        tgt_hits = {
-            _canonical_graph_concept(c)
-            for c in concepts
-            if _concept_in_text(c, tgt_text)
-        }
+        relation_text = " ".join([str(src), str(relation), str(tgt)]).lower()
 
-        return bool(src_hits and tgt_hits and len(src_hits | tgt_hits) >= 2)
+        direct_hits = 0
+
+        for c in concept_canons:
+            if not c:
+                continue
+
+            if c == src_can or c == tgt_can:
+                direct_hits += 1
+                continue
+
+            if c in src_can or src_can in c:
+                direct_hits += 1
+                continue
+
+            if c in tgt_can or tgt_can in c:
+                direct_hits += 1
+                continue
+
+            if c in relation_text:
+                direct_hits += 1
+
+        # Almeno due concetti richiesti devono essere coinvolti.
+        # Questo evita archi veri ma fuori target, es. GDPR -> ISO/IEC 27001
+        # quando ISO/IEC 27001 non è richiesto dalla domanda.
+        return direct_hits >= 2
 
     def add_row(row: Dict[str, Any]) -> None:
         src = str(row.get("source", "")).strip()
@@ -4732,9 +4749,9 @@ def answer_graph_relations_strict(
             seen_pairs.add(pair_key)
 
         key = (
-            src_can,
+            src.lower(),
             rel.lower(),
-            tgt_can,
+            tgt.lower(),
             str(row.get("filename", "")).lower(),
             str(row.get("page", "")),
             status,
@@ -4768,14 +4785,10 @@ def answer_graph_relations_strict(
         if len(rows) >= max_rows:
             break
 
-    # 2) Supporto testuale: usa solo vere fonti documentali e distingue
-    # stessa frase da semplice co-occorrenza nello stesso chunk.
+    # 2) Supporto testuale: co-occorrenze nei chunk recuperati.
     if len(rows) < max_rows:
         for s in sources:
             if not s.content:
-                continue
-
-            if normalize_tier_value(s.tier) == "GRAPH" or s.type == "graph_relations":
                 continue
 
             text = s.content
@@ -4793,32 +4806,18 @@ def answer_graph_relations_strict(
                 for j in range(i + 1, len(matched)):
                     src = matched[i]
                     tgt = matched[j]
-                    src_alias = _best_alias_for_text(src, text_l)
-                    tgt_alias = _best_alias_for_text(tgt, text_l)
-                    snippet, evidence_level = _evidence_snippet_for_pair(
-                        text,
-                        src_alias,
-                        tgt_alias,
-                    )
 
-                    if not snippet:
-                        continue
-
-                    status = (
-                        "supporto testuale forte, non esplicita come arco"
-                        if evidence_level == "supporto_testuale_forte"
-                        else "co-occorrenza debole, non esplicita come arco"
-                    )
-
-                    add_row({
+                    row = {
                         "source": src,
                         "relation": "collegamento testuale",
                         "target": tgt,
                         "filename": s.filename or "N/D",
                         "page": s.page or "",
-                        "evidence": snippet,
-                        "status": status,
-                    })
+                        "evidence": (text[:300] + "...") if len(text) > 300 else text,
+                        "status": "supporto testuale forte, non esplicita come arco",
+                    }
+
+                    add_row(row)
 
                     if len(rows) >= max_rows:
                         break
@@ -5428,6 +5427,8 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
             candidates_dict[uid] = {
                 "id": uid,
                 "content": d.get("content", ""),
+                "filename": fname,
+                "doc_id": str(meta.get("doc_id") or ""),
                 "filename": fname,
                 "doc_id": str(meta.get("doc_id") or ""),
                 "page": page,
@@ -7993,18 +7994,10 @@ class State(rx.State):
                                 )
                             )
                                 
-                # 2. RAGGRUPPAMENTO FONTI CON BUDGET EQUO PER SORGENTE
+                # 2. RAGGRUPPAMENTO FONTI (FIXED CON MAX_CONTEXT_CHARS)
                 c_a_list, c_b_list, c_c_list, c_g_list = [], [], [], []
                 current_context_length = 0
-                max_allowed_length = MAX_CONTEXT_CHARS
-                non_empty_sources = [s for s in sources if (s.content or "").strip()]
-                per_source_budget = max(
-                    600,
-                    min(
-                        4000,
-                        (max_allowed_length // max(1, len(non_empty_sources))) - 300,
-                    ),
-                )
+                max_allowed_length = MAX_CONTEXT_CHARS # Es. 16000
 
                 for i, s in enumerate(sources, start=1):
                     tier_norm = normalize_tier_value(s.tier)
@@ -8016,14 +8009,12 @@ class State(rx.State):
                     if not body:
                         continue
 
-                    body = body[:per_source_budget]
                     snippet = header + meta + body + "\n\n"
-
+                    
+                    # STOP SE SUPERIAMO IL LIMITE DEL PROMPT
                     if current_context_length + len(snippet) > max_allowed_length:
-                        remaining = max_allowed_length - current_context_length - len(header) - len(meta) - 2
-                        if remaining <= 200:
-                            continue
-                        snippet = header + meta + body[:remaining] + "\n\n"
+                        print(f"⚠️ Raggiunto MAX_CONTEXT_CHARS ({max_allowed_length}). Chunk {i} e successivi ignorati per LLM.")
+                        break
 
                     if tier_norm == "A":
                         c_a_list.append(snippet)
@@ -8033,7 +8024,7 @@ class State(rx.State):
                         c_g_list.append(snippet)
                     else:
                         c_c_list.append(snippet)
-
+                        
                     current_context_length += len(snippet)
 
                 c_a = "".join(c_a_list).strip()
@@ -8999,34 +8990,10 @@ def _is_noise_formula_row_v45(row: Dict[str, Any]) -> bool:
 
     generic_names = {
         "", "formula/metric", "formula recuperata", "contenuto", "variabili",
-        "metrica/indicatore citato", "formula", "metric",
-        "formule e modelli matematici", "elemento recuperato",
+        "metrica/indicatore citato", "formula", "metric", "formule e modelli matematici",
+        "formule e modelli matematici - pagina 12 --", "formule e modelli matematici - pagina 24 --",
+        "elemento recuperato",
     }
-
-    combined = " ".join([
-        name,
-        formula,
-        _formula_display_text(row.get("meaning") or "", 500).lower(),
-    ])
-
-    structural_noise = (
-        "tikzpicture",
-        "begintikzpicture",
-        "\\draw",
-        "\\node",
-        "ode[",
-        "cm,x=",
-        "cm,y=",
-    )
-
-    if any(marker in combined for marker in structural_noise):
-        return True
-
-    if re.fullmatch(
-        r"formule e modelli matematici(?:\s*-\s*pagina\s*\d+\s*--?)?",
-        name,
-    ):
-        return True
 
     if tipo == "regola soglia":
         return not _looks_threshold_rule(" ".join([name, formula, str(row.get("meaning") or "")]))
@@ -9281,7 +9248,7 @@ def extract_exact_phrases(query_text: str) -> List[str]:
     q = query_text or ""
     phrases: List[str] = []
 
-    quoted = re.findall(r"[\"“'«]([^\"”'»]+)[\"”'»]", q)
+    quoted = re.findall(r"[\"“']([^\"”']+)[\"”']", q)
     phrases.extend([x.strip().lower() for x in quoted if len(x.strip()) > 2])
 
     acronyms = re.findall(r"\b[A-Z]{2,8}\b", q)

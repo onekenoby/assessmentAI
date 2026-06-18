@@ -1,3 +1,6 @@
+*.db
+.states
+assets/external/
 # Python
 __pycache__/
 *.py[cod]

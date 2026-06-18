@@ -9,7 +9,9 @@ echo Questo comando ferma i servizi assessment e rag_gui.
 echo I dati persistenti restano nelle cartelle ./data.
 echo.
 
-docker compose --profile assessment --profile rag_gui down
+rem docker compose --profile assessment --profile rag_gui down
+
+docker compose --profile assessment --profile rag_gui up -d --force-recreate rag_gui_assessment
 
 echo.
 echo ======================================================

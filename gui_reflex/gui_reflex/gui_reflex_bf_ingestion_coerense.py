@@ -208,12 +208,24 @@ VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", LLM_MODEL_NAME)
 # alternativa
 #LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama3.1:8b")
 #VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "ministral-3:8b")
-
 #EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
-EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
+#EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
 
 #RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-RERANKER_MODEL_NAME = "E:/Modelli/ms-marco-reranker"
+#RERANKER_MODEL_NAME = "E:/Modelli/ms-marco-reranker"
+
+
+
+# conf. docker 
+EMBEDDING_MODEL_NAME = os.getenv(
+    "EMBEDDING_MODEL_NAME",
+    "/workspace/models/bge-m3"
+)
+
+RERANKER_MODEL_NAME = os.getenv(
+    "RERANKER_MODEL_NAME",
+    "/workspace/models/ms-marco-reranker"
+)
 
 
 # LM Studio / OpenAI Compatible API
@@ -226,7 +238,7 @@ OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "ollama")  # dummy key, Ollama non 
 # =========================
 # 🧠 LLM / OLLAMA CONTEXT
 # =========================
-LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "8192"))
+LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "16384")) #8192
 LLM_NUM_PREDICT = int(os.getenv("LLM_NUM_PREDICT", "4096"))
 
 # =========================
@@ -304,8 +316,8 @@ GRAPH_MAX_FORMULAS = int(os.getenv("GRAPH_MAX_FORMULAS", "6"))
 GRAPH_MAX_NEIGHBOR_CHUNKS = int(os.getenv("GRAPH_MAX_NEIGHBOR_CHUNKS", "4"))
 
 # Prompt limits
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "16000"))  # prevent prompt blow-ups
-MAX_ASSISTANT_CHARS = int(os.getenv("MAX_ASSISTANT_CHARS", "12000"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "24000"))  # 16000 - prevent prompt blow-ups
+MAX_ASSISTANT_CHARS = int(os.getenv("MAX_ASSISTANT_CHARS", "15000"))
 
 AUDIT_ENABLED = True
 AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "./rag_audit.jsonl")
@@ -468,21 +480,29 @@ class SourceItem(BaseModel):
     content: str
     filename: str
     page: int = 0
+
+    # Provenance introdotta dalla nuova ingestion
+    page_chunk_index: int = 0
+    doc_id: str = ""
+
     type: str = "text"
     score: float = 0.0
     graph_context: List[GraphEntity] = Field(default_factory=list)
-    # extra provenance / metadata
+
+    # Extra provenance / metadata
     section_hint: str = ""
     image_id: Optional[int] = None
-    #NEW
     tier: str = "C"
-    # ✅ PG canonical provenance
+
+    # PostgreSQL canonical provenance
     pg_ingestion_ts: str = ""
     pg_source_name: str = ""
     pg_source_type: str = ""
     pg_log_id: int = 0
     pg_chunk_id: int = 0
+    pg_page_chunk_index: int = 0
     pg_toon_type: str = ""
+
     db_origin: str = "Unknown"
     
 class RetrievalDebug(BaseModel):
@@ -2769,28 +2789,57 @@ def tier_score_delta(tier: str, query_text: str) -> float:
     # GRAPH, USER, UNKNOWN: nessun boost metodologico
     return 0.0
 
-def diversify(items: List[Dict[str, Any]], max_per_page: int, max_per_doc: int, final_k: int) -> List[Dict[str, Any]]:
-    """Keep best-scoring items but limit duplicates by page and document."""
+def diversify(
+    items: List[Dict[str, Any]],
+    max_per_page: int,
+    max_per_doc: int,
+    final_k: int,
+) -> List[Dict[str, Any]]:
+    """
+    Mantiene i migliori candidati limitando le duplicazioni.
+
+    Usa doc_id quando disponibile; il filename normalizzato resta
+    il fallback per dati precedenti o incompleti.
+    """
     out = []
+
     page_count: Dict[Tuple[str, int], int] = {}
     doc_count: Dict[str, int] = {}
 
-    for it in sorted(items, key=lambda x: float(x.get("final_score", x.get("score", 0.0))), reverse=True):
-        fname = it.get("filename", "Unknown")
-        page = int(it.get("page", 0))
-        page_key = (fname, page)
+    sorted_items = sorted(
+        items,
+        key=lambda x: float(
+            x.get("final_score", x.get("score", 0.0))
+        ),
+        reverse=True,
+    )
 
-        if doc_count.get(fname, 0) >= max_per_doc:
+    for it in sorted_items:
+        filename = str(it.get("filename") or "Unknown")
+
+        doc_key = str(
+            it.get("doc_id")
+            or normalize_doc_name(filename)
+            or filename
+        )
+
+        page = int(it.get("page") or 0)
+        page_key = (doc_key, page)
+
+        if doc_count.get(doc_key, 0) >= max_per_doc:
             continue
+
         if page_count.get(page_key, 0) >= max_per_page:
             continue
 
         out.append(it)
-        doc_count[fname] = doc_count.get(fname, 0) + 1
+
+        doc_count[doc_key] = doc_count.get(doc_key, 0) + 1
         page_count[page_key] = page_count.get(page_key, 0) + 1
 
         if len(out) >= final_k:
             break
+
     return out
 
 def append_audit_log(audit: AuditTrail):
@@ -2947,27 +2996,102 @@ def get_formulas_for_chunks(chunk_ids: List[str], limit_per_chunk: int = 5) -> D
     return formula_map
 
 
-def get_neighbor_chunk_ids(chunk_ids: List[str], limit: int = GRAPH_MAX_NEIGHBOR_CHUNKS) -> List[str]:
+def get_neighbor_chunk_ids(
+    chunk_ids: List[str],
+    limit: int = GRAPH_MAX_NEIGHBOR_CHUNKS,
+) -> List[str]:
     """
-    Espande semanticamente i chunk usando entità condivise nel grafo.
-    Coerente con ingestion:
-    - Entity -> Chunk usa PRESENT_IN
-    - Compatibile anche con MENTIONED_IN per vecchi dati
+    Espande semanticamente i chunk usando due livelli:
+
+    1. Entità condivise direttamente dai chunk:
+       richiede almeno 2 entità comuni e assegna peso doppio.
+
+    2. Entità condivise a livello pagina:
+       richiede almeno 3 entità comuni e assegna peso normale.
     """
     if not chunk_ids or not neo4j_driver:
         return []
 
     query = """
-    MATCH (c1:Chunk)<-[:PRESENT_IN|MENTIONED_IN]-(e:Entity)-[:PRESENT_IN|MENTIONED_IN]->(c2:Chunk)
-    WHERE coalesce(c1.chunk_id, c1.id) IN $ids
-      AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
-      AND NOT toUpper(coalesce(e.type, e.category, labels(e)[0], '')) IN ['GENERIC', 'YEAR', 'DATE']
+    CALL {
+        // Percorso diretto e più preciso
+        MATCH
+            (c1:Chunk)
+            <-[:PRESENT_IN|MENTIONED_IN]-
+            (e:Entity)
+            -[:PRESENT_IN|MENTIONED_IN]->
+            (c2:Chunk)
 
-    WITH c2, count(DISTINCT e) AS strength
-    WHERE strength >= 2
+        WHERE coalesce(c1.chunk_id, c1.id) IN $ids
+          AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
+          AND NOT toUpper(
+              coalesce(
+                  e.type,
+                  e.category,
+                  labels(e)[0],
+                  ''
+              )
+          ) IN ['GENERIC', 'YEAR', 'DATE']
 
-    RETURN coalesce(c2.chunk_id, c2.id) AS cid
-    ORDER BY strength DESC
+        WITH
+            c2,
+            count(DISTINCT e) AS entity_count
+
+        WHERE entity_count >= 2
+
+        RETURN
+            c2,
+            toFloat(entity_count) * 2.0 AS strength
+
+        UNION ALL
+
+        // Fallback a livello pagina
+        MATCH
+            (c1:Chunk)
+            <-[:HAS_CHUNK]-
+            (p1:Page)
+            <-[:PRESENT_ON]-
+            (e:Entity)
+            -[:PRESENT_ON]->
+            (p2:Page)
+            -[:HAS_CHUNK]->
+            (c2:Chunk)
+
+        WHERE coalesce(c1.chunk_id, c1.id) IN $ids
+          AND p1 <> p2
+          AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
+          AND NOT toUpper(
+              coalesce(
+                  e.type,
+                  e.category,
+                  labels(e)[0],
+                  ''
+              )
+          ) IN ['GENERIC', 'YEAR', 'DATE']
+
+        WITH
+            c2,
+            count(DISTINCT e) AS entity_count
+
+        WHERE entity_count >= 3
+
+        RETURN
+            c2,
+            toFloat(entity_count) AS strength
+    }
+
+    WITH
+        c2,
+        max(strength) AS strength
+
+    RETURN
+        coalesce(c2.chunk_id, c2.id) AS cid
+
+    ORDER BY
+        strength DESC,
+        coalesce(c2.page, 0),
+        coalesce(c2.page_chunk_index, 0)
+
     LIMIT $lim
     """
 
@@ -2975,8 +3099,17 @@ def get_neighbor_chunk_ids(chunk_ids: List[str], limit: int = GRAPH_MAX_NEIGHBOR
 
     try:
         with neo4j_driver.session() as session:
-            res = session.run(query, ids=chunk_ids, lim=limit)
-            out = [str(r["cid"]) for r in res if r.get("cid")]
+            res = session.run(
+                query,
+                ids=chunk_ids,
+                lim=limit,
+            )
+
+            out = [
+                str(r["cid"])
+                for r in res
+                if r.get("cid")
+            ]
 
     except Exception as e:
         print(f"⚠️ Neo4j Semantic Neighbors Error: {e}")
@@ -3008,12 +3141,16 @@ def fetch_chunks_from_qdrant_by_ids(ids: List[str]) -> List[SourceItem]:
                     content=content,
                     filename=str(payload.get("filename", "Unknown")),
                     page=get_payload_page(payload),
+                    page_chunk_index=int(
+                        payload.get("page_chunk_index") or 0
+                    ),
+                    doc_id=str(payload.get("doc_id") or ""),
                     type=get_payload_type(payload),
                     score=0.0,
                     graph_context=[],
                     section_hint=get_payload_section(payload),
                     image_id=get_payload_image_id(payload),
-                    tier=tier,  # ✅ NEW
+                    tier=tier,
                 )
             )
     except Exception as e:
@@ -3728,14 +3865,23 @@ def extract_rag_tokens(query_text: str) -> List[str]:
     return [t for t in extract_search_tokens(query_text) if t not in RAG_STOPWORDS]
 
 
-def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """
-    Ricerca diretta nel grafo Neo4j sui nodi Entity reali.
 
-    Coerente con ingestion.py:
-    - ingestion crea nodi (e:Entity)
-    - collega Entity -> Chunk con PRESENT_IN
-    - il contenuto completo viene arricchito dopo da Postgres tramite chunk_uuid
+def search_neo4j_entities(
+    query_text: str,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Ricerca diretta sui nodi Entity.
+
+    Percorsi supportati:
+    1. Entity -> MENTIONED_IN/PRESENT_IN -> Chunk
+       Provenance precisa: peso 2.
+
+    2. Entity -> PRESENT_ON -> Page -> HAS_CHUNK -> Chunk
+       Provenance a livello pagina: peso 1.
+
+    Il contenuto completo viene poi recuperato da PostgreSQL
+    tramite chunk_uuid.
     """
     if not neo4j_driver or not query_text.strip():
         return []
@@ -3746,27 +3892,103 @@ def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, An
         return []
 
     cypher = """
-    MATCH (e:Entity)-[:PRESENT_IN|MENTIONED_IN]->(c:Chunk)
-    WHERE any(tok IN $tokens WHERE
-        toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
-        toLower(coalesce(e.description, '')) CONTAINS tok OR
-        toLower(coalesce(e.category, e.type, labels(e)[0], '')) CONTAINS tok OR
-        any(s IN coalesce(e.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
-        toLower(coalesce(c.filename, '')) CONTAINS tok OR
-        toLower(coalesce(c.text, '')) CONTAINS tok
-    )
+    CALL {
+        // Percorso preciso: Entity -> Chunk
+        MATCH (e:Entity)-[:PRESENT_IN|MENTIONED_IN]->(c:Chunk)
+        WHERE any(tok IN $tokens WHERE
+            toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
+            toLower(coalesce(e.description, '')) CONTAINS tok OR
+            toLower(
+                coalesce(
+                    e.category,
+                    e.type,
+                    labels(e)[0],
+                    ''
+                )
+            ) CONTAINS tok OR
+            any(
+                s IN coalesce(e.synonyms, [])
+                WHERE toLower(toString(s)) CONTAINS tok
+            ) OR
+            toLower(coalesce(c.filename, '')) CONTAINS tok OR
+            toLower(coalesce(c.text, '')) CONTAINS tok
+        )
+
+        RETURN
+            c,
+            e,
+            2.0 AS provenance_weight
+
+        UNION ALL
+
+        // Percorso di fallback: Entity -> Page -> Chunk
+        MATCH
+            (e:Entity)-[:PRESENT_ON]->
+            (p:Page)-[:HAS_CHUNK]->
+            (c:Chunk)
+
+        WHERE any(tok IN $tokens WHERE
+            toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
+            toLower(coalesce(e.description, '')) CONTAINS tok OR
+            toLower(
+                coalesce(
+                    e.category,
+                    e.type,
+                    labels(e)[0],
+                    ''
+                )
+            ) CONTAINS tok OR
+            any(
+                s IN coalesce(e.synonyms, [])
+                WHERE toLower(toString(s)) CONTAINS tok
+            ) OR
+            toLower(coalesce(p.filename, c.filename, '')) CONTAINS tok OR
+            toLower(coalesce(c.text, '')) CONTAINS tok
+        )
+        AND (
+            coalesce(c.page_chunk_index, 0) = 0
+            OR any(
+                tok IN $tokens
+                WHERE toLower(coalesce(c.text, '')) CONTAINS tok
+            )
+        )
+
+        RETURN
+            c,
+            e,
+            1.0 AS provenance_weight
+    }
+
+    // Se la stessa entità è raggiunta da entrambi i percorsi,
+    // conserva il peso più forte.
+    WITH
+        c,
+        e,
+        max(provenance_weight) AS entity_weight
+
     WITH
         c,
         collect(DISTINCT coalesce(e.name, e.id)) AS entities,
-        count(DISTINCT e) AS rel_count
+        count(DISTINCT e) AS rel_count,
+        sum(entity_weight) AS graph_score
+
     RETURN
         coalesce(c.chunk_id, c.id) AS chunk_id,
+        coalesce(c.doc_id, '') AS doc_id,
         coalesce(c.filename, 'Neo4j') AS filename,
         coalesce(c.page, 0) AS page,
         coalesce(c.chunk_index, 0) AS chunk_index,
+        coalesce(c.page_chunk_index, 0) AS page_chunk_index,
         entities,
-        rel_count
-    ORDER BY rel_count DESC, page ASC, chunk_index ASC
+        rel_count,
+        graph_score
+
+    ORDER BY
+        graph_score DESC,
+        rel_count DESC,
+        page ASC,
+        page_chunk_index ASC
+
     LIMIT $limit
     """
 
@@ -3774,7 +3996,11 @@ def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, An
 
     try:
         with neo4j_driver.session() as session:
-            rows = session.run(cypher, tokens=tokens, limit=limit)
+            rows = session.run(
+                cypher,
+                tokens=tokens,
+                limit=limit,
+            )
 
             for r in rows:
                 cid = r.get("chunk_id")
@@ -3783,24 +4009,38 @@ def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, An
                     continue
 
                 entities = r.get("entities") or []
-                entity_preview = ", ".join(str(x) for x in entities[:12])
+                entity_preview = ", ".join(
+                    str(x) for x in entities[:12]
+                )
 
                 out.append({
                     "id": str(cid),
+                    "doc_id": str(r.get("doc_id") or ""),
                     "content": "Entity match: " + entity_preview,
                     "filename": r.get("filename") or "Neo4j",
                     "page": int(r.get("page") or 0),
+                    "page_chunk_index": int(
+                        r.get("page_chunk_index") or 0
+                    ),
                     "type": "graph",
                     "tier": "GRAPH",
-                    "score_graph": float(r.get("rel_count") or 1.0),
+                    "score_graph": float(
+                        r.get("graph_score")
+                        or r.get("rel_count")
+                        or 1.0
+                    ),
                     "origin": "Neo4j Entity Search",
-                    "section_hint": "Entities: " + ", ".join(str(x) for x in entities[:5]),
+                    "section_hint": (
+                        "Entities: "
+                        + ", ".join(str(x) for x in entities[:5])
+                    ),
                 })
 
     except Exception as e:
         print(f"⚠️ Neo4j entity search error: {e}")
 
     return out
+
 
 def search_neo4j_formulas(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
     """
@@ -3836,12 +4076,13 @@ def search_neo4j_formulas(query_text: str, limit: int = 20) -> List[Dict[str, An
     )
     RETURN
         coalesce(c.chunk_id, c.id) AS chunk_id,
+        coalesce(c.doc_id, '') AS doc_id,
         coalesce(c.filename, 'Neo4j') AS filename,
         coalesce(c.page, 0) AS page,
         coalesce(c.chunk_index, 0) AS chunk_index,
+        coalesce(c.page_chunk_index, 0) AS page_chunk_index,
         coalesce(f.latex, f.formula, '') AS latex,
-        coalesce(f.plain, f.name, f.id, '') AS plain,
-        coalesce(f.meaning_it, f.description, '') AS meaning,
+        
         count(*) AS rel_count
     ORDER BY page ASC, chunk_index ASC
     LIMIT $limit
@@ -3879,12 +4120,21 @@ def search_neo4j_formulas(query_text: str, limit: int = 20) -> List[Dict[str, An
 
                 out.append({
                     "id": str(cid),
-                    "content": "Formula from Knowledge Graph:\n" + "\n".join(formula_parts),
+                    "doc_id": str(r.get("doc_id") or ""),
+                    "content": (
+                        "Formula from Knowledge Graph:\n"
+                        + "\n".join(formula_parts)
+                    ),
                     "filename": r.get("filename") or "Neo4j",
                     "page": int(r.get("page") or 0),
+                    "page_chunk_index": int(
+                        r.get("page_chunk_index") or 0
+                    ),
                     "type": "formula",
                     "tier": "GRAPH",
-                    "score_graph": float(r.get("rel_count") or 5.0),
+                    "score_graph": float(
+                        r.get("rel_count") or 5.0
+                    ),
                     "origin": "Neo4j Formula Search",
                     "section_hint": "Formula node",
                 })
@@ -3999,7 +4249,7 @@ def filter_neo4j_relation_rows(
     return [r for _, _, r in scored[:limit]]
 
 
-def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, Any]]:
+def search_neo4j_relations(query_text: str, limit: int = 60) -> List[Dict[str, Any]]:
     """Restituisce vere relazioni Entity-[:REL]->Entity dal KG, non solo chunk collegati."""
     if not neo4j_driver:
         return []
@@ -4064,28 +4314,106 @@ def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, A
         tokens.append("risk")
     # --- FINE FIX 3 ---
 
-    # CYPHER FIX: Aggiunto il controllo su e.category, e.type e labels(e)
-    # in modo che token come "securityincident" facciano match sull'ontologia del nodo.
+    # Elimina eventuali duplicati introdotti dall'espansione dei token.
+    tokens = list(dict.fromkeys(tokens))
+
+    # Recupera la provenance sia dalle proprietà dell'arco,
+    # sia dai nuovi collegamenti Page/Chunk.
     cypher = """
     MATCH (e1:Entity)-[rel]->(e2:Entity)
+
     WHERE any(tok IN $tokens WHERE
         toLower(coalesce(e1.name, e1.id, '')) CONTAINS tok OR
         toLower(coalesce(e2.name, e2.id, '')) CONTAINS tok OR
         toLower(coalesce(e1.description, '')) CONTAINS tok OR
         toLower(coalesce(e2.description, '')) CONTAINS tok OR
-        toLower(coalesce(e1.category, e1.type, labels(e1)[0], '')) CONTAINS tok OR
-        toLower(coalesce(e2.category, e2.type, labels(e2)[0], '')) CONTAINS tok OR
-        any(s IN coalesce(e1.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
-        any(s IN coalesce(e2.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok)
+        toLower(
+            coalesce(
+                e1.category,
+                e1.type,
+                labels(e1)[0],
+                ''
+            )
+        ) CONTAINS tok OR
+        toLower(
+            coalesce(
+                e2.category,
+                e2.type,
+                labels(e2)[0],
+                ''
+            )
+        ) CONTAINS tok OR
+        any(
+            s IN coalesce(e1.synonyms, [])
+            WHERE toLower(toString(s)) CONTAINS tok
+        ) OR
+        any(
+            s IN coalesce(e2.synonyms, [])
+            WHERE toLower(toString(s)) CONTAINS tok
+        )
     )
-    OPTIONAL MATCH (e1)-[:PRESENT_IN|MENTIONED_IN]->(c1:Chunk)
-    OPTIONAL MATCH (e2)-[:PRESENT_IN|MENTIONED_IN]->(c2:Chunk)
-    RETURN coalesce(e1.name, e1.id) AS source,
-           type(rel) AS relation,
-           coalesce(e2.name, e2.id) AS target,
-           properties(rel) AS props,
-           coalesce(rel.filename, rel.source_name, c1.filename, c2.filename, '') AS filename,
-           coalesce(rel.page_no, rel.page, c1.page, c2.page, 0) AS page
+
+    // Provenance della prima entità
+    CALL {
+        WITH e1
+
+        OPTIONAL MATCH
+            (e1)-[:PRESENT_IN|MENTIONED_IN]->
+            (c1:Chunk)
+
+        OPTIONAL MATCH
+            (e1)-[:PRESENT_ON]->
+            (p1:Page)
+
+        RETURN
+            head(collect(DISTINCT c1)) AS c1,
+            head(collect(DISTINCT p1)) AS p1
+    }
+
+    // Provenance della seconda entità
+    CALL {
+        WITH e2
+
+        OPTIONAL MATCH
+            (e2)-[:PRESENT_IN|MENTIONED_IN]->
+            (c2:Chunk)
+
+        OPTIONAL MATCH
+            (e2)-[:PRESENT_ON]->
+            (p2:Page)
+
+        RETURN
+            head(collect(DISTINCT c2)) AS c2,
+            head(collect(DISTINCT p2)) AS p2
+    }
+
+    RETURN
+        coalesce(e1.name, e1.id) AS source,
+        type(rel) AS relation,
+        coalesce(e2.name, e2.id) AS target,
+        properties(rel) AS props,
+
+        coalesce(
+            rel.source_file,
+            rel.filename,
+            rel.source_name,
+            p1.filename,
+            p2.filename,
+            c1.filename,
+            c2.filename,
+            ''
+        ) AS filename,
+
+        coalesce(
+            rel.page_no,
+            rel.page,
+            p1.page_no,
+            p2.page_no,
+            c1.page,
+            c2.page,
+            0
+        ) AS page
+
     LIMIT $limit
     """
 
@@ -5243,7 +5571,7 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
     t0 = time.time()
 
     neo4j_entity_hits = search_neo4j_entities(expanded_query, limit=30)
-    neo4j_relation_rows = search_neo4j_relations(expanded_query, limit=40)
+    neo4j_relation_rows = search_neo4j_relations(expanded_query, limit=60)
 
     # Se l'utente ha chiesto un documento specifico,
     # anche le relazioni Neo4j devono rispettare lo stesso perimetro.
@@ -5296,9 +5624,15 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
             "id": uid,
             "content": content,
             "filename": str(payload.get("filename", "Unknown")),
+            "doc_id": str(payload.get("doc_id") or ""),
             "page": get_payload_page(payload),
+            "page_chunk_index": int(
+                payload.get("page_chunk_index") or 0
+            ),
             "type": get_payload_type(payload),
-            "tier": normalize_tier_value(str(payload.get("tier", "C"))),
+            "tier": normalize_tier_value(
+                str(payload.get("tier", "C"))
+            ),
             "score_base": float(hit.score or 0.0),
             "score_vec": float(hit.score or 0.0),
             "score_bm25": 0.0,
@@ -5333,7 +5667,11 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "id": uid,
                 "content": d.get("content", ""),
                 "filename": fname,
+                "doc_id": str(meta.get("doc_id") or ""),
                 "page": page,
+                "page_chunk_index": int(
+                    meta.get("page_chunk_index") or 0
+                ),
                 "type": toon_type,
                 "tier": tier,
                 "score_base": 0.0,
@@ -5383,7 +5721,11 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "id": uid,
                 "content": e.get("content", ""),
                 "filename": fname,
+                "doc_id": str(meta.get("doc_id") or ""),
                 "page": page,
+                "page_chunk_index": int(
+                    meta.get("page_chunk_index") or 0
+                ),
                 "type": toon_type,
                 "tier": tier,
                 "score_base": 0.0,
@@ -5395,7 +5737,6 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "section_hint": meta.get("section_hint", ""),
                 "image_id": meta.get("image_id"),
             }
-        else:
             candidates_dict[uid]["score_bm25"] = max(float(candidates_dict[uid].get("score_bm25", 0.0)), float(e.get("score", 2.0)))
             candidates_dict[uid]["score_exact"] = 1.0
             if "PostgresExactPhrase" not in candidates_dict[uid]["origin"]:
@@ -5424,7 +5765,11 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "id": uid,
                 "content": b.get("content", ""),
                 "filename": fname,
+                "doc_id": str(meta.get("doc_id") or ""),
                 "page": page,
+                "page_chunk_index": int(
+                    meta.get("page_chunk_index") or 0
+                ),
                 "type": toon_type,
                 "tier": tier,
                 "score_base": 0.0,
@@ -5454,13 +5799,19 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "id": uid,
                 "content": g.get("content", ""),
                 "filename": g.get("filename", "Neo4j"),
+                "doc_id": str(g.get("doc_id") or ""),
                 "page": int(g.get("page") or 0),
+                "page_chunk_index": int(
+                    g.get("page_chunk_index") or 0
+                ),
                 "type": g.get("type", "graph"),
                 "tier": "GRAPH",
                 "score_base": 0.0,
                 "score_vec": 0.0,
                 "score_bm25": 0.0,
-                "score_graph": float(g.get("score_graph", 0.0)),
+                "score_graph": float(
+                    g.get("score_graph", 0.0)
+                ),
                 "origin": g.get("origin", "Neo4j"),
                 "section_hint": g.get("section_hint", ""),
             }
@@ -5497,15 +5848,23 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                         "id": gs.id,
                         "content": gs.content,
                         "filename": gs.filename,
+                        "doc_id": gs.doc_id,
                         "page": gs.page,
+                        "page_chunk_index": gs.page_chunk_index,
                         "type": gs.type,
-                        "tier": normalize_tier_value(getattr(gs, "tier", "C")),
+                        "tier": normalize_tier_value(
+                            getattr(gs, "tier", "C")
+                        ),
                         "score_base": 0.0,
                         "score_vec": 0.0,
                         "score_bm25": 0.0,
                         "score_graph": 1.0,
                         "origin": "Neo4j_Expansion",
-                        "section_hint": getattr(gs, "section_hint", ""),
+                        "section_hint": getattr(
+                            gs,
+                            "section_hint",
+                            "",
+                        ),
                     }
 
             print(f"🕸️ Neo4j ha aggiunto {len(graph_sources)} chunk semanticamente collegati.")
@@ -5727,12 +6086,53 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
             or "C"
         )
 
-        t["pg_ingestion_ts"] = pg_row.get("ingestion_ts", "")
-        t["pg_source_name"] = pg_meta.get("source_name", "")
-        t["pg_source_type"] = pg_meta.get("source_type", "")
-        t["pg_log_id"] = int(pg_meta.get("log_id") or 0)
-        t["pg_chunk_id"] = int(pg_meta.get("chunk_index") or 0)
-        t["pg_toon_type"] = pg_meta.get("toon_type", "")
+        t["pg_ingestion_ts"] = pg_row.get(
+            "ingestion_ts",
+            "",
+        )
+
+        t["pg_source_name"] = pg_meta.get(
+            "source_name",
+            "",
+        )
+
+        t["pg_source_type"] = pg_meta.get(
+            "source_type",
+            "",
+        )
+
+        t["pg_log_id"] = int(
+            pg_meta.get("log_id") or 0
+        )
+
+        # Provenance canonica del documento
+        t["doc_id"] = str(
+            pg_meta.get("doc_id")
+            or t.get("doc_id")
+            or ""
+        )
+
+        # Indice locale del chunk nella pagina
+        t["page_chunk_index"] = int(
+            pg_meta.get("page_chunk_index")
+            if pg_meta.get("page_chunk_index") is not None
+            else (t.get("page_chunk_index") or 0)
+        )
+
+        # Indice globale del chunk nel documento
+        t["pg_chunk_id"] = int(
+            pg_meta.get("chunk_index") or 0
+        )
+
+        # Indice locale del chunk nella pagina
+        t["pg_page_chunk_index"] = int(
+            pg_meta.get("page_chunk_index") or 0
+        )
+
+        t["pg_toon_type"] = pg_meta.get(
+            "toon_type",
+            "",
+        )
 
         if "PG_Enrich" not in t["origin"]:
             t["origin"] += " + PG_Enrich"
@@ -5763,19 +6163,65 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 id=str(t.get("id", "")),
                 content=t.get("content", ""),
                 filename=t.get("filename", "Unknown"),
+
                 page=int(t.get("page") or 0),
+                page_chunk_index=int(
+                    t.get("page_chunk_index") or 0
+                ),
+                doc_id=str(t.get("doc_id") or ""),
+
                 type=t.get("type", "text"),
-                score=float(t.get("final_score", 0.0)),
-                tier=normalize_tier_value(t.get("tier", "C")),
-                db_origin=t.get("origin", "Unknown"),
-                section_hint=t.get("section_hint", ""),
+                score=float(
+                    t.get("final_score", 0.0)
+                ),
+
+                tier=normalize_tier_value(
+                    t.get("tier", "C")
+                ),
+
+                db_origin=t.get(
+                    "origin",
+                    "Unknown",
+                ),
+
+                section_hint=t.get(
+                    "section_hint",
+                    "",
+                ),
+
                 image_id=t.get("image_id"),
-                pg_ingestion_ts=t.get("pg_ingestion_ts", ""),
-                pg_source_name=t.get("pg_source_name", ""),
-                pg_source_type=t.get("pg_source_type", ""),
-                pg_log_id=int(t.get("pg_log_id") or 0),
-                pg_chunk_id=int(t.get("pg_chunk_id") or 0),
-                pg_toon_type=t.get("pg_toon_type", ""),
+
+                pg_ingestion_ts=t.get(
+                    "pg_ingestion_ts",
+                    "",
+                ),
+
+                pg_source_name=t.get(
+                    "pg_source_name",
+                    "",
+                ),
+
+                pg_source_type=t.get(
+                    "pg_source_type",
+                    "",
+                ),
+
+                pg_log_id=int(
+                    t.get("pg_log_id") or 0
+                ),
+
+                pg_chunk_id=int(
+                    t.get("pg_chunk_id") or 0
+                ),
+
+                pg_page_chunk_index=int(
+                    t.get("pg_page_chunk_index") or 0
+                ),
+
+                pg_toon_type=t.get(
+                    "pg_toon_type",
+                    "",
+                ),
             )
         )
 
@@ -7871,13 +8317,14 @@ class State(rx.State):
                                 )
                             )
                                 
-                # 2. RAGGRUPPAMENTO FONTI
+                # 2. RAGGRUPPAMENTO FONTI (FIXED CON MAX_CONTEXT_CHARS)
                 c_a_list, c_b_list, c_c_list, c_g_list = [], [], [], []
+                current_context_length = 0
+                max_allowed_length = MAX_CONTEXT_CHARS # Es. 16000
 
                 for i, s in enumerate(sources, start=1):
                     tier_norm = normalize_tier_value(s.tier)
 
-                    # FIX: Usa "Source" e "Page" per allinearsi perfettamente al System Prompt
                     header = f"--- Source [{i}] — {s.filename} — Page {s.page} — ({s.type}) ---\n"
                     meta = f"(tier={tier_norm} | db={s.db_origin})\n"
                     body = (s.content or "").strip()
@@ -7886,6 +8333,11 @@ class State(rx.State):
                         continue
 
                     snippet = header + meta + body + "\n\n"
+                    
+                    # STOP SE SUPERIAMO IL LIMITE DEL PROMPT
+                    if current_context_length + len(snippet) > max_allowed_length:
+                        print(f"⚠️ Raggiunto MAX_CONTEXT_CHARS ({max_allowed_length}). Chunk {i} e successivi ignorati per LLM.")
+                        break
 
                     if tier_norm == "A":
                         c_a_list.append(snippet)
@@ -7894,16 +8346,18 @@ class State(rx.State):
                     elif tier_norm == "GRAPH":
                         c_g_list.append(snippet)
                     else:
-                        # FIX CRITICO: Qualsiasi tier non riconosciuto finisce qui. 
-                        # Nessun chunk recuperato verrà mai più perso.
                         c_c_list.append(snippet)
-
+                        
+                    current_context_length += len(snippet)
 
                 c_a = "".join(c_a_list).strip()
                 c_b = "".join(c_b_list).strip()
                 c_c = "".join(c_c_list).strip()
                 c_g = "".join(c_g_list).strip()
-
+                    
+                   
+                    
+                    
                 # ============================================================
                 # 🧮 MATHEMATICAL DISCIPLINE
                 # ============================================================
@@ -8213,7 +8667,7 @@ def message_ui(msg: ChatMessage):
                     variant="soft",
                     color_scheme=rx.cond(is_bot, "gray", "indigo"),
                 ),
-                rx.text(rx.cond(is_bot, "Financial AI", "Tu"), weight="bold", size="2"),
+                rx.text(rx.cond(is_bot, "AI Assessment Manager", "Tu"), weight="bold", size="2"),
                 rx.spacer(),
                 # Pulsante "Info" in alto a destra nel messaggio
                 rx.cond(
