@@ -480,23 +480,31 @@ class SourceItem(BaseModel):
     content: str
     filename: str
     page: int = 0
+
+    # Provenance condivisa tra Qdrant, PostgreSQL e Neo4j
+    page_chunk_index: int = 0
+    doc_id: str = ""
+
     type: str = "text"
     score: float = 0.0
     graph_context: List[GraphEntity] = Field(default_factory=list)
-    # extra provenance / metadata
+
+    # Extra provenance / metadata
     section_hint: str = ""
     image_id: Optional[int] = None
-    #NEW
     tier: str = "C"
-    # ✅ PG canonical provenance
+
+    # PostgreSQL canonical provenance
     pg_ingestion_ts: str = ""
     pg_source_name: str = ""
     pg_source_type: str = ""
     pg_log_id: int = 0
     pg_chunk_id: int = 0
+    pg_page_chunk_index: int = 0
     pg_toon_type: str = ""
+
     db_origin: str = "Unknown"
-    
+
 class RetrievalDebug(BaseModel):
     query: str = ""
     intent: str = "text"
@@ -1954,7 +1962,7 @@ def extract_requested_terms(query_text: str) -> List[str]:
     terms: List[str] = []
 
     # 1) Frasi esplicite tra virgolette.
-    quoted = re.findall(r"[\"“']([^\"”']+)[\"”']", q)
+    quoted = re.findall(r"[\"“'«]([^\"”'»]+)[\"”'»]", q)
     for item in quoted:
         clean = item.strip()
         if len(clean) > 2 and not _looks_like_filename(clean):
@@ -2781,28 +2789,45 @@ def tier_score_delta(tier: str, query_text: str) -> float:
     # GRAPH, USER, UNKNOWN: nessun boost metodologico
     return 0.0
 
-def diversify(items: List[Dict[str, Any]], max_per_page: int, max_per_doc: int, final_k: int) -> List[Dict[str, Any]]:
-    """Keep best-scoring items but limit duplicates by page and document."""
-    out = []
+def diversify(
+    items: List[Dict[str, Any]],
+    max_per_page: int,
+    max_per_doc: int,
+    final_k: int,
+) -> List[Dict[str, Any]]:
+    """Mantiene i migliori candidati limitando duplicazioni per documento e pagina."""
+    out: List[Dict[str, Any]] = []
     page_count: Dict[Tuple[str, int], int] = {}
     doc_count: Dict[str, int] = {}
 
-    for it in sorted(items, key=lambda x: float(x.get("final_score", x.get("score", 0.0))), reverse=True):
-        fname = it.get("filename", "Unknown")
-        page = int(it.get("page", 0))
-        page_key = (fname, page)
+    sorted_items = sorted(
+        items,
+        key=lambda x: float(x.get("final_score", x.get("score", 0.0))),
+        reverse=True,
+    )
 
-        if doc_count.get(fname, 0) >= max_per_doc:
+    for it in sorted_items:
+        filename = str(it.get("filename") or "Unknown")
+        doc_key = str(
+            it.get("doc_id")
+            or normalize_doc_name(filename)
+            or filename
+        )
+        page = int(it.get("page") or 0)
+        page_key = (doc_key, page)
+
+        if doc_count.get(doc_key, 0) >= max_per_doc:
             continue
         if page_count.get(page_key, 0) >= max_per_page:
             continue
 
         out.append(it)
-        doc_count[fname] = doc_count.get(fname, 0) + 1
+        doc_count[doc_key] = doc_count.get(doc_key, 0) + 1
         page_count[page_key] = page_count.get(page_key, 0) + 1
 
         if len(out) >= final_k:
             break
+
     return out
 
 def append_audit_log(audit: AuditTrail):
@@ -2819,7 +2844,8 @@ def get_graph_entities(chunk_ids: List[str]) -> Dict[str, List[GraphEntity]]:
     """
     Recupera le entità collegate ai chunk in modo bilanciato.
     Coerente con l'ingestion:
-    - Entity -> Chunk usa PRESENT_IN o MENTIONED_IN.
+    - Entity -> Chunk usa MENTIONED_IN.
+    - PRESENT_IN resta come compatibilità per dati legacy.
     - Bilancia il retrieval limitando le entità PER SINGOLO CHUNK,
       evitando che un chunk troppo denso cannibalizzi il limite totale.
     """
@@ -2840,8 +2866,7 @@ def get_graph_entities(chunk_ids: List[str]) -> Dict[str, List[GraphEntity]]:
     WHERE coalesce(c.chunk_id, c.id) = target_id
     
     // Subquery per limitare i risultati per singolo chunk
-    CALL {
-        WITH c
+    CALL (c) {
         MATCH (e:Entity)-[r:PRESENT_IN|MENTIONED_IN]->(c)
         
         // --- INIZIO FIX: Stop-Entities Filter ---
@@ -2912,8 +2937,7 @@ def get_formulas_for_chunks(chunk_ids: List[str], limit_per_chunk: int = 5) -> D
     MATCH (c:Chunk)
     WHERE coalesce(c.chunk_id, c.id) = target_id
     
-    CALL {
-        WITH c
+    CALL (c) {
         MATCH (f)-[:MENTIONED_IN|PRESENT_IN]->(c)
         WHERE (f:Formula OR toUpper(coalesce(f.category, '')) = 'FORMULA')
         
@@ -2959,42 +2983,66 @@ def get_formulas_for_chunks(chunk_ids: List[str], limit_per_chunk: int = 5) -> D
     return formula_map
 
 
-def get_neighbor_chunk_ids(chunk_ids: List[str], limit: int = GRAPH_MAX_NEIGHBOR_CHUNKS) -> List[str]:
+def get_neighbor_chunk_ids(
+    chunk_ids: List[str],
+    limit: int = GRAPH_MAX_NEIGHBOR_CHUNKS,
+) -> List[str]:
     """
-    Espande semanticamente i chunk usando entità condivise nel grafo.
-    Coerente con ingestion:
-    - Entity -> Chunk usa PRESENT_IN
-    - Compatibile anche con MENTIONED_IN per vecchi dati
+    Espande semanticamente i chunk usando due livelli di provenance:
+    1. MENTIONED_IN/PRESENT_IN tra entità e chunk, con peso maggiore;
+    2. PRESENT_ON tra entità e pagine, con soglia più severa.
     """
     if not chunk_ids or not neo4j_driver:
         return []
 
     query = """
-    MATCH (c1:Chunk)<-[:PRESENT_IN|MENTIONED_IN]-(e:Entity)-[:PRESENT_IN|MENTIONED_IN]->(c2:Chunk)
-    WHERE coalesce(c1.chunk_id, c1.id) IN $ids
-      AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
-      AND NOT toUpper(coalesce(e.type, e.category, labels(e)[0], '')) IN ['GENERIC', 'YEAR', 'DATE']
+    CALL () {
+        MATCH
+            (c1:Chunk)<-[:PRESENT_IN|MENTIONED_IN]-
+            (e:Entity)-[:PRESENT_IN|MENTIONED_IN]->
+            (c2:Chunk)
+        WHERE coalesce(c1.chunk_id, c1.id) IN $ids
+          AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
+          AND NOT toUpper(
+              coalesce(e.type, e.category, labels(e)[0], '')
+          ) IN ['GENERIC', 'YEAR', 'DATE']
+        WITH c2, count(DISTINCT e) AS entity_count
+        WHERE entity_count >= 2
+        RETURN c2, toFloat(entity_count) * 2.0 AS strength
 
-    WITH c2, count(DISTINCT e) AS strength
-    WHERE strength >= 2
+        UNION ALL
 
+        MATCH
+            (c1:Chunk)<-[:HAS_CHUNK]-(p1:Page)
+            <-[:PRESENT_ON]-(e:Entity)-[:PRESENT_ON]->
+            (p2:Page)-[:HAS_CHUNK]->(c2:Chunk)
+        WHERE coalesce(c1.chunk_id, c1.id) IN $ids
+          AND p1 <> p2
+          AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
+          AND NOT toUpper(
+              coalesce(e.type, e.category, labels(e)[0], '')
+          ) IN ['GENERIC', 'YEAR', 'DATE']
+        WITH c2, count(DISTINCT e) AS entity_count
+        WHERE entity_count >= 3
+        RETURN c2, toFloat(entity_count) AS strength
+    }
+
+    WITH c2, max(strength) AS strength
     RETURN coalesce(c2.chunk_id, c2.id) AS cid
-    ORDER BY strength DESC
+    ORDER BY
+        strength DESC,
+        coalesce(c2.page, 0),
+        coalesce(c2.page_chunk_index, 0)
     LIMIT $lim
     """
-
-    out: List[str] = []
 
     try:
         with neo4j_driver.session() as session:
             res = session.run(query, ids=chunk_ids, lim=limit)
-            out = [str(r["cid"]) for r in res if r.get("cid")]
-
+            return [str(r["cid"]) for r in res if r.get("cid")]
     except Exception as e:
         print(f"⚠️ Neo4j Semantic Neighbors Error: {e}")
-
-    return out
-
+        return []
 
 def fetch_chunks_from_qdrant_by_ids(ids: List[str]) -> List[SourceItem]:
     """Fetch Qdrant points by IDs (for graph expansion neighbors)."""
@@ -3020,6 +3068,8 @@ def fetch_chunks_from_qdrant_by_ids(ids: List[str]) -> List[SourceItem]:
                     content=content,
                     filename=str(payload.get("filename", "Unknown")),
                     page=get_payload_page(payload),
+                    page_chunk_index=int(payload.get("page_chunk_index") or 0),
+                    doc_id=str(payload.get("doc_id") or ""),
                     type=get_payload_type(payload),
                     score=0.0,
                     graph_context=[],
@@ -3281,52 +3331,88 @@ def search_pg_bm25(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
 
 
 def search_pg_exact_phrases(query_text: str, limit: int = 30) -> List[Dict[str, Any]]:
-    """Ricerca ILIKE deterministica per frasi/acronimi che non devono dipendere dal vettoriale."""
+    """
+    Ricerca deterministica bilanciata per ciascuna frase o acronimo.
+
+    Ogni termine estratto riceve una quota propria di risultati, evitando che
+    un solo termine o il documento ingerito più di recente saturi tutto il limite.
+    """
     if not PG_ENRICH_ENABLED or not pg_pool:
         return []
+
     phrases = extract_exact_phrases(query_text)
     if not phrases:
         return []
-    clauses = []
-    params: List[Any] = []
-    for p in phrases[:12]:
-        like = f"%{p.lower()}%"
-        clauses.append("""(
-            lower(COALESCE(content_semantic, '')) LIKE %s OR
-            lower(COALESCE(content_raw, '')) LIKE %s OR
-            lower(COALESCE(metadata_json::text, '')) LIKE %s
-        )""")
-        params.extend([like, like, like])
-    sql = f"""
-    SELECT chunk_uuid::text, content_raw, content_semantic, metadata_json, ingestion_ts
+
+    phrases = phrases[:12]
+    per_phrase_limit = max(3, limit // len(phrases))
+
+    sql_template = """
+    SELECT
+        chunk_uuid::text,
+        content_raw,
+        content_semantic,
+        metadata_json,
+        ingestion_ts
     FROM public.document_chunks
-    WHERE {' OR '.join(clauses)}
+    WHERE {condition}
     ORDER BY ingestion_ts DESC
     LIMIT %s;
     """
-    params.append(limit)
+
     conn = pg_pool.getconn()
+
     try:
+        found: Dict[str, Dict[str, Any]] = {}
+
         with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-        out: List[Dict[str, Any]] = []
-        for chunk_uuid, content_raw, content_semantic, metadata_json, ingestion_ts in rows:
-            if isinstance(metadata_json, str):
-                try:
-                    metadata_json = json.loads(metadata_json)
-                except Exception:
-                    metadata_json = {}
-            if metadata_json is None:
-                metadata_json = {}
-            out.append({"id": str(chunk_uuid), "content": content_semantic or content_raw or "", "metadata": metadata_json, "score": 2.0, "origin": "PostgresExactPhrase", "ingestion_ts": ingestion_ts.isoformat() if ingestion_ts else ""})
-        return out
+            for phrase in phrases:
+                condition, condition_params = _term_sql_condition(phrase)
+                if not condition:
+                    continue
+
+                cur.execute(
+                    sql_template.format(condition=condition),
+                    [*condition_params, per_phrase_limit],
+                )
+
+                for chunk_uuid, content_raw, content_semantic, metadata_json, ingestion_ts in cur.fetchall():
+                    if isinstance(metadata_json, str):
+                        try:
+                            metadata_json = json.loads(metadata_json)
+                        except Exception:
+                            metadata_json = {}
+
+                    if metadata_json is None:
+                        metadata_json = {}
+
+                    uid = str(chunk_uuid)
+                    existing = found.get(uid)
+
+                    if existing is None:
+                        found[uid] = {
+                            "id": uid,
+                            "content": content_semantic or content_raw or "",
+                            "metadata": metadata_json,
+                            "score": 2.0,
+                            "origin": "PostgresExactPhrase",
+                            "ingestion_ts": ingestion_ts.isoformat() if ingestion_ts else "",
+                        }
+                    else:
+                        existing["score"] = float(existing.get("score", 2.0)) + 1.0
+
+        return sorted(
+            found.values(),
+            key=lambda x: float(x.get("score", 0.0)),
+            reverse=True,
+        )[:limit]
+
     except Exception as e:
         print(f"⚠️ Exact phrase search error: {e}")
         return []
+
     finally:
         pg_pool.putconn(conn)
-
 
 def _term_sql_condition(alias: str) -> Tuple[str, List[Any]]:
     """
@@ -3528,6 +3614,8 @@ def answer_glossary_terms_directly(query_text: str) -> Tuple[str, List[SourceIte
                     content=content[:1800],
                     filename=fname,
                     page=page,
+                    page_chunk_index=int(meta.get("page_chunk_index") or 0),
+                    doc_id=str(meta.get("doc_id") or ""),
                     type=meta.get("toon_type") or meta.get("type") or "text",
                     score=2.0,
                     tier=normalize_tier_value(meta.get("tier", "C")),
@@ -3538,6 +3626,7 @@ def answer_glossary_terms_directly(query_text: str) -> Tuple[str, List[SourceIte
                     pg_source_type=meta.get("source_type", ""),
                     pg_log_id=int(meta.get("log_id") or 0),
                     pg_chunk_id=int(meta.get("chunk_index") or 0),
+                    pg_page_chunk_index=int(meta.get("page_chunk_index") or 0),
                     pg_toon_type=meta.get("toon_type", ""),
                 )
             )
@@ -3740,119 +3829,132 @@ def extract_rag_tokens(query_text: str) -> List[str]:
     return [t for t in extract_search_tokens(query_text) if t not in RAG_STOPWORDS]
 
 
-def search_neo4j_entities(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
+def search_neo4j_entities(
+    query_text: str,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
     """
-    Ricerca diretta nel grafo Neo4j sui nodi Entity reali.
-
-    Coerente con ingestion.py:
-    - ingestion crea nodi (e:Entity)
-    - collega Entity -> Chunk con PRESENT_IN
-    - il contenuto completo viene arricchito dopo da Postgres tramite chunk_uuid
+    Ricerca Entity con due percorsi:
+    - MENTIONED_IN/PRESENT_IN -> Chunk: provenance precisa, peso 2;
+    - PRESENT_ON -> Page -> HAS_CHUNK -> Chunk: fallback di pagina, peso 1.
     """
     if not neo4j_driver or not query_text.strip():
         return []
 
     tokens = extract_rag_tokens(query_text)
-
     if not tokens:
         return []
 
     cypher = """
-    MATCH (e:Entity)-[:PRESENT_IN|MENTIONED_IN]->(c:Chunk)
-    WHERE any(tok IN $tokens WHERE
-        toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
-        toLower(coalesce(e.description, '')) CONTAINS tok OR
-        toLower(coalesce(e.category, e.type, labels(e)[0], '')) CONTAINS tok OR
-        any(s IN coalesce(e.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
-        toLower(coalesce(c.filename, '')) CONTAINS tok OR
-        toLower(coalesce(c.text, '')) CONTAINS tok
-    )
+    CALL () {
+        MATCH (e:Entity)-[:PRESENT_IN|MENTIONED_IN]->(c:Chunk)
+        WHERE any(tok IN $tokens WHERE
+            toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
+            toLower(coalesce(e.description, '')) CONTAINS tok OR
+            toLower(coalesce(e.category, e.type, labels(e)[0], '')) CONTAINS tok OR
+            any(s IN coalesce(e.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
+            toLower(coalesce(c.filename, '')) CONTAINS tok OR
+            toLower(coalesce(c.text, '')) CONTAINS tok
+        )
+        RETURN c, e, 2.0 AS provenance_weight
+
+        UNION ALL
+
+        MATCH (e:Entity)-[:PRESENT_ON]->(p:Page)-[:HAS_CHUNK]->(c:Chunk)
+        WHERE any(tok IN $tokens WHERE
+            toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
+            toLower(coalesce(e.description, '')) CONTAINS tok OR
+            toLower(coalesce(e.category, e.type, labels(e)[0], '')) CONTAINS tok OR
+            any(s IN coalesce(e.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
+            toLower(coalesce(p.filename, c.filename, '')) CONTAINS tok OR
+            toLower(coalesce(c.text, '')) CONTAINS tok
+        )
+        AND (
+            coalesce(c.page_chunk_index, 0) = 0
+            OR any(tok IN $tokens WHERE toLower(coalesce(c.text, '')) CONTAINS tok)
+        )
+        RETURN c, e, 1.0 AS provenance_weight
+    }
+
+    WITH c, e, max(provenance_weight) AS entity_weight
     WITH
         c,
         collect(DISTINCT coalesce(e.name, e.id)) AS entities,
-        count(DISTINCT e) AS rel_count
+        count(DISTINCT e) AS rel_count,
+        sum(entity_weight) AS graph_score
     RETURN
         coalesce(c.chunk_id, c.id) AS chunk_id,
+        coalesce(c.doc_id, '') AS doc_id,
         coalesce(c.filename, 'Neo4j') AS filename,
         coalesce(c.page, 0) AS page,
         coalesce(c.chunk_index, 0) AS chunk_index,
+        coalesce(c.page_chunk_index, 0) AS page_chunk_index,
         entities,
-        rel_count
-    ORDER BY rel_count DESC, page ASC, chunk_index ASC
+        rel_count,
+        graph_score
+    ORDER BY graph_score DESC, rel_count DESC, page ASC, page_chunk_index ASC
     LIMIT $limit
     """
 
     out: List[Dict[str, Any]] = []
-
     try:
         with neo4j_driver.session() as session:
             rows = session.run(cypher, tokens=tokens, limit=limit)
-
             for r in rows:
                 cid = r.get("chunk_id")
-
                 if not cid:
                     continue
-
                 entities = r.get("entities") or []
-                entity_preview = ", ".join(str(x) for x in entities[:12])
-
                 out.append({
                     "id": str(cid),
-                    "content": "Entity match: " + entity_preview,
+                    "doc_id": str(r.get("doc_id") or ""),
+                    "content": "Entity match: " + ", ".join(str(x) for x in entities[:12]),
                     "filename": r.get("filename") or "Neo4j",
                     "page": int(r.get("page") or 0),
+                    "page_chunk_index": int(r.get("page_chunk_index") or 0),
                     "type": "graph",
                     "tier": "GRAPH",
-                    "score_graph": float(r.get("rel_count") or 1.0),
+                    "score_graph": float(r.get("graph_score") or r.get("rel_count") or 1.0),
                     "origin": "Neo4j Entity Search",
                     "section_hint": "Entities: " + ", ".join(str(x) for x in entities[:5]),
                 })
-
     except Exception as e:
         print(f"⚠️ Neo4j entity search error: {e}")
 
     return out
 
 def search_neo4j_formulas(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """
-    Ricerca diretta delle formule nel Knowledge Graph.
-
-    Utile per domande come:
-    - quali formule sono presenti nel documento?
-    - riportale in LaTeX
-    - quali equazioni usa il documento?
-    """
+    """Ricerca diretta delle formule nel Knowledge Graph."""
     if not neo4j_driver or not query_text.strip():
         return []
 
     tokens = extract_rag_tokens(query_text)
-
     if not tokens:
         return []
 
     cypher = """
     MATCH (f)-[:MENTIONED_IN|PRESENT_IN]->(c:Chunk)
     WHERE (
-            f:Formula
-            OR toUpper(coalesce(f.category, '')) = 'FORMULA'
-        )
+        f:Formula OR toUpper(coalesce(f.category, '')) = 'FORMULA'
+    )
     AND any(tok IN $tokens WHERE
-            toLower(coalesce(c.filename, '')) CONTAINS tok OR
-            toLower(coalesce(f.latex, '')) CONTAINS tok OR
-            toLower(coalesce(f.formula, '')) CONTAINS tok OR
-            toLower(coalesce(f.plain, '')) CONTAINS tok OR
-            toLower(coalesce(f.meaning_it, '')) CONTAINS tok OR
-            toLower(coalesce(f.description, '')) CONTAINS tok OR
-            toLower(coalesce(f.name, f.id, '')) CONTAINS tok
+        toLower(coalesce(c.filename, '')) CONTAINS tok OR
+        toLower(coalesce(f.latex, '')) CONTAINS tok OR
+        toLower(coalesce(f.formula, '')) CONTAINS tok OR
+        toLower(coalesce(f.plain, '')) CONTAINS tok OR
+        toLower(coalesce(f.meaning_it, '')) CONTAINS tok OR
+        toLower(coalesce(f.description, '')) CONTAINS tok OR
+        toLower(coalesce(f.name, f.id, f.fid, '')) CONTAINS tok
     )
     RETURN
         coalesce(c.chunk_id, c.id) AS chunk_id,
+        coalesce(c.doc_id, '') AS doc_id,
         coalesce(c.filename, 'Neo4j') AS filename,
         coalesce(c.page, 0) AS page,
         coalesce(c.chunk_index, 0) AS chunk_index,
+        coalesce(c.page_chunk_index, 0) AS page_chunk_index,
         coalesce(f.latex, f.formula, '') AS latex,
-        coalesce(f.plain, f.name, f.id, '') AS plain,
+        coalesce(f.plain, f.name, f.id, f.fid, '') AS plain,
         coalesce(f.meaning_it, f.description, '') AS meaning,
         count(*) AS rel_count
     ORDER BY page ASC, chunk_index ASC
@@ -3860,63 +3962,57 @@ def search_neo4j_formulas(query_text: str, limit: int = 20) -> List[Dict[str, An
     """
 
     out: List[Dict[str, Any]] = []
-
     try:
         with neo4j_driver.session() as session:
             rows = session.run(cypher, tokens=tokens, limit=limit)
-
             for r in rows:
                 cid = r.get("chunk_id")
-
                 if not cid:
                     continue
-
                 latex = (r.get("latex") or "").strip()
                 plain = (r.get("plain") or "").strip()
                 meaning = (r.get("meaning") or "").strip()
-
-                formula_parts = []
-
+                formula_parts: List[str] = []
                 if latex:
                     formula_parts.append(f"LaTeX: {latex}")
-
                 if plain:
                     formula_parts.append(f"Plain: {plain}")
-
                 if meaning:
                     formula_parts.append(f"Meaning: {meaning}")
-
                 if not formula_parts:
                     continue
-
                 out.append({
                     "id": str(cid),
+                    "doc_id": str(r.get("doc_id") or ""),
                     "content": "Formula from Knowledge Graph:\n" + "\n".join(formula_parts),
                     "filename": r.get("filename") or "Neo4j",
                     "page": int(r.get("page") or 0),
+                    "page_chunk_index": int(r.get("page_chunk_index") or 0),
                     "type": "formula",
                     "tier": "GRAPH",
                     "score_graph": float(r.get("rel_count") or 5.0),
                     "origin": "Neo4j Formula Search",
                     "section_hint": "Formula node",
                 })
-
     except Exception as e:
         print(f"⚠️ Neo4j formula search error: {e}")
 
     return out
 
-
 GRAPH_QUERY_NOISE_TERMS = {
-    # IT generici
+    # IT generici / istruzionali
     "usa", "usare", "spiega", "spiegare", "collegamenti", "collegamento",
     "relazioni", "relazione", "documenti", "documento", "normativi",
-    "normativo", "glossario", "fonti", "fonte", "tabella",
+    "normativo", "glossario", "fonti", "fonte", "tabella", "catena",
+    "percorso", "passaggio", "traversamento", "ricostruisci", "traccia",
+    "mostra", "verifica", "grafo", "neo4j", "multihop", "multi-hop",
 
-    # EN generici
+    # EN generici / istruzionali
     "using", "use", "explain", "relationship", "relationships",
     "relation", "relations", "retrieved", "documents", "document",
-    "sources", "source", "glossary", "table",
+    "sources", "source", "glossary", "table", "chain", "path", "step",
+    "traversal", "reconstruct", "trace", "show", "verify", "graph",
+    "multihop", "multi-hop",
 }
 
 
@@ -3973,9 +4069,9 @@ def filter_neo4j_relation_rows(
     limit: int,
 ) -> List[Dict[str, Any]]:
     """
-    Tiene relazioni Neo4j pertinenti rispetto ai concetti richiesti.
-    Non è adattativa: usa concetti estratti dalla query e matching testuale
-    su sorgente, relazione, target, proprietà e filename.
+    Mantiene solo archi i cui due estremi corrispondono a due concetti distinti
+    richiesti nella query. I token generici sono usati solo come fallback quando
+    non sono stati estratti concetti strutturati.
     """
     if not rows:
         return []
@@ -3989,95 +4085,45 @@ def filter_neo4j_relation_rows(
     scored: List[Tuple[int, int, Dict[str, Any]]] = []
 
     for row in rows:
-        text = _relation_row_text(row)
+        source_text = str(row.get("source") or "").lower()
+        target_text = str(row.get("target") or "").lower()
+        relation_text = _relation_row_text(row)
 
-        concept_hits = {
+        source_hits = {
             _canonical_graph_concept(c)
             for c in concepts
-            if _concept_in_text(c, text)
+            if _concept_in_text(c, source_text)
         }
+        target_hits = {
+            _canonical_graph_concept(c)
+            for c in concepts
+            if _concept_in_text(c, target_text)
+        }
+        endpoint_hits = source_hits | target_hits
+        token_hits = {t for t in tokens if t in relation_text}
 
-        token_hits = {t for t in tokens if t in text}
-
-        # Priorità ai concetti forti; i token servono solo come supporto.
-        concept_score = len(concept_hits)
-        token_score = len(token_hits)
-
-        if concept_score >= 1 or token_score >= 2:
-            scored.append((concept_score, token_score, row))
+        if concepts:
+            if source_hits and target_hits and len(endpoint_hits) >= 2:
+                scored.append((len(endpoint_hits), len(token_hits), row))
+        elif len(token_hits) >= 2:
+            scored.append((0, len(token_hits), row))
 
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [row for _, _, row in scored[:limit]]
 
-    return [r for _, _, r in scored[:limit]]
-
-
-def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, Any]]:
-    """Restituisce vere relazioni Entity-[:REL]->Entity dal KG, non solo chunk collegati."""
+def search_neo4j_relations(query_text: str, limit: int = 60) -> List[Dict[str, Any]]:
+    """Restituisce relazioni Entity-[:REL]->Entity con provenance dell'ingestion."""
     if not neo4j_driver:
         return []
 
     tokens = graph_relevant_tokens(query_text)
-
     if not tokens:
         tokens = extract_rag_tokens(query_text)
-
     if not tokens:
         return []
 
-    # --- INIZIO FIX 3: Espansione Statica dei Token (Assessment Domain) ---
-    q_low = (query_text or "").lower()
+    tokens = list(dict.fromkeys(tokens))
 
-    # 1. CUSTOMER ACCOUNT (Organizzazione/Soggetto verificato)
-    customer_terms = [
-        "cliente", "account cliente", "azienda cliente", "organizzazione", "tenant", "sottoscrittore", 
-        "client", "customer", "customer account", "client organization", "subscriber"
-    ]
-    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in customer_terms):
-        tokens.append("customer_account")
-        
-    # 2. ADMIN (Gestione/Acquisto Licenza Assessment)
-    admin_terms = [
-        "amministratore", "admin", "chi compra la licenza", "acquirente della licenza", "titolare della licenza", "responsabile licenza",
-        "administrator", "license buyer", "license purchaser", "license owner", "license manager"
-    ]
-    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in admin_terms):
-        tokens.append("admin")
-        
-    # 3. SECURITY INCIDENT (Focus NIS2 / GDPR)
-    incident_terms = [
-        "incidente", "violazione", "breach", "data breach", "compromissione", "attacco informatico", "evento di sicurezza", "fuga di dati",
-        "incident", "compromise", "cyber attack", "security event", "data leak", "security incident"
-    ]
-    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in incident_terms):
-        tokens.append("securityincident")
-        
-    # 4. SECURITY CONTROL (Focus ISO 27001 / DORA)
-    control_terms = [
-        "controllo", "misura", "mitigazione", "salvaguardia", "contromisura", "presidio", "misura di sicurezza", "policy", "procedura",
-        "control", "measure", "mitigation", "safeguard", "countermeasure", "security measure", "security control", "procedure"
-    ]
-    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in control_terms):
-        tokens.append("securitycontrol")
-
-    # 5. ASSET (Perimetro di applicabilità)
-    asset_terms = [
-        "asset", "risorsa", "dispositivo", "bene", "infrastruttura", "sistema",
-        "resource", "device", "infrastructure", "system", "equipment"
-    ]
-    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in asset_terms):
-        tokens.append("asset")
-
-    # 6. RISK / VULNERABILITY (Valutazione del rischio)
-    risk_terms = [
-        "rischio", "minaccia", "vulnerabilità", "falla", "impatto", "criticita", "criticità",
-        "risk", "threat", "vulnerability", "flaw", "impact", "criticality"
-    ]
-    if any(re.search(rf"\b{re.escape(k)}\b", q_low) for k in risk_terms):
-        tokens.append("risk")
-    # --- FINE FIX 3 ---
-
-    # CYPHER FIX: Aggiunto il controllo su e.category, e.type e labels(e)
-    # in modo che token come "securityincident" facciano match sull'ontologia del nodo.
     cypher = """
     MATCH (e1:Entity)-[rel]->(e2:Entity)
     WHERE any(tok IN $tokens WHERE
@@ -4090,14 +4136,48 @@ def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, A
         any(s IN coalesce(e1.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
         any(s IN coalesce(e2.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok)
     )
-    OPTIONAL MATCH (e1)-[:PRESENT_IN|MENTIONED_IN]->(c1:Chunk)
-    OPTIONAL MATCH (e2)-[:PRESENT_IN|MENTIONED_IN]->(c2:Chunk)
-    RETURN coalesce(e1.name, e1.id) AS source,
-           type(rel) AS relation,
-           coalesce(e2.name, e2.id) AS target,
-           properties(rel) AS props,
-           coalesce(rel.filename, rel.source_name, c1.filename, c2.filename, '') AS filename,
-           coalesce(rel.page_no, rel.page, c1.page, c2.page, 0) AS page
+
+    CALL (e1) {
+        OPTIONAL MATCH (e1)-[:PRESENT_IN|MENTIONED_IN]->(c1:Chunk)
+        RETURN head(collect(DISTINCT c1)) AS c1
+    }
+    CALL (e2) {
+        OPTIONAL MATCH (e2)-[:PRESENT_IN|MENTIONED_IN]->(c2:Chunk)
+        RETURN head(collect(DISTINCT c2)) AS c2
+    }
+    CALL (e1) {
+        OPTIONAL MATCH (e1)-[:PRESENT_ON]->(p1:Page)
+        RETURN head(collect(DISTINCT p1)) AS p1
+    }
+    CALL (e2) {
+        OPTIONAL MATCH (e2)-[:PRESENT_ON]->(p2:Page)
+        RETURN head(collect(DISTINCT p2)) AS p2
+    }
+
+    RETURN
+        coalesce(e1.name, e1.id) AS source,
+        type(rel) AS relation,
+        coalesce(e2.name, e2.id) AS target,
+        properties(rel) AS props,
+        coalesce(
+            rel.source_file,
+            rel.filename,
+            rel.source_name,
+            p1.filename,
+            p2.filename,
+            c1.filename,
+            c2.filename,
+            ''
+        ) AS filename,
+        coalesce(
+            rel.page_no,
+            rel.page,
+            p1.page_no,
+            p2.page_no,
+            c1.page,
+            c2.page,
+            0
+        ) AS page
     LIMIT $limit
     """
 
@@ -4106,13 +4186,10 @@ def search_neo4j_relations(query_text: str, limit: int = 40) -> List[Dict[str, A
             scan_limit = max(limit * 4, limit)
             rows = session.run(cypher, tokens=tokens, limit=scan_limit)
             raw_rows = [dict(r) for r in rows]
-
         return filter_neo4j_relation_rows(query_text, raw_rows, limit)
-
     except Exception as e:
         print(f"⚠️ Neo4j relation search error: {e}")
         return []
-
 
 def clean_graph_relation_label(value: Any) -> str:
     """
@@ -4203,7 +4280,7 @@ def _clean_graph_concept(value: str) -> str:
     """
     text = re.sub(r"\s+", " ", value or "").strip()
 
-    text = text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’`")
+    text = text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’«»`")
 
     # Rimuove prefissi descrittivi generici:
     # es. funzione “Respond” -> Respond
@@ -4224,7 +4301,7 @@ def _clean_graph_concept(value: str) -> str:
     # Rimuove congiunzioni finali residue.
     text = re.sub(r"\s+(?:e|ed|and|or|oppure|o)$", "", text, flags=re.IGNORECASE)
 
-    return text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’`")
+    return text.strip(" \t\n\r.,;:!?()[]{}\"'“”‘’«»`")
 
 
 
@@ -4259,7 +4336,7 @@ def _canonical_graph_concept(concept: str) -> str:
     Canonicalizza solo usando alias già presenti nel glossario.
     Evita relazioni tra sinonimi dello stesso concetto, es. MFA ↔ autenticazione a più fattori.
     """
-    c = (concept or "").lower().strip()
+    c = _clean_graph_concept(concept).lower().strip()
 
     for canonical, aliases in GLOSSARY_TERM_ALIASES.items():
         all_aliases = [canonical] + list(aliases or [])
@@ -4334,7 +4411,7 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
     concepts: List[str] = []
 
     # 1. Termini tra virgolette dritte o curve.
-    quoted = re.findall(r"[\"“”'‘’]([^\"“”'‘’]+)[\"“”'‘’]", q)
+    quoted = re.findall(r"[\"“'‘«]([^\"”'’»]+)[\"”'’»]", q)
     for item in quoted:
         clean = _clean_graph_concept(item)
         if len(clean) >= 2:
@@ -4395,6 +4472,9 @@ def extract_graph_concepts_from_query(query_text: str, max_concepts: int = 8) ->
         "rischio", "risk", "utente", "user", "identity", "identità",
         "documenti", "documents", "normativi", "normative",
         "funzione", "function", "processo", "process",
+        "catena", "chain", "percorso", "path", "passaggio", "step",
+        "traversamento", "traversal", "grafo", "graph", "neo4j",
+        "multi-hop", "multihop",
     }
 
     cleaned: List[str] = []
@@ -4614,41 +4694,25 @@ def answer_graph_relations_strict(
 
     def is_edge_relevant(src: str, tgt: str, relation: str = "") -> bool:
         """
-        Un arco è pertinente solo se:
-        - collega almeno un concetto richiesto;
-        - e preferibilmente collega due concetti richiesti oppure un concetto richiesto
-          a un nodo intermedio semanticamente presente nella query.
+        Un arco è pertinente solo quando sorgente e target corrispondono a due
+        concetti distinti richiesti dall'utente. Il nome della relazione non può
+        compensare un estremo fuori target.
         """
-        src_can = _canonical_graph_concept(src)
-        tgt_can = _canonical_graph_concept(tgt)
+        src_text = str(src or "").lower()
+        tgt_text = str(tgt or "").lower()
 
-        relation_text = " ".join([str(src), str(relation), str(tgt)]).lower()
+        src_hits = {
+            _canonical_graph_concept(c)
+            for c in concepts
+            if _concept_in_text(c, src_text)
+        }
+        tgt_hits = {
+            _canonical_graph_concept(c)
+            for c in concepts
+            if _concept_in_text(c, tgt_text)
+        }
 
-        direct_hits = 0
-
-        for c in concept_canons:
-            if not c:
-                continue
-
-            if c == src_can or c == tgt_can:
-                direct_hits += 1
-                continue
-
-            if c in src_can or src_can in c:
-                direct_hits += 1
-                continue
-
-            if c in tgt_can or tgt_can in c:
-                direct_hits += 1
-                continue
-
-            if c in relation_text:
-                direct_hits += 1
-
-        # Almeno due concetti richiesti devono essere coinvolti.
-        # Questo evita archi veri ma fuori target, es. GDPR -> ISO/IEC 27001
-        # quando ISO/IEC 27001 non è richiesto dalla domanda.
-        return direct_hits >= 2
+        return bool(src_hits and tgt_hits and len(src_hits | tgt_hits) >= 2)
 
     def add_row(row: Dict[str, Any]) -> None:
         src = str(row.get("source", "")).strip()
@@ -4668,9 +4732,9 @@ def answer_graph_relations_strict(
             seen_pairs.add(pair_key)
 
         key = (
-            src.lower(),
+            src_can,
             rel.lower(),
-            tgt.lower(),
+            tgt_can,
             str(row.get("filename", "")).lower(),
             str(row.get("page", "")),
             status,
@@ -4704,10 +4768,14 @@ def answer_graph_relations_strict(
         if len(rows) >= max_rows:
             break
 
-    # 2) Supporto testuale: co-occorrenze nei chunk recuperati.
+    # 2) Supporto testuale: usa solo vere fonti documentali e distingue
+    # stessa frase da semplice co-occorrenza nello stesso chunk.
     if len(rows) < max_rows:
         for s in sources:
             if not s.content:
+                continue
+
+            if normalize_tier_value(s.tier) == "GRAPH" or s.type == "graph_relations":
                 continue
 
             text = s.content
@@ -4725,18 +4793,32 @@ def answer_graph_relations_strict(
                 for j in range(i + 1, len(matched)):
                     src = matched[i]
                     tgt = matched[j]
+                    src_alias = _best_alias_for_text(src, text_l)
+                    tgt_alias = _best_alias_for_text(tgt, text_l)
+                    snippet, evidence_level = _evidence_snippet_for_pair(
+                        text,
+                        src_alias,
+                        tgt_alias,
+                    )
 
-                    row = {
+                    if not snippet:
+                        continue
+
+                    status = (
+                        "supporto testuale forte, non esplicita come arco"
+                        if evidence_level == "supporto_testuale_forte"
+                        else "co-occorrenza debole, non esplicita come arco"
+                    )
+
+                    add_row({
                         "source": src,
                         "relation": "collegamento testuale",
                         "target": tgt,
                         "filename": s.filename or "N/D",
                         "page": s.page or "",
-                        "evidence": (text[:300] + "...") if len(text) > 300 else text,
-                        "status": "supporto testuale forte, non esplicita come arco",
-                    }
-
-                    add_row(row)
+                        "evidence": snippet,
+                        "status": status,
+                    })
 
                     if len(rows) >= max_rows:
                         break
@@ -5255,7 +5337,7 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
     t0 = time.time()
 
     neo4j_entity_hits = search_neo4j_entities(expanded_query, limit=30)
-    neo4j_relation_rows = search_neo4j_relations(expanded_query, limit=40)
+    neo4j_relation_rows = search_neo4j_relations(expanded_query, limit=60)
 
     # Se l'utente ha chiesto un documento specifico,
     # anche le relazioni Neo4j devono rispettare lo stesso perimetro.
@@ -5308,7 +5390,9 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
             "id": uid,
             "content": content,
             "filename": str(payload.get("filename", "Unknown")),
+            "doc_id": str(payload.get("doc_id") or ""),
             "page": get_payload_page(payload),
+            "page_chunk_index": int(payload.get("page_chunk_index") or 0),
             "type": get_payload_type(payload),
             "tier": normalize_tier_value(str(payload.get("tier", "C"))),
             "score_base": float(hit.score or 0.0),
@@ -5345,7 +5429,9 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "id": uid,
                 "content": d.get("content", ""),
                 "filename": fname,
+                "doc_id": str(meta.get("doc_id") or ""),
                 "page": page,
+                "page_chunk_index": int(meta.get("page_chunk_index") or 0),
                 "type": toon_type,
                 "tier": tier,
                 "score_base": 0.0,
@@ -5395,7 +5481,9 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "id": uid,
                 "content": e.get("content", ""),
                 "filename": fname,
+                "doc_id": str(meta.get("doc_id") or ""),
                 "page": page,
+                "page_chunk_index": int(meta.get("page_chunk_index") or 0),
                 "type": toon_type,
                 "tier": tier,
                 "score_base": 0.0,
@@ -5436,7 +5524,9 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "id": uid,
                 "content": b.get("content", ""),
                 "filename": fname,
+                "doc_id": str(meta.get("doc_id") or ""),
                 "page": page,
+                "page_chunk_index": int(meta.get("page_chunk_index") or 0),
                 "type": toon_type,
                 "tier": tier,
                 "score_base": 0.0,
@@ -5466,7 +5556,9 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "id": uid,
                 "content": g.get("content", ""),
                 "filename": g.get("filename", "Neo4j"),
+                "doc_id": str(g.get("doc_id") or ""),
                 "page": int(g.get("page") or 0),
+                "page_chunk_index": int(g.get("page_chunk_index") or 0),
                 "type": g.get("type", "graph"),
                 "tier": "GRAPH",
                 "score_base": 0.0,
@@ -5509,7 +5601,9 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                         "id": gs.id,
                         "content": gs.content,
                         "filename": gs.filename,
+                        "doc_id": gs.doc_id,
                         "page": gs.page,
+                        "page_chunk_index": gs.page_chunk_index,
                         "type": gs.type,
                         "tier": normalize_tier_value(getattr(gs, "tier", "C")),
                         "score_base": 0.0,
@@ -5743,7 +5837,14 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
         t["pg_source_name"] = pg_meta.get("source_name", "")
         t["pg_source_type"] = pg_meta.get("source_type", "")
         t["pg_log_id"] = int(pg_meta.get("log_id") or 0)
+        t["doc_id"] = str(pg_meta.get("doc_id") or t.get("doc_id") or "")
+        t["page_chunk_index"] = int(
+            pg_meta.get("page_chunk_index")
+            if pg_meta.get("page_chunk_index") is not None
+            else (t.get("page_chunk_index") or 0)
+        )
         t["pg_chunk_id"] = int(pg_meta.get("chunk_index") or 0)
+        t["pg_page_chunk_index"] = int(pg_meta.get("page_chunk_index") or 0)
         t["pg_toon_type"] = pg_meta.get("toon_type", "")
 
         if "PG_Enrich" not in t["origin"]:
@@ -5776,6 +5877,8 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 content=t.get("content", ""),
                 filename=t.get("filename", "Unknown"),
                 page=int(t.get("page") or 0),
+                page_chunk_index=int(t.get("page_chunk_index") or 0),
+                doc_id=str(t.get("doc_id") or ""),
                 type=t.get("type", "text"),
                 score=float(t.get("final_score", 0.0)),
                 tier=normalize_tier_value(t.get("tier", "C")),
@@ -5787,6 +5890,7 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 pg_source_type=t.get("pg_source_type", ""),
                 pg_log_id=int(t.get("pg_log_id") or 0),
                 pg_chunk_id=int(t.get("pg_chunk_id") or 0),
+                pg_page_chunk_index=int(t.get("pg_page_chunk_index") or 0),
                 pg_toon_type=t.get("pg_toon_type", ""),
             )
         )
@@ -6637,6 +6741,8 @@ def prepare_sources_for_ui(sources: List[SourceItem]) -> List[SourceItem]:
                 content=ui_safe_text(getattr(s, "content", ""), MAX_UI_SOURCE_CONTENT_CHARS),
                 filename=ui_safe_text(getattr(s, "filename", "Unknown"), 240),
                 page=ui_safe_int(getattr(s, "page", 0), 0),
+                page_chunk_index=ui_safe_int(getattr(s, "page_chunk_index", 0), 0),
+                doc_id=ui_safe_text(getattr(s, "doc_id", ""), 120),
                 type=ui_safe_text(getattr(s, "type", "text"), 80),
                 score=ui_safe_float(getattr(s, "score", 0.0), 0.0),
                 graph_context=[],
@@ -6648,6 +6754,7 @@ def prepare_sources_for_ui(sources: List[SourceItem]) -> List[SourceItem]:
                 pg_source_type=ui_safe_text(getattr(s, "pg_source_type", ""), 80),
                 pg_log_id=ui_safe_int(getattr(s, "pg_log_id", 0), 0),
                 pg_chunk_id=ui_safe_int(getattr(s, "pg_chunk_id", 0), 0),
+                pg_page_chunk_index=ui_safe_int(getattr(s, "pg_page_chunk_index", 0), 0),
                 pg_toon_type=ui_safe_text(getattr(s, "pg_toon_type", ""), 80),
                 db_origin=ui_safe_text(getattr(s, "db_origin", "Unknown"), 160),
             )
@@ -6711,6 +6818,8 @@ def normalize_sources_for_modal(raw_sources) -> List[SourceItem]:
                     240,
                 ),
                 page=ui_safe_int(state_get(s, "page", 0), 0),
+                page_chunk_index=ui_safe_int(state_get(s, "page_chunk_index", 0), 0),
+                doc_id=ui_safe_text(state_get(s, "doc_id", ""), 120),
                 type=ui_safe_text(state_get(s, "type", "text"), 80),
                 score=ui_safe_float(state_get(s, "score", 0.0), 0.0),
                 graph_context=[],
@@ -6734,6 +6843,7 @@ def normalize_sources_for_modal(raw_sources) -> List[SourceItem]:
                 ),
                 pg_log_id=ui_safe_int(state_get(s, "pg_log_id", 0), 0),
                 pg_chunk_id=ui_safe_int(state_get(s, "pg_chunk_id", 0), 0),
+                pg_page_chunk_index=ui_safe_int(state_get(s, "pg_page_chunk_index", 0), 0),
                 pg_toon_type=ui_safe_text(
                     state_get(s, "pg_toon_type", ""),
                     80,
@@ -7883,10 +7993,18 @@ class State(rx.State):
                                 )
                             )
                                 
-                # 2. RAGGRUPPAMENTO FONTI (FIXED CON MAX_CONTEXT_CHARS)
+                # 2. RAGGRUPPAMENTO FONTI CON BUDGET EQUO PER SORGENTE
                 c_a_list, c_b_list, c_c_list, c_g_list = [], [], [], []
                 current_context_length = 0
-                max_allowed_length = MAX_CONTEXT_CHARS # Es. 16000
+                max_allowed_length = MAX_CONTEXT_CHARS
+                non_empty_sources = [s for s in sources if (s.content or "").strip()]
+                per_source_budget = max(
+                    600,
+                    min(
+                        4000,
+                        (max_allowed_length // max(1, len(non_empty_sources))) - 300,
+                    ),
+                )
 
                 for i, s in enumerate(sources, start=1):
                     tier_norm = normalize_tier_value(s.tier)
@@ -7898,12 +8016,14 @@ class State(rx.State):
                     if not body:
                         continue
 
+                    body = body[:per_source_budget]
                     snippet = header + meta + body + "\n\n"
-                    
-                    # STOP SE SUPERIAMO IL LIMITE DEL PROMPT
+
                     if current_context_length + len(snippet) > max_allowed_length:
-                        print(f"⚠️ Raggiunto MAX_CONTEXT_CHARS ({max_allowed_length}). Chunk {i} e successivi ignorati per LLM.")
-                        break
+                        remaining = max_allowed_length - current_context_length - len(header) - len(meta) - 2
+                        if remaining <= 200:
+                            continue
+                        snippet = header + meta + body[:remaining] + "\n\n"
 
                     if tier_norm == "A":
                         c_a_list.append(snippet)
@@ -7913,7 +8033,7 @@ class State(rx.State):
                         c_g_list.append(snippet)
                     else:
                         c_c_list.append(snippet)
-                        
+
                     current_context_length += len(snippet)
 
                 c_a = "".join(c_a_list).strip()
@@ -8879,10 +8999,34 @@ def _is_noise_formula_row_v45(row: Dict[str, Any]) -> bool:
 
     generic_names = {
         "", "formula/metric", "formula recuperata", "contenuto", "variabili",
-        "metrica/indicatore citato", "formula", "metric", "formule e modelli matematici",
-        "formule e modelli matematici - pagina 12 --", "formule e modelli matematici - pagina 24 --",
-        "elemento recuperato",
+        "metrica/indicatore citato", "formula", "metric",
+        "formule e modelli matematici", "elemento recuperato",
     }
+
+    combined = " ".join([
+        name,
+        formula,
+        _formula_display_text(row.get("meaning") or "", 500).lower(),
+    ])
+
+    structural_noise = (
+        "tikzpicture",
+        "begintikzpicture",
+        "\\draw",
+        "\\node",
+        "ode[",
+        "cm,x=",
+        "cm,y=",
+    )
+
+    if any(marker in combined for marker in structural_noise):
+        return True
+
+    if re.fullmatch(
+        r"formule e modelli matematici(?:\s*-\s*pagina\s*\d+\s*--?)?",
+        name,
+    ):
+        return True
 
     if tipo == "regola soglia":
         return not _looks_threshold_rule(" ".join([name, formula, str(row.get("meaning") or "")]))
@@ -9137,7 +9281,7 @@ def extract_exact_phrases(query_text: str) -> List[str]:
     q = query_text or ""
     phrases: List[str] = []
 
-    quoted = re.findall(r"[\"“']([^\"”']+)[\"”']", q)
+    quoted = re.findall(r"[\"“'«]([^\"”'»]+)[\"”'»]", q)
     phrases.extend([x.strip().lower() for x in quoted if len(x.strip()) > 2])
 
     acronyms = re.findall(r"\b[A-Z]{2,8}\b", q)
@@ -9692,6 +9836,8 @@ def _threshold_supplemental_sources_v412(query_text: str, limit: int = 18) -> Li
                 content=content,
                 filename=fname,
                 page=page,
+                page_chunk_index=int(meta.get("page_chunk_index") or 0),
+                doc_id=str(meta.get("doc_id") or ""),
                 type=source_type,
                 score=float(h.get("score", 0.0) or 0.0),
                 tier=tier,
@@ -9998,6 +10144,8 @@ def _search_pg_threshold_regex_v413(limit: int = 12) -> List[SourceItem]:
                 content=content,
                 filename=metadata_json.get("filename") or metadata_json.get("source_name") or "Postgres",
                 page=int(metadata_json.get("page_no") or metadata_json.get("page") or 0),
+                page_chunk_index=int(metadata_json.get("page_chunk_index") or 0),
+                doc_id=str(metadata_json.get("doc_id") or ""),
                 type=metadata_json.get("toon_type") or metadata_json.get("type") or "text",
                 score=2.5,
                 tier=normalize_tier_value(metadata_json.get("tier", "C")),
@@ -10008,6 +10156,7 @@ def _search_pg_threshold_regex_v413(limit: int = 12) -> List[SourceItem]:
                 pg_source_type=metadata_json.get("source_type", ""),
                 pg_log_id=int(metadata_json.get("log_id") or 0),
                 pg_chunk_id=int(metadata_json.get("chunk_index") or 0),
+                pg_page_chunk_index=int(metadata_json.get("page_chunk_index") or 0),
                 pg_toon_type=metadata_json.get("toon_type", ""),
             ))
         return out

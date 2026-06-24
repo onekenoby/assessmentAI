@@ -95,6 +95,8 @@ import torch
 
 
 
+
+
 # =========================
 # TIERS / TAXONOMY (DOC ORGANIZATION) - NEW
 # =========================
@@ -299,10 +301,24 @@ def dispatch_document(file_path: str, root_dir: str) -> dict:
     # Macro-tier fisico: fonte primaria per la gerarchia del RAG.
     if macro_tier_folder == "TIER_A_NORMATIVE":
         base["tier"] = "A"
+        base["scope"] = "GLOBAL"
     elif macro_tier_folder == "TIER_B_GOVERNANCE":
         base["tier"] = "B"
+        base["scope"] = "ACCOUNT"
     elif macro_tier_folder == "TIER_C_EVIDENCES":
         base["tier"] = "C"
+        base["scope"] = "ACCOUNT"
+    else:
+        # Fallback di sicurezza
+        base["tier"] = base.get("tier", "B")
+        base["scope"] = "GLOBAL" if base["tier"] == "A" else "ACCOUNT"
+
+    # Assegnazione dell'Organization ID
+    # Il TIER A è globale, quindi non appartiene a nessuna organizzazione specifica.
+    if base["scope"] == "ACCOUNT":
+        base["organization_id"] = ORGANIZATION_ID
+    else:
+        base["organization_id"] = None
 
     # Ontology coerente con assessment.
     # Per Tier C manteniamo la macro-area evidenziale (technical / organizational / legal / physical).
@@ -374,6 +390,12 @@ def ensure_inbox_structure(inbox_dir: str):
             os.makedirs(tier_path, exist_ok=True)
 
 # =========================# =========================# =========================# 
+
+
+# =========================
+# MULTI-TENANT CONTEXT
+# =========================
+ORGANIZATION_ID = 1234
 
 # -------------------------
 # KG LIMITS (coherent names)
@@ -2321,21 +2343,26 @@ def pg_get_conn():
 def pg_put_conn(conn):
     pg_pool.putconn(conn)
 
-def pg_start_log(source_name: str, source_type: str) -> int:
+def pg_start_log(source_name: str, source_type: str, doc_meta: dict = None) -> int:
     conn = pg_get_conn()
+    org_id = doc_meta.get("organization_id") if doc_meta else None
+    tier = doc_meta.get("tier") if doc_meta else None
+    scope = doc_meta.get("scope") if doc_meta else None
+    
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO ingestion_logs (source_name, source_type, ingestion_ts, status) "
-                "VALUES (%s, %s, NOW(), %s) RETURNING log_id",
-                (source_name, source_type, "RUNNING")
+                "INSERT INTO ingestion_logs (source_name, source_type, ingestion_ts, status, organization_id, tier, scope) "
+                "VALUES (%s, %s, NOW(), %s, %s, %s, %s) RETURNING log_id",
+                (source_name, source_type, "RUNNING", org_id, tier, scope)
             )
             log_id = cur.fetchone()[0]
         conn.commit()
         return log_id
     finally:
         pg_put_conn(conn)
-
+        
+        
 def pg_close_log(log_id: int, status: str, total_chunks: int, processing_ms: int, error_msg: str = None):
     conn = pg_get_conn()
     try:
@@ -2423,6 +2450,7 @@ def flush_postgres_chunks_batch(batch_data: List[Tuple]):
                 )
 
             # 2) Inserimento nuova versione corrente dei chunk.
+            # 2) Inserimento nuova versione corrente dei chunk.
             execute_values(
                 cur,
                 """
@@ -2434,6 +2462,9 @@ def flush_postgres_chunks_batch(batch_data: List[Tuple]):
                     content_semantic,
                     metadata_json,
                     chunk_uuid,
+                    organization_id,
+                    tier,
+                    scope,
                     ingestion_ts
                 )
                 VALUES %s
@@ -2495,6 +2526,8 @@ MERGE (d:Document {doc_id: r.doc_id})
 SET d.filename = r.filename,
     d.doc_type = r.doc_type,
     d.tier = r.tier,
+    d.scope = r.scope,
+    d.organization_id = r.organization_id,
     d.ontology = r.ontology,
     d.log_id = r.log_id,
     d.ingested_at = datetime()
@@ -2504,6 +2537,8 @@ SET p.doc_id = r.doc_id,
     p.page_no = r.page_no,
     p.filename = r.filename,
     p.tier = r.tier,
+    p.scope = r.scope,
+    p.organization_id = r.organization_id,
     p.ontology = r.ontology
 MERGE (d)-[:HAS_PAGE]->(p)
 
@@ -2516,6 +2551,8 @@ SET c.chunk_id = r.chunk_id,
     c.page = r.page_no,
     c.filename = r.filename,
     c.tier = r.tier,
+    c.scope = r.scope,
+    c.organization_id = r.organization_id,
     c.ontology = r.ontology,
     c.text = left(r.text_sem, 2500),
     c.section_hint = coalesce(r.section_hint, "")
@@ -2539,6 +2576,9 @@ ON CREATE SET
         THEN n.category
         ELSE "UNCLASSIFIED"
     END,
+    e.tier = r.tier,
+    e.scope = r.scope,
+    e.organization_id = r.organization_id,
     e.sources = [r.filename_norm],
     e.source_refs = [r.source_ref]
 ON MATCH SET
@@ -2558,6 +2598,18 @@ ON MATCH SET
         WHEN n.category IS NOT NULL AND n.category <> "UNCLASSIFIED"
         THEN n.category
         ELSE e.category
+    END,
+    e.tier = CASE 
+        WHEN r.scope = 'GLOBAL' THEN 'A' 
+        ELSE coalesce(e.tier, r.tier) 
+    END,
+    e.scope = CASE 
+        WHEN r.scope = 'GLOBAL' THEN 'GLOBAL' 
+        ELSE coalesce(e.scope, r.scope) 
+    END,
+    e.organization_id = CASE 
+        WHEN r.scope = 'GLOBAL' THEN NULL 
+        ELSE coalesce(e.organization_id, r.organization_id) 
     END,
     e.sources = CASE
         WHEN r.filename_norm IN coalesce(e.sources, [])
@@ -2580,6 +2632,9 @@ SET m.filename = r.filename,
     m.page_chunk_index = r.page_chunk_index,
     m.chunk_id = r.chunk_id,
     m.source_ref = r.source_ref,
+    m.tier = r.tier,
+    m.scope = r.scope,
+    m.organization_id = r.organization_id,
     m.evidence_type = "chunk_entity_mention"
 
 RETURN count(*) AS entity_mentions_written
@@ -5342,14 +5397,31 @@ def process_ai_and_db(
     os.makedirs(FAILED_DIR, exist_ok=True)
 
     tier = (doc_meta or {}).get("tier", "B")
+    scope = (doc_meta or {}).get("scope", "ACCOUNT")
+    org_id = (doc_meta or {}).get("organization_id")
     ontology = (doc_meta or {}).get("ontology", DEFAULT_ONTOLOGY)
 
     print(
-        f"   ⚙️ Engine Start: {filename} | tier={tier} | "
+        f"   ⚙️ Engine Start: {filename} | tier={tier} | scope={scope} | org_id={org_id} | "
         f"Brain={LLM_MODEL_NAME}"
     )
 
+    # Sincronizza i metadati multi-tenant delle immagini estratte finora
+    conn = pg_get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ingestion_images SET organization_id = %s, tier = %s, scope = %s WHERE log_id = %s",
+                (org_id, tier, scope, log_id)
+            )
+        conn.commit()
+    except Exception as e:
+        print(f"   ⚠️ Impossibile aggiornare i metadati delle immagini: {e}")
+    finally:
+        pg_put_conn(conn)
+
     doc_id = sha256_file(file_path)[:32]
+    
 
     global embedder, qdrant_client
     embedder = get_embedder()
@@ -5383,16 +5455,6 @@ def process_ai_and_db(
         )
 
         meta = dict(ch.get("metadata") or {})
-        meta.update({
-            "doc_id": doc_id,
-            "filename": filename,
-            "tier": tier,
-            "ontology": ontology,
-            "chunk_index": idx,
-            "page_chunk_index": page_chunk_index,
-            "page_no": page_no,
-            "chunk_id": ch["chunk_id"],
-        })
         ch["metadata"] = meta
 
     qdrant_points: List[Dict[str, Any]] = []
@@ -5740,6 +5802,8 @@ def process_ai_and_db(
                 "filename": filename,
                 "doc_id": doc_id,
                 "tier": tier,
+                "scope": scope,
+                "organization_id": org_id,
                 "ontology": ontology,
                 "source_name": filename,
                 "source_type": source_type,
@@ -5775,6 +5839,9 @@ def process_ai_and_db(
                 ch.get("text_sem"),
                 json.dumps(metadata, ensure_ascii=False),
                 chunk_id,
+                doc_meta.get("organization_id"),
+                doc_meta.get("tier"),
+                doc_meta.get("scope")
             ))
 
             chunk_nodes, chunk_edges = chunk_kg_results.get(
@@ -5849,6 +5916,9 @@ def process_ai_and_db(
                 props.setdefault("chunk_index", global_idx)
                 props.setdefault("page_chunk_index", page_chunk_index)
                 props.setdefault("source_ref", source_ref)
+                props.setdefault("tier", tier)
+                props.setdefault("scope", scope)
+                props.setdefault("organization_id", org_id)
 
                 final_edges.append({
                     "source": source,
@@ -5864,6 +5934,8 @@ def process_ai_and_db(
                 "filename_norm": normalize_doc_name(filename),
                 "doc_type": source_type,
                 "tier": tier,
+                "scope": scope,
+                "organization_id": org_id,
                 "ontology": ontology,
                 "log_id": log_id,
                 "chunk_id": chunk_id,
@@ -6014,9 +6086,13 @@ def main():
 
             try:
                 doc_meta = dispatch_document(file_path, root_folder)
-                log_id = pg_start_log(filename, "document")
+                log_id = pg_start_log(filename, "document", doc_meta)
 
                 print(f"   ⚙️ Extracting: {filename}...")
+
+
+
+
 
                 if file_path.lower().endswith(".md"):
                     chunks = extract_markdown_chunks(file_path, log_id)
@@ -6121,9 +6197,10 @@ def main():
 
         try:
             doc_meta = dispatch_document(file_path, root_folder)
-            log_id = pg_start_log(filename, "document")
+            log_id = pg_start_log(filename, "document", doc_meta)
 
             print(f"   ⚙️ Producer Extracting: {filename}...")
+
 
             if file_path.lower().endswith(".md"):
                 chunks = extract_markdown_chunks(file_path, log_id)

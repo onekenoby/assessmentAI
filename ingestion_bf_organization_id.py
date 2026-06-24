@@ -383,7 +383,10 @@ def ensure_inbox_structure(inbox_dir: str):
 MIN_ENTITY_DENSITY = int(os.getenv("MIN_ENTITY_DENSITY", "1"))
 MIN_FIN_KEYWORDS = int(os.getenv("MIN_FIN_KEYWORDS", "1"))
 
-KG_TEXT_MAX_CHARS = int(os.getenv("KG_TEXT_MAX_CHARS", "2600"))   # chars sent to KG model per page
+KG_TEXT_MAX_CHARS = int(os.getenv("KG_TEXT_MAX_CHARS", "2600"))   # max chars sent to KG model per window
+KG_WINDOW_OVERLAP_CHARS = int(os.getenv("KG_WINDOW_OVERLAP_CHARS", "300"))
+# 0 = nessun limite. Ogni pagina lunga viene coperta da tutte le finestre necessarie.
+KG_MAX_WINDOWS_PER_PAGE = int(os.getenv("KG_MAX_WINDOWS_PER_PAGE", "0"))
 KG_MAX_TRIPLES = int(os.getenv("KG_MAX_TRIPLES", "50"))           # 10 soft cap (sanitize already caps)
 KG_TIMEOUT = int(os.getenv("KG_TIMEOUT", "180"))                   # seconds per KG task/page
 
@@ -445,8 +448,15 @@ PG_COMMIT_EVERY_N_PAGES = int(os.getenv("PG_COMMIT_EVERY_N_PAGES", "25"))
 
 # KG extraction (solo dove serve)
 KG_ENABLED = os.getenv("KG_ENABLED", "1") == "1"
-KG_MIN_LEN = int(os.getenv("KG_MIN_LEN", "300")) #
-MAX_KG_CHUNKS_PER_DOC = int(os.getenv("MAX_KG_CHUNKS_PER_DOC", "50")) #30
+KG_MIN_LEN = int(os.getenv("KG_MIN_LEN", "100")) #
+MAX_KG_CHUNKS_PER_DOC = int(os.getenv("MAX_KG_CHUNKS_PER_DOC", "0"))
+# Il limite KG è disabilitato di default. Viene applicato soltanto se
+# KG_CHUNK_LIMIT_ENABLED=1; in questo modo un vecchio valore ambiente non
+# tronca silenziosamente il grafo.
+KG_CHUNK_LIMIT_ENABLED = os.getenv("KG_CHUNK_LIMIT_ENABLED", "0") == "1"
+KG_GATEKEEPER_THRESHOLD = float(os.getenv("KG_GATEKEEPER_THRESHOLD", "0.20"))
+KG_WINDOW_OVERLAP_CHARS = int(os.getenv("KG_WINDOW_OVERLAP_CHARS", "300"))
+KG_MAX_WINDOWS_PER_CHUNK = int(os.getenv("KG_MAX_WINDOWS_PER_CHUNK", "0"))
 
 
 
@@ -1619,10 +1629,34 @@ def normalize_ws(text: str) -> str:
     return text.strip()
 
 def normalize_entity_id(s: str) -> str:
+    """ID canonico stabile per le Entity Neo4j."""
     s = (s or "").strip().lower()
-    s = s.replace('"', "").replace("'", "")
+    for quote in ('"', "'", "“", "”", "‘", "’", "«", "»"):
+        s = s.replace(quote, "")
     s = re.sub(r"\s+", " ", s)
     return s[:180]
+
+
+def entity_alias_matches_text(alias: str, text: str) -> bool:
+    """
+    Verifica deterministica della presenza di un nome/sinonimo nel chunk.
+    Per alias brevi usa boundary alfanumerici, evitando falsi positivi.
+    """
+    alias_norm = normalize_entity_id(alias)
+    text_norm = normalize_entity_id(text)
+
+    if not alias_norm or not text_norm or len(alias_norm) < 2:
+        return False
+
+    if re.fullmatch(r"[a-z0-9]{2,12}", alias_norm):
+        return bool(
+            re.search(
+                rf"(?<![a-z0-9]){re.escape(alias_norm)}(?![a-z0-9])",
+                text_norm,
+            )
+        )
+
+    return alias_norm in text_norm
 
 def normalize_doc_name(value: str) -> str:
     """Sincronizzato con gui_reflex.py"""
@@ -1996,12 +2030,13 @@ def canonicalize_edges_to_verb_object(edges: list[dict]) -> list[dict]:
             continue
 
         m = canon_map.get(raw_rel) or {}
+        
         verb = (m.get("verb") or raw_rel).strip().upper()
         obj = (m.get("object") or "").strip().upper()
         qual = (m.get("qualifier") or "").strip().upper()
 
         # lemma cheap (en)
-        verb = _cheap_lemma_en(verb)
+        #verb = _cheap_lemma_en(verb)
 
         ee = dict(e)
         props = dict(ee.get("props") or {})
@@ -2084,8 +2119,6 @@ def _cheap_lemma_en(verb: str) -> str:
         v = v[:-3]
     elif v.endswith("ED") and len(v) > 5:
         v = v[:-2]
-    elif v.endswith("S") and len(v) > 5:
-        v = v[:-1]
 
     if v.endswith("ISHE") and len(v) >= 8:
         v = v[:-1]
@@ -2229,12 +2262,14 @@ CHART_CANDIDATE_PAT = re.compile(
 # Rileva parole che iniziano con la maiuscola (entità potenziali)
 _ENTITY_PROPER_NOUNS = re.compile(r'\b[A-Z][a-zà-ù]{1,}\b')
 
+
+
 def is_keyword_candidate_hybrid(text: str) -> bool:
     """
-    Trigger bilanciato: abbassiamo la soglia di attivazione per 
-    distribuire i nodi su più chunk.
+    Trigger bilanciato per distribuire i nodi sui chunk
+    semanticamente significativi.
     """
-    if not text or len(text) < 300: # Soglia minima più bassa
+    if not text or len(text) < KG_MIN_LEN:
         return False
     
     clean_text = safe_normalize_text(text)
@@ -2244,11 +2279,13 @@ def is_keyword_candidate_hybrid(text: str) -> bool:
     proper_nouns = set(_ENTITY_PROPER_NOUNS.findall(clean_text))
     assessment_keywords = set(_KG_PAT.findall(clean_text))
 
-    if (len(proper_nouns) >= 1 and len(assessment_keywords) >= 1) or len(assessment_keywords) >= 3:
+    if (
+        len(proper_nouns) >= 1
+        and len(assessment_keywords) >= 1
+    ) or len(assessment_keywords) >= 3:
         return True
     
     return False
-
 
 
 def is_keyword_candidate(text: str) -> bool:
@@ -2449,70 +2486,124 @@ def ensure_qdrant_collection():
             ),
         )
 
-NEO4J_BATCH_QUERY = """
+NEO4J_STRUCTURE_QUERY = """
 UNWIND $rows AS r
 
-// 1) Documento (Isolato)
+// Modello fisico unico e direzionale:
+// Document -> Page -> Chunk
 MERGE (d:Document {doc_id: r.doc_id})
 SET d.filename = r.filename,
     d.doc_type = r.doc_type,
+    d.tier = r.tier,
+    d.ontology = r.ontology,
     d.log_id = r.log_id,
     d.ingested_at = datetime()
 
-// 2) Pagina (Isolata)
-WITH d, r
 MERGE (p:Page {pid: r.doc_id + "::" + toString(r.page_no)})
 SET p.doc_id = r.doc_id,
-    p.page_no = r.page_no
+    p.page_no = r.page_no,
+    p.filename = r.filename,
+    p.tier = r.tier,
+    p.ontology = r.ontology
 MERGE (d)-[:HAS_PAGE]->(p)
 
-// 3) Chunk (Isolato)
-WITH p, r
 MERGE (c:Chunk {id: r.chunk_id})
 SET c.chunk_id = r.chunk_id,
+    c.doc_id = r.doc_id,
     c.chunk_index = r.chunk_index,
+    c.page_chunk_index = r.page_chunk_index,
     c.toon_type = r.toon_type,
     c.page = r.page_no,
     c.filename = r.filename,
-    c.text = left(r.text_sem, 1000), 
-    c.section_hint = coalesce(r.section_hint, ""),
-    c.ontology = r.ontology
+    c.tier = r.tier,
+    c.ontology = r.ontology,
+    c.text = left(r.text_sem, 2500),
+    c.section_hint = coalesce(r.section_hint, "")
 MERGE (p)-[:HAS_CHUNK]->(c)
 
-// 4) Entità (GLOBALI E CONDIVISE TRA DOCUMENTI)
-WITH r, c
-UNWIND coalesce(r.nodes, []) AS n
-WITH n, c, r
-WHERE n.id IS NOT NULL AND n.id <> ""
-
-MERGE (e:Entity {id: n.id})
-ON CREATE SET 
-    e.name = n.id,
-    e.category = CASE WHEN n.category IS NOT NULL AND n.category <> 'UNCLASSIFIED' THEN n.category ELSE 'UNCLASSIFIED' END,
-    e.sources = [r.filename_norm]
-ON MATCH SET 
-    e.category = CASE WHEN n.category IS NOT NULL AND n.category <> 'UNCLASSIFIED' THEN n.category ELSE e.category END,
-    // Se il file non è già nella lista dei sorgenti, aggiungilo all'array
-    e.sources = CASE WHEN r.filename_norm IN coalesce(e.sources, []) THEN coalesce(e.sources, []) ELSE coalesce(e.sources, []) + r.filename_norm END
-SET e += coalesce(n.props, {})
-
-// Il collegamento tra l'entità globale e il pezzetto di testo isolato
-MERGE (e)-[:PRESENT_IN]->(c)
+RETURN count(*) AS chunks_written
 """
 
-# Formula nodes deterministici
+NEO4J_ENTITY_QUERY = """
+UNWIND $rows AS r
+MATCH (c:Chunk {id: r.chunk_id})
+UNWIND coalesce(r.nodes, []) AS n
+WITH r, c, n
+WHERE n.id IS NOT NULL AND trim(toString(n.id)) <> ""
+
+MERGE (e:Entity {id: n.id})
+ON CREATE SET
+    e.name = coalesce(n.name, n.id),
+    e.category = CASE
+        WHEN n.category IS NOT NULL AND n.category <> "UNCLASSIFIED"
+        THEN n.category
+        ELSE "UNCLASSIFIED"
+    END,
+    e.sources = [r.filename_norm],
+    e.source_refs = [r.source_ref]
+ON MATCH SET
+    e.name = CASE
+        WHEN n.name IS NOT NULL
+             AND trim(toString(n.name)) <> ""
+             AND (
+                 e.name IS NULL
+                 OR trim(toString(e.name)) = ""
+                 OR toLower(trim(toString(e.name))) =
+                    toLower(trim(toString(e.id)))
+             )
+        THEN n.name
+        ELSE coalesce(e.name, n.name, n.id)
+    END,
+    e.category = CASE
+        WHEN n.category IS NOT NULL AND n.category <> "UNCLASSIFIED"
+        THEN n.category
+        ELSE e.category
+    END,
+    e.sources = CASE
+        WHEN r.filename_norm IN coalesce(e.sources, [])
+        THEN coalesce(e.sources, [])
+        ELSE coalesce(e.sources, []) + r.filename_norm
+    END,
+    e.source_refs = CASE
+        WHEN r.source_ref IN coalesce(e.source_refs, [])
+        THEN coalesce(e.source_refs, [])
+        ELSE coalesce(e.source_refs, []) + r.source_ref
+    END
+SET e += coalesce(n.props, {})
+
+// Provenance esclusivamente a livello Chunk.
+// Non esiste più alcun collegamento diretto Page -> Entity o Entity -> Page.
+MERGE (c)-[m:MENTIONS]->(e)
+SET m.filename = r.filename,
+    m.page_no = r.page_no,
+    m.chunk_index = r.chunk_index,
+    m.page_chunk_index = r.page_chunk_index,
+    m.chunk_id = r.chunk_id,
+    m.source_ref = r.source_ref,
+    m.evidence_type = "chunk_entity_mention"
+
+RETURN count(*) AS entity_mentions_written
+"""
+
+# Alias mantenuto per eventuali riferimenti esterni al modulo.
+NEO4J_BATCH_QUERY = NEO4J_STRUCTURE_QUERY
+
+# Formula nodes deterministici: Chunk -> Formula.
 NEO4J_FORMULA_QUERY = """
 UNWIND $rows AS r
 MATCH (c:Chunk {id: r.chunk_id})
 MERGE (f:Formula {fid: r.fid})
-SET f.latex = r.latex, 
-    f.latex_raw = r.latex_raw,  // Salvataggio del dato puro
-    f.plain = r.plain, 
-    f.meaning_it = r.meaning_it, 
+SET f.latex = r.latex,
+    f.latex_raw = r.latex_raw,
+    f.plain = r.plain,
+    f.meaning_it = r.meaning_it,
     f.keywords = r.keywords,
-    f.page = r.page_no, 
+    f.page = r.page_no,
     f.source = r.filename
-MERGE (f)-[:MENTIONED_IN]->(c)
+MERGE (c)-[hf:HAS_FORMULA]->(f)
+SET hf.filename = r.filename,
+    hf.page_no = r.page_no,
+    hf.chunk_id = r.chunk_id
 """
 
 def _flat_props(props) -> Dict[str, Any]:
@@ -2788,51 +2879,284 @@ def enrich_formula_nodes_and_edges(nodes: list[dict], edges: list[dict]) -> tupl
     return nodes + new_nodes, edges + new_edges
 
 
-def flush_neo4j_rows_batch(rows: List[Dict[str, Any]]):
+def _cleanup_legacy_neo4j_links(
+    session,
+    page_ids: List[str],
+    chunk_ids: List[str],
+) -> None:
+    """Rimuove soltanto le vecchie provenance del modello precedente."""
+    if page_ids:
+        session.run(
+            """
+            MATCH (p:Page)
+            WHERE p.pid IN $page_ids
+            MATCH (:Entity)-[r:PRESENT_ON]->(p)
+            DELETE r
+            """,
+            page_ids=page_ids,
+        ).consume()
+
+    if chunk_ids:
+        session.run(
+            """
+            MATCH (c:Chunk)
+            WHERE c.id IN $chunk_ids
+            MATCH (:Entity)-[r:PRESENT_IN|MENTIONED_IN]->(c)
+            DELETE r
+            """,
+            chunk_ids=chunk_ids,
+        ).consume()
+
+        session.run(
+            """
+            MATCH (c:Chunk)
+            WHERE c.id IN $chunk_ids
+            MATCH (:Formula)-[r:MENTIONED_IN]->(c)
+            DELETE r
+            """,
+            chunk_ids=chunk_ids,
+        ).consume()
+
+
+def flush_neo4j_rows_batch(rows: List[Dict[str, Any]]) -> bool:
+    """
+    Scrive il modello:
+        Document -[:HAS_PAGE]-> Page
+        Page     -[:HAS_CHUNK]-> Chunk
+        Chunk    -[:MENTIONS]-> Entity
+
+    Le relazioni semantiche Entity -> Entity restano separate e conservano
+    provenance di documento, pagina e chunk.
+    """
     if not NEO4J_ENABLED or not rows:
-        return
-    
+        return True
+
     try:
         with neo4j_driver.session() as session:
-            # A. Inserimento Struttura e Nodi
-            session.run(NEO4J_BATCH_QUERY, rows=rows)
+            page_ids = sorted({
+                f"{row.get('doc_id')}::{int(row.get('page_no') or 0)}"
+                for row in rows
+                if row.get("doc_id") and int(row.get("page_no") or 0) > 0
+            })
+            chunk_ids = sorted({
+                str(row.get("chunk_id"))
+                for row in rows
+                if row.get("chunk_id")
+            })
 
-            # B. Inserimento Relazioni Native (Raggruppate per Tipo)
-            edges_by_type = {}
-            for r in rows:
-                for edge in r.get("edges", []):
-                    rel_type = edge.get("relation", "RELATES_TO").upper().replace(" ", "_")
-                    rel_type = "".join(c for c in rel_type if c.isalnum() or c == "_")
-                    
-                    if not rel_type:
+            # Consente anche re-ingestion incrementale senza lasciare il modello
+            # legacy Entity->Page / Entity->Chunk sul documento corrente.
+            _cleanup_legacy_neo4j_links(session, page_ids, chunk_ids)
+
+            session.run(NEO4J_STRUCTURE_QUERY, rows=rows).consume()
+            session.run(NEO4J_ENTITY_QUERY, rows=rows).consume()
+
+            edges_by_type: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}
+
+            for row in rows:
+                for edge in row.get("edges", []):
+                    if not isinstance(edge, dict):
                         continue
-                        
-                    if rel_type not in edges_by_type:
-                        edges_by_type[rel_type] = []
-                    
-                    edges_by_type[rel_type].append({
-                        "source": edge.get("source"),
-                        "target": edge.get("target"),
-                        # 🚀 FIX: Usa 'props' invece di 'properties' per non perdere i dati dell'arco
-                        "props": edge.get("props", {}) 
+
+                    source = normalize_entity_id(str(edge.get("source") or ""))
+                    target = normalize_entity_id(str(edge.get("target") or ""))
+                    rel_type = str(
+                        edge.get("relation") or "RELATES_TO"
+                    ).upper().replace(" ", "_")
+                    rel_type = "".join(
+                        char for char in rel_type
+                        if char.isalnum() or char == "_"
+                    ) or "RELATES_TO"
+
+                    if not source or not target:
+                        continue
+
+                    props = dict(edge.get("props") or {})
+                    source_file = str(
+                        props.get("source_file")
+                        or row.get("filename")
+                        or ""
+                    )
+                    page_no = int(
+                        props.get("page_no")
+                        or row.get("page_no")
+                        or 0
+                    )
+                    chunk_id = str(
+                        props.get("chunk_id")
+                        or row.get("chunk_id")
+                        or ""
+                    )
+                    chunk_index = int(
+                        props.get("chunk_index")
+                        if props.get("chunk_index") is not None
+                        else (row.get("chunk_index") or 0)
+                    )
+                    page_chunk_index = int(
+                        props.get("page_chunk_index")
+                        if props.get("page_chunk_index") is not None
+                        else (row.get("page_chunk_index") or 0)
+                    )
+                    source_ref = str(
+                        props.get("source_ref")
+                        or row.get("source_ref")
+                        or ""
+                    )
+
+                    bucket = edges_by_type.setdefault(rel_type, {})
+                    key = (source, target)
+                    entry = bucket.setdefault(
+                        key,
+                        {
+                            "source": source,
+                            "target": target,
+                            "props": {},
+                            "source_files": set(),
+                            "page_nos": set(),
+                            "chunk_ids": set(),
+                            "chunk_indices": set(),
+                            "page_chunk_indices": set(),
+                            "source_refs": set(),
+                        },
+                    )
+
+                    entry["props"].update(props)
+                    if source_file:
+                        entry["source_files"].add(source_file)
+                    if page_no > 0:
+                        entry["page_nos"].add(page_no)
+                    if chunk_id:
+                        entry["chunk_ids"].add(chunk_id)
+                    entry["chunk_indices"].add(chunk_index)
+                    entry["page_chunk_indices"].add(page_chunk_index)
+                    if source_ref:
+                        entry["source_refs"].add(source_ref)
+
+            for rel_type, edge_map in edges_by_type.items():
+                batch_edges = []
+                for entry in edge_map.values():
+                    batch_edges.append({
+                        "source": entry["source"],
+                        "target": entry["target"],
+                        "props": entry["props"],
+                        "source_files": sorted(entry["source_files"]),
+                        "page_nos": sorted(entry["page_nos"]),
+                        "chunk_ids": sorted(entry["chunk_ids"]),
+                        "chunk_indices": sorted(entry["chunk_indices"]),
+                        "page_chunk_indices": sorted(
+                            entry["page_chunk_indices"]
+                        ),
+                        "source_refs": sorted(entry["source_refs"]),
                     })
 
-            # Eseguiamo query specifiche per tipo di verbo
-            for rel_type, edges in edges_by_type.items():
                 edge_query = f"""
                 UNWIND $batch AS e
                 MATCH (s:Entity {{id: e.source}})
                 MATCH (t:Entity {{id: e.target}})
                 MERGE (s)-[r:{rel_type}]->(t)
+                ON CREATE SET
+                    r.first_seen = datetime(),
+                    r.source_files = [],
+                    r.page_nos = [],
+                    r.chunk_ids = [],
+                    r.chunk_indices = [],
+                    r.page_chunk_indices = [],
+                    r.source_refs = []
                 SET r += coalesce(e.props, {{}}),
-                    r.last_seen = datetime(),
-                    r.count = coalesce(r.count, 0) + 1
+                    r.last_seen = datetime()
+                SET r.source_files = reduce(
+                    acc = coalesce(r.source_files, []),
+                    value IN coalesce(e.source_files, []) |
+                    CASE WHEN value IN acc THEN acc ELSE acc + value END
+                )
+                SET r.page_nos = reduce(
+                    acc = coalesce(r.page_nos, []),
+                    value IN coalesce(e.page_nos, []) |
+                    CASE WHEN value IN acc THEN acc ELSE acc + value END
+                )
+                SET r.chunk_ids = reduce(
+                    acc = coalesce(r.chunk_ids, []),
+                    value IN coalesce(e.chunk_ids, []) |
+                    CASE WHEN value IN acc THEN acc ELSE acc + value END
+                )
+                SET r.chunk_indices = reduce(
+                    acc = coalesce(r.chunk_indices, []),
+                    value IN coalesce(e.chunk_indices, []) |
+                    CASE WHEN value IN acc THEN acc ELSE acc + value END
+                )
+                SET r.page_chunk_indices = reduce(
+                    acc = coalesce(r.page_chunk_indices, []),
+                    value IN coalesce(e.page_chunk_indices, []) |
+                    CASE WHEN value IN acc THEN acc ELSE acc + value END
+                )
+                SET r.source_refs = reduce(
+                    acc = coalesce(r.source_refs, []),
+                    value IN coalesce(e.source_refs, []) |
+                    CASE WHEN value IN acc THEN acc ELSE acc + value END
+                )
+                SET r.count = size(coalesce(r.source_refs, []))
                 """
-                session.run(edge_query, batch=edges)
+
+                session.run(edge_query, batch=batch_edges).consume()
+
+        return True
 
     except Exception as e:
         print(f"   ⚠️ Neo4j Batch Error: {e}")
+        return False
 
+
+def validate_neo4j_graph_model(doc_id: str) -> None:
+    """Verifica il modello Document -> Page -> Chunk -> Entity."""
+    if not NEO4J_ENABLED or not neo4j_driver or not doc_id:
+        return
+
+    try:
+        with neo4j_driver.session() as session:
+            summary = session.run(
+                """
+                MATCH (d:Document {doc_id: $doc_id})
+                OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
+                OPTIONAL MATCH (p)-[:HAS_CHUNK]->(c:Chunk)
+                OPTIONAL MATCH (c)-[:MENTIONS]->(e:Entity)
+                RETURN
+                    count(DISTINCT p) AS pages,
+                    count(DISTINCT c) AS chunks,
+                    count(DISTINCT e) AS entities,
+                    count(DISTINCT [c.id, e.id]) AS mentions
+                """,
+                doc_id=doc_id,
+            ).single()
+
+            legacy_page = session.run(
+                """
+                MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
+                MATCH (:Entity)-[r:PRESENT_ON]->(p)
+                RETURN count(r) AS total
+                """,
+                doc_id=doc_id,
+            ).single()["total"]
+
+            legacy_chunk = session.run(
+                """
+                MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(:Page)
+                      -[:HAS_CHUNK]->(c:Chunk)
+                MATCH (:Entity)-[r:PRESENT_IN|MENTIONED_IN]->(c)
+                RETURN count(r) AS total
+                """,
+                doc_id=doc_id,
+            ).single()["total"]
+
+            print(
+                "   🧭 Graph Model Check | "
+                f"pages={summary['pages']} | chunks={summary['chunks']} | "
+                f"entities={summary['entities']} | mentions={summary['mentions']} | "
+                f"legacy_page_links={legacy_page} | "
+                f"legacy_reverse_chunk_links={legacy_chunk}"
+            )
+
+    except Exception as e:
+        print(f"   ⚠️ Graph Model Check Error: {e}")
 
 def flush_neo4j_formulas_batch(rows: List[Dict[str, Any]]):
     if not NEO4J_ENABLED or not rows:
@@ -4993,10 +5317,23 @@ def enrich_synonyms_from_local_text(nodes: list[dict], text: str) -> list[dict]:
 # =========================
 # FILE DISPATCH (PDF only here)
 # =========================
-def process_ai_and_db(file_path: str, source_type: str, doc_meta: dict, chunks: list, log_id: int):
+def process_ai_and_db(
+    file_path: str,
+    source_type: str,
+    doc_meta: dict,
+    chunks: list,
+    log_id: int,
+):
     """
-    Pipeline v2.5 - Optimized for Gemma 2:9b & P5000 (Final Clean)
-    Rimuove log doppi e ottimizza la visualizzazione della console.
+    Pipeline con Knowledge Graph estratto per singolo chunk.
+
+    Modello Neo4j:
+        Document -[:HAS_PAGE]-> Page
+        Page     -[:HAS_CHUNK]-> Chunk
+        Chunk    -[:MENTIONS]-> Entity
+
+    Non vengono creati collegamenti diretti Page-Entity e non vengono
+    parcheggiate entità su chunk diversi da quello che le ha generate.
     """
     t0 = time.time()
     filename = os.path.basename(file_path)
@@ -5006,14 +5343,15 @@ def process_ai_and_db(file_path: str, source_type: str, doc_meta: dict, chunks: 
 
     tier = (doc_meta or {}).get("tier", "B")
     ontology = (doc_meta or {}).get("ontology", DEFAULT_ONTOLOGY)
-    
-    print(f"   ⚙️ Engine Start: {filename} | tier={tier} | Brain={LLM_MODEL_NAME}")
+
+    print(
+        f"   ⚙️ Engine Start: {filename} | tier={tier} | "
+        f"Brain={LLM_MODEL_NAME}"
+    )
 
     doc_id = sha256_file(file_path)[:32]
 
     global embedder, qdrant_client
-
-    # Init Lazy dei client
     embedder = get_embedder()
     qdrant_client = get_qdrant_client()
     ensure_qdrant_collection()
@@ -5022,198 +5360,378 @@ def process_ai_and_db(file_path: str, source_type: str, doc_meta: dict, chunks: 
         pg_close_log(log_id, "FAILED", 0, _ms(t0), "No chunks extracted")
         move_file_preserving_structure(file_path, FAILED_DIR)
         return
-    
-    # 2. Iniezione metadati e normalizzazione tipo
+
+    # Indici stabili e chunk_id deterministico calcolato una sola volta.
+    page_chunk_counters: Dict[int, int] = {}
+
     for idx, ch in enumerate(chunks):
-        ch.setdefault("chunk_index", idx)
-        
-        # Applica la nuova classificazione invece di forzare 'text'
+        page_no = int(ch.get("page_no") or ch.get("page") or 1)
+        page_chunk_index = page_chunk_counters.get(page_no, 0)
+        page_chunk_counters[page_no] = page_chunk_index + 1
+
+        ch["chunk_index"] = idx
+        ch["page_chunk_index"] = page_chunk_index
+        ch["page_no"] = page_no
         ch["toon_type"] = normalize_toon_type(ch)
-        
-        meta = ch.get("metadata", {})
+        ch["chunk_id"] = deterministic_chunk_id(
+            doc_id,
+            page_no,
+            page_chunk_index,
+            ch.get("toon_type"),
+            ch.get("text_sem"),
+            image_id=ch.get("image_id"),
+        )
+
+        meta = dict(ch.get("metadata") or {})
         meta.update({
-            "doc_id": doc_id, 
-            "filename": filename, 
-            "tier": tier, 
-            "ontology": ontology
+            "doc_id": doc_id,
+            "filename": filename,
+            "tier": tier,
+            "ontology": ontology,
+            "chunk_index": idx,
+            "page_chunk_index": page_chunk_index,
+            "page_no": page_no,
+            "chunk_id": ch["chunk_id"],
         })
         ch["metadata"] = meta
 
-    # Buffers
-    qdrant_points, pg_rows, neo4j_rows = [], [], []
+    qdrant_points: List[Dict[str, Any]] = []
+    pg_rows: List[Tuple] = []
+    neo4j_rows: List[Dict[str, Any]] = []
     total_chunks = 0
     num_chunks_totali = len(chunks)
 
-    # PDF: batch più piccolo per stabilità VRAM su P5000
+    # Risultati KG indicizzati direttamente per chunk globale.
+    chunk_kg_results: Dict[
+        int,
+        Tuple[List[Dict[str, Any]], List[Dict[str, Any]]],
+    ] = {}
+    processed_kg_chunks = set()
+    submitted_kg_chunks = 0
+
     if file_path.lower().endswith(".pdf"):
         pdf_batch = int(os.environ.get("PDF_EMBED_BATCH_SIZE", "8"))
         if pdf_batch > 0:
             global EMBED_BATCH_SIZE
             EMBED_BATCH_SIZE = pdf_batch
 
-    # LOG SINGOLO (Prima ne avevi due)
-    print(f"   🚀 Inizio elaborazione: {num_chunks_totali} chunks (Batch: {EMBED_BATCH_SIZE})")
+    print(
+        f"   🚀 Inizio elaborazione: {num_chunks_totali} chunks "
+        f"(Batch: {EMBED_BATCH_SIZE})"
+    )
 
-
-    # 3. Ciclo Batches
     for i in range(0, num_chunks_totali, EMBED_BATCH_SIZE):
         batch_t0 = time.time()
         batch = chunks[i:i + EMBED_BATCH_SIZE]
-        
-        # Prep text
-        PDF_EMBED_MAX_CHARS = int(os.environ.get("PDF_EMBED_MAX_CHARS", "1800"))
-        texts = [prep_text_for_embedding(c.get("text_sem", ""), max_chars=PDF_EMBED_MAX_CHARS) for c in batch]
 
-        # 3a. Embeddings (Con barra di progresso reale)
-        print(f"   [DEBUG] Calcolo embeddings batch {i//EMBED_BATCH_SIZE + 1}...")
-        t_emb0 = time.time()
+        pdf_embed_max_chars = int(
+            os.environ.get("PDF_EMBED_MAX_CHARS", "1800")
+        )
+        texts = [
+            prep_text_for_embedding(
+                ch.get("text_sem", ""),
+                max_chars=pdf_embed_max_chars,
+            )
+            for ch in batch
+        ]
+
+        print(
+            f"   [DEBUG] Calcolo embeddings batch "
+            f"{i // EMBED_BATCH_SIZE + 1}..."
+        )
+
         try:
-            vecs = embedder.encode(texts, batch_size=EMBED_BATCH_SIZE, show_progress_bar=True)
+            vecs = embedder.encode(
+                texts,
+                batch_size=EMBED_BATCH_SIZE,
+                show_progress_bar=True,
+            )
         except Exception as e:
             print(f"   ⚠️ Errore Embeddings: {e}")
             break
-        t_emb1 = time.time()
 
-        # 3b. Knowledge Graph (Parallel)
-        batch_kg_results = {}
+        # ------------------------------------------------------------
+        # KG PER CHUNK: nessuna aggregazione a livello Page.
+        # ------------------------------------------------------------
         if KG_ENABLED:
-            pages_map = {}
-            for local_j, ch in enumerate(batch):
-                p = int(ch.get("page_no") or 1)
-                # salviamo anche l'indice locale nel batch, così riusiamo vecs[local_j]
-                pages_map.setdefault(p, []).append((i + local_j, local_j, ch))
+            futures_kg: Dict[Tuple[int, int], Any] = {}
+            scheduled_chunks: Dict[int, Dict[str, Any]] = {}
+            raw_results: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}
 
-            # Convertiamo i vecs del batch una volta sola in torch (utile per mean/max)
-            try:
-                vecs_t = torch.tensor(vecs, dtype=torch.float32)
-            except Exception:
-                vecs_t = None
+            for local_idx, ch in enumerate(batch):
+                global_idx = i + local_idx
 
-            futures_kg = {}
+                if global_idx in processed_kg_chunks:
+                    continue
 
-            # I Markdown sono già testi puliti/curati e spesso derivano da documenti
-            # ottimizzati per ingestion. Evitiamo che il gatekeeper vettoriale blocchi
-            # l'esplosione KG dei chunk MD.
-            is_markdown_doc = file_path.lower().endswith(".md")
+                processed_kg_chunks.add(global_idx)
 
-            for p_no, indexed_chunks in pages_map.items():
-                combined_text = "\n".join([ch.get("text_sem", "") for _, _, ch in indexed_chunks])
-                text_clean = safe_normalize_text(combined_text)[:KG_TEXT_MAX_CHARS]
+                text_full = safe_normalize_text(
+                    ch.get("text_raw")
+                    or ch.get("text_sem")
+                    or ""
+                )
+                page_no = int(ch.get("page_no") or 1)
+                page_chunk_index = int(ch.get("page_chunk_index") or 0)
 
-                # ✅ Gatekeeper su embedding già calcolato (media dei chunk della pagina)
-                if vecs_t is not None:
-                    local_idxs = [local_j for _, local_j, _ in indexed_chunks]
-                    page_vec = vecs_t[local_idxs].mean(dim=0)
+                if len(text_full) < KG_MIN_LEN:
+                    print(
+                        f"   [KG_GATEKEEPER] file={filename} | page={page_no} | "
+                        f"chunk={page_chunk_index} | text_len={len(text_full)} | "
+                        "kg=False (testo corto)"
+                    )
+                    continue
 
-                    # Tier A: documenti normativi/framework/procedure di riferimento.
-                    # Soglia più permissiva per non perdere pagine con obblighi, definizioni,
-                    # autorità, notifiche, scadenze, compliance/non-compliance.
-                    kg_threshold = 0.30 if str(tier).upper() == "A" else 0.38
+                semantic_ok = ai_gatekeeper_decision_from_vec(
+                    vecs[local_idx],
+                    threshold=KG_GATEKEEPER_THRESHOLD,
+                )
+                keyword_ok = is_keyword_candidate_hybrid(text_full)
+                ok_kg = semantic_ok or keyword_ok
 
-                    ok_kg = ai_gatekeeper_decision_from_vec(page_vec, threshold=kg_threshold)
-
-                else:
-                    ok_kg = ai_gatekeeper_decision(text_clean)
-
-                # FIX MD:
-                # se è un Markdown e il testo è sufficientemente lungo,
-                # abilitiamo comunque l'estrazione KG.
-                # Non è adattativo: dipende solo dal formato documento e dalla lunghezza.
-                if is_markdown_doc and len(text_clean) >= KG_MIN_LEN:
-                    ok_kg = True
+                if (
+                    KG_CHUNK_LIMIT_ENABLED
+                    and MAX_KG_CHUNKS_PER_DOC > 0
+                    and submitted_kg_chunks >= MAX_KG_CHUNKS_PER_DOC
+                ):
+                    ok_kg = False
 
                 print(
-                    f"   [KG_GATEKEEPER] file={filename} | page={p_no} | "
-                    f"chunks={len(indexed_chunks)} | text_len={len(text_clean)} | "
-                    f"markdown={is_markdown_doc} | kg={ok_kg}"
+                    f"   [KG_GATEKEEPER] file={filename} | page={page_no} | "
+                    f"chunk={page_chunk_index} | text_len={len(text_full)} | "
+                    f"semantic={semantic_ok} | keyword={keyword_ok} | kg={ok_kg}"
                 )
 
-                if ok_kg:
-                    futures_kg[p_no] = kg_executor.submit(
-                        llm_extract_kg, filename, p_no, text_clean, LLM_MODEL_NAME
+                if not ok_kg:
+                    continue
+
+                windows = split_text_with_overlap(
+                    text_full,
+                    KG_TEXT_MAX_CHARS,
+                    min(KG_WINDOW_OVERLAP_CHARS, KG_TEXT_MAX_CHARS // 3),
+                )
+
+                if KG_MAX_WINDOWS_PER_CHUNK > 0:
+                    windows = windows[:KG_MAX_WINDOWS_PER_CHUNK]
+
+                if not windows:
+                    continue
+
+                submitted_kg_chunks += 1
+                scheduled_chunks[global_idx] = {
+                    "chunk": ch,
+                    "text": text_full,
+                    "windows": len(windows),
+                }
+                raw_results[global_idx] = {"nodes": [], "edges": []}
+
+                for window_idx, window_text in enumerate(windows):
+                    futures_kg[(global_idx, window_idx)] = kg_executor.submit(
+                        llm_extract_kg,
+                        filename,
+                        page_no,
+                        window_text,
+                        LLM_MODEL_NAME,
                     )
 
-            # 3c. Raccolta KG (FIXED: Protezione "list index out of range")
-            for p_no, fut in futures_kg.items():
+            for (global_idx, window_idx), future in futures_kg.items():
+                chunk_info = scheduled_chunks[global_idx]
+                ch = chunk_info["chunk"]
+                page_no = int(ch.get("page_no") or 1)
+                page_chunk_index = int(ch.get("page_chunk_index") or 0)
+
                 try:
-                    res = fut.result(timeout=KG_TIMEOUT) 
-                    
-                    # Controllo robusto sul tipo di ritorno
-                    if not res or not isinstance(res, (list, tuple)) or len(res) < 2:
-                        print(f"   ⚠️ KG Skip: Risposta non valida o incompleta a Pagina {p_no}")
+                    result = future.result(timeout=KG_TIMEOUT)
+                    if (
+                        not result
+                        or not isinstance(result, (list, tuple))
+                        or len(result) < 2
+                    ):
+                        print(
+                            f"   ⚠️ KG Skip: risposta non valida | "
+                            f"p={page_no} c={page_chunk_index} "
+                            f"window={window_idx + 1}"
+                        )
                         continue
-                        
-                    raw_nodes, raw_edges = res
-                    
-                    # Normalizzazione Schema
-                    graph_data = _normalize_graph_schema({"nodes": raw_nodes, "edges": raw_edges})
-                    
-                    if graph_data and (graph_data.get("nodes") or graph_data.get("edges")):
 
-                        # Sanificazione con slicing sicuro
-                        # La funzione _sanitize_graph ora deve gestire liste vuote internamente
-                        clean_nodes, clean_edges = _sanitize_graph(graph_data)
-                        clean_nodes, clean_edges = enrich_formula_nodes_and_edges(clean_nodes, clean_edges)
+                    raw_nodes, raw_edges = result
+                    raw_results[global_idx]["nodes"].extend(raw_nodes or [])
+                    raw_results[global_idx]["edges"].extend(raw_edges or [])
 
-                        # Canonizzazione non adattativa delle relazioni KG.
-                        # Usa funzioni già esistenti, senza introdurre wrapper o versioni duplicate.
-                        clean_edges = canonicalize_edges_to_verb_object(clean_edges)
-                        clean_edges = canonicalize_edges_by_base_presence(clean_edges)
-
-                        final_edges = clean_edges
-                        
-                        # Validazione Neo4j (essenziale: filtra nodi senza ID)
-                        validated_nodes = [n for n in clean_nodes if isinstance(n, dict) and n.get("id")]
-                        
-                        for e in final_edges:
-                            if not isinstance(e, dict):
-                                continue
-
-                            props = dict(e.get("props") or {})
-                            props.setdefault("source_file", filename)
-                            props.setdefault("page_no", p_no)
-                            props.setdefault("source", "kg_extraction")
-                            props.setdefault("evidence_type", "explicit_kg_edge")
-                            e["props"] = props                        
-                        
-
-                        if validated_nodes:
-                            # Associa il KG estratto dalla pagina solo al primo chunk della pagina.
-                            # Evita duplicazione logica degli stessi nodi/archi su ogni chunk della stessa pagina.
-                            first_g_idx = pages_map[p_no][0][0]
-                            batch_kg_results[first_g_idx] = (validated_nodes, final_edges)
-                            print(f"   ✅ KG Exploded: {len(validated_nodes)} nodi e {len(final_edges)} archi a Pagina {p_no}")
-                        else:
-                            print(f"   ⚠️ KG Empty: Nessun nodo valido estratto a Pagina {p_no}")
-                            
                 except cf.TimeoutError:
-                    fut.cancel()
-                    print(f"   ⌛ KG Timeout (Pag {p_no}) dopo {KG_TIMEOUT}s: salto estrazione.")
-                    continue
+                    future.cancel()
+                    print(
+                        f"   ⌛ KG Timeout | p={page_no} "
+                        f"c={page_chunk_index} window={window_idx + 1} | "
+                        f"timeout={KG_TIMEOUT}s"
+                    )
                 except Exception as e:
-                    print(f"   ⚠️ KG Processing Error (Pag {p_no}): {str(e)}")
-                    continue
-                    
-                    
-        # 3c. Costruzione Record DB
-        for j, ch in enumerate(batch):
-            g_idx = i + j
+                    print(
+                        f"   ⚠️ KG Processing Error | p={page_no} "
+                        f"c={page_chunk_index} window={window_idx + 1}: {e}"
+                    )
 
-            # ✅ NORMALIZZA toon_type (solo "testo" / "imagine")
+            # Normalizzazione finale per singolo chunk.
+            for global_idx, chunk_info in scheduled_chunks.items():
+                ch = chunk_info["chunk"]
+                chunk_text = chunk_info["text"]
+                page_no = int(ch.get("page_no") or 1)
+                page_chunk_index = int(ch.get("page_chunk_index") or 0)
+                chunk_id = str(ch.get("chunk_id") or "")
+                source_ref = (
+                    f"{filename}::p{page_no}::c{page_chunk_index}"
+                )
+
+                graph_data = _normalize_graph_schema(
+                    raw_results.get(global_idx, {})
+                )
+
+                if not graph_data or not (
+                    graph_data.get("nodes") or graph_data.get("edges")
+                ):
+                    print(
+                        f"   ⚠️ KG Empty | p={page_no} "
+                        f"c={page_chunk_index}: nessun contenuto valido"
+                    )
+                    continue
+
+                clean_nodes, clean_edges = _sanitize_graph(graph_data)
+                clean_nodes, clean_edges = enrich_formula_nodes_and_edges(
+                    clean_nodes,
+                    clean_edges,
+                )
+                clean_edges = canonicalize_edges_to_verb_object(clean_edges)
+                clean_edges = canonicalize_edges_by_base_presence(clean_edges)
+
+                nodes_by_id: Dict[str, Dict[str, Any]] = {}
+
+                for node in clean_nodes:
+                    if not isinstance(node, dict):
+                        continue
+
+                    raw_id = str(node.get("id") or "").strip()
+                    normalized_id = normalize_entity_id(raw_id)
+                    if not normalized_id:
+                        continue
+
+                    normalized_node = dict(node)
+                    normalized_node["id"] = normalized_id
+                    normalized_node["name"] = (
+                        str(node.get("name") or raw_id).strip() or raw_id
+                    )
+
+                    props = dict(normalized_node.get("props") or {})
+                    props.setdefault("description", "")
+                    props.setdefault("formula", "")
+                    props.setdefault("synonyms", [])
+                    normalized_node["props"] = props
+
+                    if normalized_id not in nodes_by_id:
+                        nodes_by_id[normalized_id] = normalized_node
+                    else:
+                        existing = nodes_by_id[normalized_id]
+                        existing_props = dict(existing.get("props") or {})
+                        existing_props.update(props)
+                        existing["props"] = existing_props
+
+                        if existing.get("category") in (
+                            None,
+                            "",
+                            "UNCLASSIFIED",
+                        ):
+                            existing["category"] = normalized_node.get(
+                                "category",
+                                "UNCLASSIFIED",
+                            )
+
+                validated_nodes = ensure_entity_props_defaults(
+                    list(nodes_by_id.values())
+                )
+                validated_nodes = enrich_synonyms_from_local_text(
+                    validated_nodes,
+                    chunk_text,
+                )
+
+                valid_node_ids = {node["id"] for node in validated_nodes}
+                final_edges: List[Dict[str, Any]] = []
+                seen_edges = set()
+
+                for edge in clean_edges:
+                    if not isinstance(edge, dict):
+                        continue
+
+                    source = normalize_entity_id(
+                        str(edge.get("source") or "")
+                    )
+                    target = normalize_entity_id(
+                        str(edge.get("target") or "")
+                    )
+                    relation = str(
+                        edge.get("relation") or "RELATES_TO"
+                    ).strip()
+
+                    if not source or not target:
+                        continue
+                    if source not in valid_node_ids or target not in valid_node_ids:
+                        continue
+
+                    edge_key = (source, target, relation)
+                    if edge_key in seen_edges:
+                        continue
+
+                    props = dict(edge.get("props") or {})
+                    props.setdefault("source_file", filename)
+                    props.setdefault("page_no", page_no)
+                    props.setdefault("chunk_id", chunk_id)
+                    props.setdefault("chunk_index", global_idx)
+                    props.setdefault("page_chunk_index", page_chunk_index)
+                    props.setdefault("source_ref", source_ref)
+                    props.setdefault("source", "kg_extraction")
+                    props.setdefault(
+                        "evidence_type",
+                        "explicit_kg_edge",
+                    )
+
+                    final_edges.append({
+                        "source": source,
+                        "target": target,
+                        "relation": relation,
+                        "props": props,
+                    })
+                    seen_edges.add(edge_key)
+
+                if not validated_nodes:
+                    print(
+                        f"   ⚠️ KG Empty | p={page_no} "
+                        f"c={page_chunk_index}: nessun nodo valido"
+                    )
+                    continue
+
+                chunk_kg_results[global_idx] = (
+                    validated_nodes,
+                    final_edges,
+                )
+
+                print(
+                    f"   ✅ KG Exploded | p={page_no} "
+                    f"c={page_chunk_index} | "
+                    f"nodes={len(validated_nodes)} | "
+                    f"edges={len(final_edges)}"
+                )
+
+        # ------------------------------------------------------------
+        # Costruzione record DB.
+        # ------------------------------------------------------------
+        for local_idx, ch in enumerate(batch):
+            global_idx = i + local_idx
             ch["toon_type"] = normalize_toon_type(ch)
 
-            vector = vecs[j]
-            chunk_id = deterministic_chunk_id(
-                doc_id,
-                ch.get("page_no", 1),
-                g_idx,
-                ch.get("toon_type"),
-                ch.get("text_sem")
-            )
-
-            # Qdrant Payload
+            vector = vecs[local_idx]
             page_no = int(ch.get("page_no") or ch.get("page") or 1)
-            
+            page_chunk_index = int(ch.get("page_chunk_index") or 0)
+            chunk_id = str(ch.get("chunk_id") or "")
+            source_ref = f"{filename}::p{page_no}::c{page_chunk_index}"
+
             metadata = dict(ch.get("metadata") or {})
             metadata.update({
                 "page": page_no,
@@ -5226,9 +5744,12 @@ def process_ai_and_db(file_path: str, source_type: str, doc_meta: dict, chunks: 
                 "source_name": filename,
                 "source_type": source_type,
                 "log_id": log_id,
-                "chunk_index": g_idx,
+                "chunk_index": global_idx,
+                "page_chunk_index": page_chunk_index,
+                "chunk_id": chunk_id,
+                "source_ref": source_ref,
             })
-            
+
             if ch.get("image_id") is not None:
                 metadata["image_id"] = ch.get("image_id")
 
@@ -5248,88 +5769,180 @@ def process_ai_and_db(file_path: str, source_type: str, doc_meta: dict, chunks: 
 
             pg_rows.append((
                 log_id,
-                g_idx,
+                global_idx,
                 ch.get("toon_type", "text"),
                 ch.get("text_raw"),
                 ch.get("text_sem"),
                 json.dumps(metadata, ensure_ascii=False),
                 chunk_id,
             ))
-            # Neo4j Rows (Con tutte le proprietà corrette)
-            k_nodes, k_edges = batch_kg_results.get(g_idx, ([], []))
 
-            # FIX: aggiunge sempre le formule Vision come nodi FORMULA deterministici
+            chunk_nodes, chunk_edges = chunk_kg_results.get(
+                global_idx,
+                ([], []),
+            )
+            chunk_nodes = list(chunk_nodes)
+            chunk_edges = list(chunk_edges)
+
+            # Formula Vision: resta sul chunk che contiene la formula.
             formula_nodes, formula_edges = formula_kg_from_chunk(ch)
+            chunk_nodes.extend(formula_nodes)
+            chunk_edges.extend(formula_edges)
 
-            k_nodes = list(k_nodes or []) + formula_nodes
-            k_edges = list(k_edges or []) + formula_edges
+            # Deduplica finale dei nodi dopo l'aggiunta delle formule.
+            final_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+            for node in ensure_entity_props_defaults(chunk_nodes):
+                if not isinstance(node, dict):
+                    continue
+                node_id = normalize_entity_id(str(node.get("id") or ""))
+                if not node_id:
+                    continue
 
-      
-            # FIX: garantisce proprietà standard su tutte le Entity
-            k_nodes = ensure_entity_props_defaults(k_nodes)
+                normalized_node = dict(node)
+                normalized_node["id"] = node_id
+                normalized_node.setdefault(
+                    "name",
+                    str(node.get("name") or node.get("id") or ""),
+                )
 
-            # FIX: arricchisce synonyms SOLO da pattern espliciti nel testo locale
-            k_nodes = enrich_synonyms_from_local_text(k_nodes, ch.get("text_sem", ""))
-            
+                if node_id not in final_nodes_by_id:
+                    final_nodes_by_id[node_id] = normalized_node
+                else:
+                    existing = final_nodes_by_id[node_id]
+                    props = dict(existing.get("props") or {})
+                    props.update(dict(normalized_node.get("props") or {}))
+                    existing["props"] = props
+
+            final_nodes = enrich_synonyms_from_local_text(
+                list(final_nodes_by_id.values()),
+                ch.get("text_sem", ""),
+            )
+            final_node_ids = {node["id"] for node in final_nodes}
+
+            final_edges = []
+            seen_final_edges = set()
+            for edge in chunk_edges:
+                if not isinstance(edge, dict):
+                    continue
+
+                source = normalize_entity_id(
+                    str(edge.get("source") or "")
+                )
+                target = normalize_entity_id(
+                    str(edge.get("target") or "")
+                )
+                relation = str(
+                    edge.get("relation") or "RELATES_TO"
+                ).strip()
+
+                if source not in final_node_ids or target not in final_node_ids:
+                    continue
+
+                edge_key = (source, target, relation)
+                if edge_key in seen_final_edges:
+                    continue
+
+                props = dict(edge.get("props") or {})
+                props.setdefault("source_file", filename)
+                props.setdefault("page_no", page_no)
+                props.setdefault("chunk_id", chunk_id)
+                props.setdefault("chunk_index", global_idx)
+                props.setdefault("page_chunk_index", page_chunk_index)
+                props.setdefault("source_ref", source_ref)
+
+                final_edges.append({
+                    "source": source,
+                    "target": target,
+                    "relation": relation,
+                    "props": props,
+                })
+                seen_final_edges.add(edge_key)
 
             neo4j_rows.append({
                 "doc_id": doc_id,
                 "filename": filename,
-                "filename_norm": normalize_doc_name(filename), # <--- AGGIUNTO
+                "filename_norm": normalize_doc_name(filename),
                 "doc_type": source_type,
+                "tier": tier,
+                "ontology": ontology,
                 "log_id": log_id,
                 "chunk_id": chunk_id,
-                "chunk_index": g_idx,
+                "chunk_index": global_idx,
+                "page_chunk_index": page_chunk_index,
                 "toon_type": ch.get("toon_type"),
-                "page_no": ch.get("page_no", 1),
-                "nodes": k_nodes,
-                "edges": k_edges,
-                "ontology": ontology,
+                "page_no": page_no,
+                "source_ref": source_ref,
+                "nodes": final_nodes,
+                "edges": final_edges,
                 "text_sem": ch.get("text_sem", ""),
-                "section_hint": ch.get("section_hint", "")
+                "section_hint": ch.get("section_hint", ""),
             })
-            
+
             total_chunks += 1
 
-        # 4. Flush "intelligente" (meno roundtrip, stessa modalità di scrittura)
-        must_flush = (len(pg_rows) >= DB_FLUSH_SIZE) or (i + len(batch) >= num_chunks_totali)
+        must_flush = (
+            len(pg_rows) >= DB_FLUSH_SIZE
+            or i + len(batch) >= num_chunks_totali
+        )
 
         if must_flush:
             flush_postgres_chunks_batch(pg_rows)
 
             try:
-                pts = [models.PointStruct(id=p["id"], vector=p["vector"], payload=p["payload"]) for p in qdrant_points]
-                qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=pts)
+                points = [
+                    models.PointStruct(
+                        id=point["id"],
+                        vector=point["vector"],
+                        payload=point["payload"],
+                    )
+                    for point in qdrant_points
+                ]
+                qdrant_client.upsert(
+                    collection_name=QDRANT_COLLECTION,
+                    points=points,
+                    wait=True,
+                )
             except Exception as e:
                 print(f"   ⚠️ Qdrant Error: {e}")
 
             flush_neo4j_rows_batch(neo4j_rows)
 
-            # Reset buffers (solo dopo flush)
             pg_rows.clear()
             qdrant_points.clear()
             neo4j_rows.clear()
 
-        
-        # Log Avanzamento
-        percentuale = min(100, int((i + len(batch)) / num_chunks_totali * 100))
-        print(f"   📦 Batch {int(i/EMBED_BATCH_SIZE)+1} | {percentuale}% completato | Tempo Batch: {_ms(batch_t0)}ms")
+        percentage = min(
+            100,
+            int((i + len(batch)) / num_chunks_totali * 100),
+        )
+        print(
+            f"   📦 Batch {int(i / EMBED_BATCH_SIZE) + 1} | "
+            f"{percentage}% completato | Tempo Batch: {_ms(batch_t0)}ms"
+        )
 
-    # 5. Chiusura Finale
     total_ms = _ms(t0)
     pg_close_log(log_id, "DONE", total_chunks, total_ms)
 
     if NEO4J_ENABLED:
         try:
             with neo4j_driver.session() as session:
-                session.run("MATCH (d:Document {doc_id: $did}) SET d.processing_time_ms = $ms", did=doc_id, ms=total_ms)
-        except Exception: pass
+                session.run(
+                    "MATCH (d:Document {doc_id: $did}) "
+                    "SET d.processing_time_ms = $ms",
+                    did=doc_id,
+                    ms=total_ms,
+                ).consume()
+        except Exception:
+            pass
 
-    # Sposta in PROCESSED
+        validate_neo4j_graph_model(doc_id)
+
     move_file_preserving_structure(file_path, PROCESSED_DIR)
 
-
-    print(f"   ✅ Completed: {filename} | chunks={total_chunks} | time={total_ms/1000:.2f}s")
+    print(
+        f"   ✅ Completed: {filename} | chunks={total_chunks} | "
+        f"time={total_ms / 1000:.2f}s"
+    )
 
 def main():
     """

@@ -171,6 +171,11 @@ COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "assessment_docs")
 RAG_DEFAULT_TIERS = os.getenv("RAG_DEFAULT_TIERS", "A,B,C")
 
 
+# =========================
+# MULTI-TENANT CONTEXT
+# =========================
+ORGANIZATION_ID = int(os.getenv("ORGANIZATION_ID", "8888")) #1234 in ingestio
+
 
 # =========================
 # 🐘 POSTGRES (Timescale) - RAG ENRICH
@@ -493,6 +498,10 @@ class SourceItem(BaseModel):
     section_hint: str = ""
     image_id: Optional[int] = None
     tier: str = "C"
+    scope: str = "ACCOUNT"
+    organization_id: Optional[int] = None
+
+    # PostgreSQL canonical provenance
 
     # PostgreSQL canonical provenance
     pg_ingestion_ts: str = ""
@@ -3003,6 +3012,7 @@ def get_neighbor_chunk_ids(
             (c2:Chunk)
         WHERE coalesce(c1.chunk_id, c1.id) IN $ids
           AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
+          AND (c2.scope = 'GLOBAL' OR (c2.scope = 'ACCOUNT' AND c2.organization_id = $org_id))
           AND NOT toUpper(
               coalesce(e.type, e.category, labels(e)[0], '')
           ) IN ['GENERIC', 'YEAR', 'DATE']
@@ -3019,6 +3029,7 @@ def get_neighbor_chunk_ids(
         WHERE coalesce(c1.chunk_id, c1.id) IN $ids
           AND p1 <> p2
           AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
+          AND (c2.scope = 'GLOBAL' OR (c2.scope = 'ACCOUNT' AND c2.organization_id = $org_id))
           AND NOT toUpper(
               coalesce(e.type, e.category, labels(e)[0], '')
           ) IN ['GENERIC', 'YEAR', 'DATE']
@@ -3038,8 +3049,10 @@ def get_neighbor_chunk_ids(
 
     try:
         with neo4j_driver.session() as session:
-            res = session.run(query, ids=chunk_ids, lim=limit)
+            res = session.run(query, ids=chunk_ids, lim=limit, org_id=ORGANIZATION_ID)
             return [str(r["cid"]) for r in res if r.get("cid")]
+        
+        
     except Exception as e:
         print(f"⚠️ Neo4j Semantic Neighbors Error: {e}")
         return []
@@ -3218,6 +3231,8 @@ def fetch_pg_chunks_by_uuid(chunk_uuids: List[str]) -> Dict[str, Dict[str, Any]]
             d.content_semantic,
             d.metadata_json,
             d.ingestion_ts,
+            d.scope,
+            d.organization_id,
             ROW_NUMBER() OVER (
                 PARTITION BY d.chunk_uuid
                 ORDER BY d.ingestion_ts DESC
@@ -3233,9 +3248,9 @@ def fetch_pg_chunks_by_uuid(chunk_uuids: List[str]) -> Dict[str, Dict[str, Any]]
         metadata_json,
         ingestion_ts
     FROM ranked
-    WHERE rn = 1;
+    WHERE rn = 1
+      AND (scope = 'GLOBAL' OR (scope = 'ACCOUNT' AND organization_id = %s));
     """
-
     conn = pg_pool.getconn()
 
     try:
@@ -3291,6 +3306,8 @@ def search_pg_bm25(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
     if not tokens:
         return []
     pg_query = " OR ".join(tokens)
+    
+    
     sql = """
     WITH q AS (SELECT websearch_to_tsquery('simple', %s) AS tsq)
     SELECT
@@ -3304,14 +3321,17 @@ def search_pg_bm25(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
         ) AS rank
     FROM public.document_chunks, q
     WHERE to_tsvector('simple', COALESCE(content_semantic, '') || ' ' || COALESCE(content_raw, '') || ' ' || COALESCE(metadata_json::text, '')) @@ q.tsq
+      AND (scope = 'GLOBAL' OR (scope = 'ACCOUNT' AND organization_id = %s))
     ORDER BY rank DESC
     LIMIT %s;
     """
     conn = pg_pool.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (pg_query, limit))
+            cur.execute(sql, (pg_query, ORGANIZATION_ID, limit))
             rows = cur.fetchall()
+            
+            
         out: List[Dict[str, Any]] = []
         for chunk_uuid, content_raw, content_semantic, metadata_json, rank in rows:
             if isinstance(metadata_json, str):
@@ -3347,17 +3367,19 @@ def search_pg_exact_phrases(query_text: str, limit: int = 30) -> List[Dict[str, 
     phrases = phrases[:12]
     per_phrase_limit = max(3, limit // len(phrases))
 
+
     sql_template = """
-    SELECT
-        chunk_uuid::text,
-        content_raw,
-        content_semantic,
-        metadata_json,
-        ingestion_ts
-    FROM public.document_chunks
-    WHERE {condition}
-    ORDER BY ingestion_ts DESC
-    LIMIT %s;
+        SELECT
+            chunk_uuid::text,
+            content_raw,
+            content_semantic,
+            metadata_json,
+            ingestion_ts
+        FROM public.document_chunks
+        WHERE {condition}
+        AND (scope = 'GLOBAL' OR (scope = 'ACCOUNT' AND organization_id = %s))
+        ORDER BY ingestion_ts DESC
+        LIMIT %s;
     """
 
     conn = pg_pool.getconn()
@@ -3373,8 +3395,10 @@ def search_pg_exact_phrases(query_text: str, limit: int = 30) -> List[Dict[str, 
 
                 cur.execute(
                     sql_template.format(condition=condition),
-                    [*condition_params, per_phrase_limit],
+                    [*condition_params, ORGANIZATION_ID, per_phrase_limit],
                 )
+
+
 
                 for chunk_uuid, content_raw, content_semantic, metadata_json, ingestion_ts in cur.fetchall():
                     if isinstance(metadata_json, str):
@@ -3487,6 +3511,7 @@ def search_pg_glossary_term(
             OR lower(COALESCE(metadata_json::text, '')) LIKE %s
         )
         AND ({' OR '.join(clauses)})
+        AND (scope = 'GLOBAL' OR (scope = 'ACCOUNT' AND organization_id = %s))
     ORDER BY ingestion_ts DESC
     LIMIT %s;
     """
@@ -3495,13 +3520,16 @@ def search_pg_glossary_term(
     # come parametri e non scritti come '%glossario%' dentro la query, altrimenti
     # si ottengono errori tipo: list index out of range.
     params = ["%glossario%", "%glossario%", "%glossario%"] + params
-    params.append(limit)
+    params.extend([ORGANIZATION_ID, limit])
 
     conn = pg_pool.getconn()
 
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params)
+            
+            
+            
             rows = cur.fetchall()
 
         out: List[Dict[str, Any]] = []
@@ -3848,7 +3876,8 @@ def search_neo4j_entities(
     cypher = """
     CALL () {
         MATCH (e:Entity)-[:PRESENT_IN|MENTIONED_IN]->(c:Chunk)
-        WHERE any(tok IN $tokens WHERE
+        WHERE (c.scope = 'GLOBAL' OR (c.scope = 'ACCOUNT' AND c.organization_id = $org_id))
+          AND any(tok IN $tokens WHERE
             toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
             toLower(coalesce(e.description, '')) CONTAINS tok OR
             toLower(coalesce(e.category, e.type, labels(e)[0], '')) CONTAINS tok OR
@@ -3861,7 +3890,8 @@ def search_neo4j_entities(
         UNION ALL
 
         MATCH (e:Entity)-[:PRESENT_ON]->(p:Page)-[:HAS_CHUNK]->(c:Chunk)
-        WHERE any(tok IN $tokens WHERE
+        WHERE (c.scope = 'GLOBAL' OR (c.scope = 'ACCOUNT' AND c.organization_id = $org_id))
+          AND any(tok IN $tokens WHERE
             toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
             toLower(coalesce(e.description, '')) CONTAINS tok OR
             toLower(coalesce(e.category, e.type, labels(e)[0], '')) CONTAINS tok OR
@@ -3899,7 +3929,10 @@ def search_neo4j_entities(
     out: List[Dict[str, Any]] = []
     try:
         with neo4j_driver.session() as session:
-            rows = session.run(cypher, tokens=tokens, limit=limit)
+            rows = session.run(cypher, tokens=tokens, limit=limit, org_id=ORGANIZATION_ID)
+            
+            
+            
             for r in rows:
                 cid = r.get("chunk_id")
                 if not cid:
@@ -3934,7 +3967,8 @@ def search_neo4j_formulas(query_text: str, limit: int = 20) -> List[Dict[str, An
 
     cypher = """
     MATCH (f)-[:MENTIONED_IN|PRESENT_IN]->(c:Chunk)
-    WHERE (
+    WHERE (c.scope = 'GLOBAL' OR (c.scope = 'ACCOUNT' AND c.organization_id = $org_id))
+      AND (
         f:Formula OR toUpper(coalesce(f.category, '')) = 'FORMULA'
     )
     AND any(tok IN $tokens WHERE
@@ -3964,7 +3998,9 @@ def search_neo4j_formulas(query_text: str, limit: int = 20) -> List[Dict[str, An
     out: List[Dict[str, Any]] = []
     try:
         with neo4j_driver.session() as session:
-            rows = session.run(cypher, tokens=tokens, limit=limit)
+            rows = session.run(cypher, tokens=tokens, limit=limit, org_id=ORGANIZATION_ID)
+            
+            
             for r in rows:
                 cid = r.get("chunk_id")
                 if not cid:
@@ -4126,7 +4162,8 @@ def search_neo4j_relations(query_text: str, limit: int = 60) -> List[Dict[str, A
 
     cypher = """
     MATCH (e1:Entity)-[rel]->(e2:Entity)
-    WHERE any(tok IN $tokens WHERE
+    WHERE (rel.scope = 'GLOBAL' OR (rel.scope = 'ACCOUNT' AND rel.organization_id = $org_id))
+      AND any(tok IN $tokens WHERE
         toLower(coalesce(e1.name, e1.id, '')) CONTAINS tok OR
         toLower(coalesce(e2.name, e2.id, '')) CONTAINS tok OR
         toLower(coalesce(e1.description, '')) CONTAINS tok OR
@@ -4184,7 +4221,10 @@ def search_neo4j_relations(query_text: str, limit: int = 60) -> List[Dict[str, A
     try:
         with neo4j_driver.session() as session:
             scan_limit = max(limit * 4, limit)
-            rows = session.run(cypher, tokens=tokens, limit=scan_limit)
+            rows = session.run(cypher, tokens=tokens, limit=scan_limit, org_id=ORGANIZATION_ID)
+            
+            
+            
             raw_rows = [dict(r) for r in rows]
         return filter_neo4j_relation_rows(query_text, raw_rows, limit)
     except Exception as e:
@@ -5085,6 +5125,8 @@ def search_pg_by_document_scope(
             d.content_semantic,
             d.metadata_json,
             d.ingestion_ts,
+            d.scope,          -- AGGIUNTO: Propagazione per la clausola WHERE esterna
+            d.organization_id, -- AGGIUNTO: Propagazione per la clausola WHERE esterna
 
             regexp_replace(
                 regexp_replace(
@@ -5140,6 +5182,7 @@ def search_pg_by_document_scope(
             filename_norm LIKE %s
             OR %s LIKE ('%%' || filename_norm || '%%')
       )
+      AND (scope = 'GLOBAL' OR (scope = 'ACCOUNT' AND organization_id = %s))
     ORDER BY rank DESC, ingestion_ts DESC
     LIMIT %s;
     """
@@ -5154,9 +5197,14 @@ def search_pg_by_document_scope(
                     query_text,
                     f"%{wanted_norm}%",
                     wanted_norm,
+                    ORGANIZATION_ID,
                     limit,
                 )
             )
+            
+            
+            
+            
             rows = cur.fetchall()
 
         out: List[Dict[str, Any]] = []
@@ -5253,6 +5301,18 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
     # 2) Qdrant vector search
     t0 = time.time()
     hits = []
+    
+    tenant_filter = models.Filter(
+        should=[
+            models.FieldCondition(key="scope", match=models.MatchValue(value="GLOBAL")),
+            models.Filter(
+                must=[
+                    models.FieldCondition(key="scope", match=models.MatchValue(value="ACCOUNT")),
+                    models.FieldCondition(key="organization_id", match=models.MatchValue(value=ORGANIZATION_ID))
+                ]
+            )
+        ]
+    )
 
     try:
         # Compatibilità universale per le versioni nuove e vecchie di Qdrant
@@ -5260,6 +5320,7 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
             response = qdrant_client_inst.query_points(
                 collection_name=COLLECTION_NAME,
                 query=query_vector,
+                query_filter=tenant_filter,
                 limit=qdrant_k,
                 with_payload=True,
             )
@@ -5268,9 +5329,12 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
             hits = qdrant_client_inst.search(
                 collection_name=COLLECTION_NAME,
                 query_vector=query_vector,
+                query_filter=tenant_filter,
                 limit=qdrant_k,
                 with_payload=True,
             )
+            
+            
         counts["qdrant_hits"] = len(hits)
         print(f"🌌 Qdrant ha trovato {len(hits)} chunk.")
     except Exception as e:
@@ -7446,23 +7510,33 @@ class State(rx.State):
         try:
             query_vector = embedder.encode(query, normalize_embeddings=True).tolist()
 
+            # Filtro Multi-Tenant
+            tenant_filter = models.Filter(
+                must=[models.FieldCondition(key="tier", match=models.MatchValue(value=tier))],
+                should=[
+                    models.FieldCondition(key="scope", match=models.MatchValue(value="GLOBAL")),
+                    models.Filter(
+                        must=[
+                            models.FieldCondition(key="scope", match=models.MatchValue(value="ACCOUNT")),
+                            models.FieldCondition(key="organization_id", match=models.MatchValue(value=ORGANIZATION_ID))
+                        ]
+                    )
+                ]
+            )
+
             # Compatibilità universale
             if hasattr(qdrant_client_inst, 'query_points'):
                 search_result = qdrant_client_inst.query_points(
                     collection_name=COLLECTION_NAME,
                     query=query_vector,
-                    query_filter=models.Filter(
-                        must=[models.FieldCondition(key="tier", match=models.MatchValue(value=tier))]
-                    ),
+                    query_filter=tenant_filter,
                     limit=15
                 ).points
             else:
                 search_result = qdrant_client_inst.search(
                     collection_name=COLLECTION_NAME,
                     query_vector=query_vector,
-                    query_filter=models.Filter(
-                        must=[models.FieldCondition(key="tier", match=models.MatchValue(value=tier))]
-                    ),
+                    query_filter=tenant_filter,
                     limit=15
                 )
                 
@@ -10113,11 +10187,12 @@ def _search_pg_threshold_regex_v413(limit: int = 12) -> List[SourceItem]:
     sql = f"""
     SELECT chunk_uuid::text, content_raw, content_semantic, metadata_json, ingestion_ts
     FROM public.document_chunks
-    WHERE {' OR '.join(clauses)}
+    WHERE ({' OR '.join(clauses)})
+      AND (scope = 'GLOBAL' OR (scope = 'ACCOUNT' AND organization_id = %s))
     ORDER BY ingestion_ts DESC
     LIMIT %s;
     """
-    params.append(limit)
+    params.extend([ORGANIZATION_ID, limit])
 
     conn = pg_pool.getconn()
     try:
