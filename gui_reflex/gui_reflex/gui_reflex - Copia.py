@@ -1,5 +1,16 @@
+# FINAL MULTI-TENANT HARDENED VERSION - aligned with Architecture v1.1
+# LaTeX rendering + formula provenance fix v4.14: raw text priority, document scope, KaTeX-safe output
 
 import os
+import sys
+
+# Log immediati nel container Docker.
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+try:
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
+except Exception:
+    pass
 
 # --- FIX ANTI-BLOCCO GUI/RAG ---
 # Deve stare prima di torch / sentence_transformers.
@@ -35,6 +46,8 @@ from openai import OpenAI
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import uuid
+import contextvars
+import secrets
 
 import warnings
 import logging
@@ -171,6 +184,217 @@ COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "assessment_docs")
 RAG_DEFAULT_TIERS = os.getenv("RAG_DEFAULT_TIERS", "A,B,C")
 
 
+# =========================
+# MULTI-TENANT CONTEXT
+# =========================
+def _required_positive_int_env(name: str) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        raise RuntimeError(f"Variabile ambiente obbligatoria non configurata: {name}")
+    try:
+        value = int(str(raw).strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} deve essere un intero positivo") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} deve essere maggiore di zero")
+    return value
+
+
+# POC: un'unica organizzazione configurata direttamente nel codice.
+# Deve essere un intero, non un confronto booleano.
+POC_MODE = True
+ORGANIZATION_ID: int = 1234
+
+CORPUS_VERSION = (os.getenv("CORPUS_VERSION", "v1").strip() or "v1")
+PG_AUTO_HARDEN_SCHEMA = os.getenv("PG_AUTO_HARDEN_SCHEMA", "0") == "1"
+PG_ENFORCE_LEAST_PRIVILEGE = (
+    False if POC_MODE
+    else os.getenv("PG_ENFORCE_LEAST_PRIVILEGE", "1") == "1"
+)
+
+
+class TenantContext(BaseModel):
+    organization_id: int
+    user_id: str
+    roles: List[str] = Field(default_factory=list)
+    request_id: str
+    is_super_admin: bool = False
+    allowed_scopes: List[str] = Field(default_factory=lambda: ["GLOBAL", "ACCOUNT"])
+
+    class Config:
+        allow_mutation = False
+
+
+def resolve_tenant_context(*, request_id: str = "", user_id: str = "") -> TenantContext:
+    # Il TenantContext iniziale deve usare direttamente la configurazione trusted.
+    # Non può chiamare current_organization_id(), perché la ContextVar viene
+    # creata soltanto dopo la costruzione del contesto base.
+    roles = [r.strip() for r in os.getenv("RAG_USER_ROLES", "user").split(",") if r.strip()]
+    return TenantContext(
+        organization_id=int(ORGANIZATION_ID),
+        user_id=user_id or os.getenv("RAG_USER_ID", "service-user"),
+        roles=roles,
+        request_id=request_id or str(uuid.uuid4()),
+        is_super_admin=False,
+    )
+
+
+_BASE_TENANT_CONTEXT = resolve_tenant_context(request_id="startup")
+_CURRENT_TENANT_CONTEXT: contextvars.ContextVar[TenantContext] = contextvars.ContextVar(
+    "rag_tenant_context", default=_BASE_TENANT_CONTEXT
+)
+
+
+def get_tenant_context() -> TenantContext:
+    return _CURRENT_TENANT_CONTEXT.get()
+
+
+def current_organization_id() -> int:
+    return int(get_tenant_context().organization_id)
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def tenant_record_is_visible(
+    *,
+    scope: Any,
+    organization_id: Any,
+    tier: Any,
+    status: Any = "active",
+    current_organization_id: Optional[int] = None,
+    allow_graph_tier: bool = False,
+) -> bool:
+    """Regola fail-closed condivisa da Qdrant, PostgreSQL, Neo4j e prompt."""
+    org_current = int(current_organization_id or current_organization_id_fn())
+    scope_norm = str(scope or "").strip().upper()
+    tier_norm = str(tier or "").strip().upper()
+    status_norm = str(status or "").strip().lower()
+    org_norm = _optional_int(organization_id)
+
+    if status_norm != "active":
+        return False
+    if scope_norm == "GLOBAL":
+        return org_norm is None and (tier_norm == "A" or (allow_graph_tier and tier_norm == "GRAPH"))
+    if scope_norm == "ACCOUNT":
+        return org_norm == org_current and (
+            tier_norm in {"B", "C"} or (allow_graph_tier and tier_norm == "GRAPH")
+        )
+    return False
+
+
+def current_organization_id_fn() -> int:
+    return current_organization_id()
+
+
+def qdrant_payload_is_visible(
+    payload: Dict[str, Any],
+    current_organization_id: Optional[int] = None,
+) -> bool:
+    return tenant_record_is_visible(
+        scope=payload.get("scope"),
+        organization_id=payload.get("organization_id"),
+        tier=payload.get("tier"),
+        status=payload.get("status"),
+        current_organization_id=current_organization_id,
+        allow_graph_tier=False,
+    )
+
+
+def source_is_visible(
+    source: "SourceItem",
+    current_organization_id: Optional[int] = None,
+) -> bool:
+    org_current = int(current_organization_id or current_organization_id_fn())
+    tier_norm = str(getattr(source, "tier", "") or "").strip().upper()
+    if tier_norm == "USER":
+        return (
+            str(getattr(source, "scope", "") or "").strip().upper() == "ACCOUNT"
+            and _optional_int(getattr(source, "organization_id", None)) == org_current
+            and str(getattr(source, "id", "") or "") in {"user_input", "error"}
+        )
+    return tenant_record_is_visible(
+        scope=getattr(source, "scope", ""),
+        organization_id=getattr(source, "organization_id", None),
+        tier=tier_norm,
+        status=getattr(source, "status", ""),
+        current_organization_id=org_current,
+        allow_graph_tier=True,
+    )
+
+
+def filter_sources_for_current_organization(
+    sources: List["SourceItem"],
+    current_organization_id: Optional[int] = None,
+) -> List["SourceItem"]:
+    org_current = int(current_organization_id or current_organization_id_fn())
+    visible: List["SourceItem"] = []
+    dropped = 0
+    for source in sources or []:
+        if source_is_visible(source, org_current):
+            visible.append(source)
+        else:
+            dropped += 1
+    if dropped:
+        logger.warning(
+            "Tenant guard: scartate %s fonti non visibili per organization_id=%s request_id=%s",
+            dropped, org_current, get_tenant_context().request_id,
+        )
+    return visible
+
+
+def build_qdrant_tenant_filter(extra_must: Optional[List[Any]] = None) -> models.Filter:
+    """Ogni query Qdrant include status e perimetro tenant costruiti da codice trusted."""
+    org_id = current_organization_id()
+    mandatory = [
+        models.FieldCondition(key="status", match=models.MatchValue(value="active")),
+        *(list(extra_must or [])),
+    ]
+    return models.Filter(
+        must=mandatory,
+        should=[
+            models.Filter(
+                must=[
+                    models.FieldCondition(key="scope", match=models.MatchValue(value="GLOBAL")),
+                    models.FieldCondition(key="tier", match=models.MatchValue(value="A")),
+                ]
+            ),
+            models.Filter(
+                must=[
+                    models.FieldCondition(key="scope", match=models.MatchValue(value="ACCOUNT")),
+                    models.FieldCondition(key="organization_id", match=models.MatchValue(value=org_id)),
+                    models.FieldCondition(key="tier", match=models.MatchAny(any=["B", "C"])),
+                ]
+            ),
+        ],
+    )
+
+
+def metadata_with_tenant(
+    metadata: Any,
+    scope: Any,
+    organization_id: Any,
+    tier: Any,
+) -> Dict[str, Any]:
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = {}
+    result = dict(metadata or {})
+    result["scope"] = str(scope or "").strip().upper()
+    result["organization_id"] = _optional_int(organization_id)
+    result["tier"] = str(tier or result.get("tier") or "").strip().upper()
+    result["status"] = str(result.get("status") or "active").strip().lower()
+    result["corpus_version"] = str(result.get("corpus_version") or CORPUS_VERSION)
+    return result
+
 
 # =========================
 # 🐘 POSTGRES (Timescale) - RAG ENRICH
@@ -261,6 +485,11 @@ def call_ollama_chat_native(messages: List[Dict[str, str]]) -> str:
         "model": LLM_MODEL_NAME,
         "messages": messages,
         "stream": False,
+
+        # Evita che il modello produca soltanto il campo thinking,
+        # lasciando message.content vuoto.
+        "think": False,
+
         "options": {
             "temperature": 0.15,
             "num_ctx": int(LLM_NUM_CTX),
@@ -374,6 +603,7 @@ llm_client = None
 qdrant_client_inst = None
 neo4j_driver = None
 pg_pool = None
+RESOURCE_INIT_ERROR = ""
 
 # Device selection (già definiti nel tuo script, ma assicurati siano accessibili)
 # Device selection
@@ -384,17 +614,212 @@ pg_pool = None
 device_embed = os.getenv("EMBED_DEVICE", "cpu")
 device_rerank = os.getenv("RERANK_DEVICE", "cpu")
 
+
+def _pg_role_security_check(cur) -> None:
+    cur.execute(
+        "SELECT current_user, rolsuper, rolbypassrls "
+        "FROM pg_roles WHERE rolname = current_user"
+    )
+    row = cur.fetchone() or ("unknown", False, False)
+    user_name = str(row[0])
+    is_superuser = bool(row[1])
+    bypass_rls = bool(row[2])
+
+    if is_superuser or bypass_rls:
+        if POC_MODE:
+            print(
+                "⚠️ POC MODE: ruolo PostgreSQL privilegiato consentito "
+                f"(user={user_name}, superuser={is_superuser}, bypassrls={bypass_rls})."
+            )
+            return
+
+        if PG_ENFORCE_LEAST_PRIVILEGE:
+            raise RuntimeError(
+                "PG_USER non può essere SUPERUSER/BYPASSRLS nel backend RAG. "
+                "Configurare un ruolo applicativo dedicato."
+            )
+
+
+def pg_get_conn_secure():
+    if not pg_pool:
+        raise RuntimeError("Pool PostgreSQL non inizializzato")
+    conn = pg_pool.getconn()
+    try:
+        ctx = get_tenant_context()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT set_config('app.current_customer_account_id', %s, false), "
+                "set_config('app.current_request_id', %s, false)",
+                (str(ctx.organization_id), ctx.request_id),
+            )
+        conn.commit()
+        return conn
+    except Exception:
+        conn.rollback()
+        pg_pool.putconn(conn)
+        raise
+
+
+def pg_put_conn_secure(conn) -> None:
+    if conn is None or not pg_pool:
+        return
+    try:
+        if not conn.closed:
+            with conn.cursor() as cur:
+                cur.execute("RESET app.current_customer_account_id")
+                cur.execute("RESET app.current_request_id")
+            conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        pg_pool.putconn(conn)
+
+
+def ensure_postgres_rag_security() -> None:
+    """
+    Verifica fail-closed delle difese PostgreSQL.
+
+    Il backend RAG non esegue DDL e non deve usare un ruolo proprietario,
+    SUPERUSER o BYPASSRLS. Il bootstrap viene eseguito una sola volta tramite
+    ingestion_final_multitenant.py con PG_SCHEMA_MIGRATION_ONLY=1.
+    """
+    if PG_AUTO_HARDEN_SCHEMA and not POC_MODE:
+        raise RuntimeError(
+            "Il backend RAG non può modificare lo schema. Impostare "
+            "PG_AUTO_HARDEN_SCHEMA=0 ed eseguire il bootstrap con il job ingestion."
+        )
+
+    if POC_MODE:
+        print(
+            f"ℹ️ POC MODE attivo | ORGANIZATION_ID={ORGANIZATION_ID} | "
+            "controlli RLS/least-privilege non bloccanti."
+        )
+        conn = pg_pool.getconn()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                _pg_role_security_check(cur)
+                cur.execute("SELECT 1")
+        finally:
+            try:
+                conn.autocommit = False
+            except Exception:
+                pass
+            pg_pool.putconn(conn)
+        return
+
+    conn = pg_pool.getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            _pg_role_security_check(cur)
+
+            required_columns = {
+                "status", "ingestion_run_id", "tenant_key", "corpus_version",
+                "classification", "embedding_model", "organization_id", "tier", "scope",
+            }
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='document_chunks'
+                """
+            )
+            existing = {str(row[0]) for row in cur.fetchall()}
+            missing = sorted(required_columns - existing)
+            if missing:
+                raise RuntimeError(
+                    "Schema document_chunks incompleto; colonne mancanti: " + ", ".join(missing)
+                )
+
+            cur.execute(
+                """
+                SELECT relrowsecurity, relforcerowsecurity
+                FROM pg_class
+                WHERE oid = 'public.document_chunks'::regclass
+                """
+            )
+            rls = cur.fetchone()
+            if not rls or not all(bool(x) for x in rls):
+                raise RuntimeError("RLS/FORCE RLS non attive su document_chunks")
+
+            cur.execute(
+                """
+                SELECT count(*)
+                FROM pg_policies
+                WHERE schemaname='public' AND tablename='document_chunks'
+                  AND policyname='document_chunks_tenant_select'
+                """
+            )
+            if int(cur.fetchone()[0]) != 1:
+                raise RuntimeError("Policy document_chunks_tenant_select assente")
+
+            cur.execute("SELECT to_regclass('public.rag_query_audit')")
+            if cur.fetchone()[0] is None:
+                raise RuntimeError("Tabella rag_query_audit assente")
+
+            cur.execute(
+                """
+                SELECT relrowsecurity, relforcerowsecurity
+                FROM pg_class
+                WHERE oid = 'public.rag_query_audit'::regclass
+                """
+            )
+            audit_rls = cur.fetchone()
+            if not audit_rls or not all(bool(x) for x in audit_rls):
+                raise RuntimeError("RLS/FORCE RLS non attive su rag_query_audit")
+
+            cur.execute(
+                """
+                SELECT count(*)
+                FROM pg_policies
+                WHERE schemaname='public' AND tablename='rag_query_audit'
+                  AND policyname='rag_query_audit_tenant_all'
+                """
+            )
+            if int(cur.fetchone()[0]) != 1:
+                raise RuntimeError("Policy rag_query_audit_tenant_all assente")
+    finally:
+        try:
+            conn.autocommit = False
+        except Exception:
+            pass
+        pg_pool.putconn(conn)
+
+
+
+NEO4J_ALLOWED_RELATIONSHIPS = [
+    "IS_A", "PART_OF", "HAS_COMPONENT", "CONTAINS", "BELONGS_TO",
+    "APPLIES_TO", "MAPS_TO", "DEFINES", "CLASSIFIES", "COMPLIES_WITH",
+    "NON_COMPLIANT_WITH", "HAS_COMPLIANCE_STATUS", "HAS_GAP",
+    "REQUIRES_REMEDIATION", "REMEDIATES", "MANDATES", "REQUIRES",
+    "GOVERNS", "APPROVES", "REVIEWS", "ASSIGNS_RESPONSIBILITY_TO",
+    "TRIGGERS", "ACTIVATES", "STARTS", "FOLLOWS", "PRECEDES",
+    "LEADS_TO", "ESCALATES_TO", "MANAGES", "HANDLES", "NOTIFIES",
+    "REPORTS_TO", "HAS_DEADLINE", "SUPPORTS", "ENABLES", "IMPLEMENTS",
+    "DEPENDS_ON", "ALIGNS_WITH", "CONTRIBUTES_TO", "MEASURES", "MONITORS",
+    "MITIGATES", "REDUCES", "THREATENS", "EXPLOITS", "PROTECTS",
+    "VULNERABLE_TO", "IMPACTS", "AFFECTS", "GENERATES", "VERIFIES",
+    "TESTS", "DEMONSTRATES", "DOCUMENTS", "SUPPORTS_EVIDENCE_FOR",
+    "EVIDENCES", "SATISFIES", "REFERENCES_REQUIREMENT", "HAS_FORMULA",
+]
+
+
 def init_resources():
     """
     Inizializza i modelli e le connessioni ai database in un unico passaggio.
     Previene il caricamento duplicato durante la compilazione del frontend Reflex.
     """
-    global embedder, reranker, llm_client, qdrant_client_inst, neo4j_driver, pg_pool, NEO4J_ENABLED
+    global embedder, reranker, llm_client, qdrant_client_inst, neo4j_driver, pg_pool, NEO4J_ENABLED, RESOURCE_INIT_ERROR
 
     with _init_lock:
-        if embedder is not None:
+        if embedder is not None and qdrant_client_inst is not None and llm_client is not None:
             return
 
+        RESOURCE_INIT_ERROR = ""
         print("\n" + "═" * 60)
         print("⏳ [BACKEND] Avvio inizializzazione modelli e database...")
         print("═" * 60)
@@ -442,28 +867,35 @@ def init_resources():
                     host=PG_HOST, port=PG_PORT, dbname=PG_DB,
                     user=PG_USER, password=PG_PASS
                 )
-                # Smoke test per validare la connessione
-                conn = pg_pool.getconn()
+                ensure_postgres_rag_security()
+                conn = pg_get_conn_secure()
                 try:
                     with conn.cursor() as cur:
-                        cur.execute("SELECT 1;")
+                        cur.execute("SELECT 1")
                 finally:
-                    pg_pool.putconn(conn)
+                    pg_put_conn_secure(conn)
 
             print("✅ [BACKEND] Risorse caricate con successo.")
             print("═"*60 + "\n")
 
         except Exception as e:
+            RESOURCE_INIT_ERROR = str(e)
             print(f"❌ [ERRORE] Fallimento inizializzazione: {e}")
-            # Reset variabili per permettere retry se necessario
-            embedder = None
-            # Non blocchiamo l'esecuzione dell'intera app, ma il RAG non funzionerà
+            # Nel POC l'errore delle risorse non deve impedire a Reflex di
+            # creare l'app ed esporre le porte 3000/8000. Un successivo
+            # on_load o submit ritenterà l'inizializzazione.
+            if pg_pool is not None:
+                try:
+                    pg_pool.closeall()
+                except Exception:
+                    pass
+                pg_pool = None
+            if not POC_MODE:
+                raise
         
-# --- ESECUZIONE SELETTIVA ---
-# REFLEX_RELOAD viene impostato durante l'hot-reload del server di sviluppo.
-# Questo controllo assicura che il caricamento pesante avvenga solo nel processo worker.
-if not os.environ.get("REFLEX_RELOAD"):
-    init_resources()
+# Non inizializzare modelli e database durante l'import del modulo Reflex.
+# L'import deve completarsi rapidamente affinché il backend esponga la porta 8000.
+print("ℹ️ RAG POC: inizializzazione risorse differita all'on_load della GUI.")
 
 
 # =========================
@@ -493,6 +925,16 @@ class SourceItem(BaseModel):
     section_hint: str = ""
     image_id: Optional[int] = None
     tier: str = "C"
+    scope: str = ""
+    organization_id: Optional[int] = None
+    status: str = ""
+    ingestion_run_id: str = ""
+    corpus_version: str = ""
+    classification: str = "internal"
+    embedding_model: str = ""
+    request_id: str = ""
+
+    # PostgreSQL canonical provenance
 
     # PostgreSQL canonical provenance
     pg_ingestion_ts: str = ""
@@ -534,7 +976,15 @@ class RetrievalDebug(BaseModel):
 class AuditTrail(BaseModel):
     ts_utc: str = ""
     query: str = ""
+    query_sha256: str = ""
     intent: str = ""
+    organization_id: int = 0
+    user_id: str = ""
+    roles: List[str] = Field(default_factory=list)
+    request_id: str = ""
+    corpus_version: str = ""
+    filters: Dict[str, Any] = Field(default_factory=dict)
+    retrieved_sources: List[Dict[str, Any]] = Field(default_factory=list)
 
     # What we sent to the LLM (hash only, to avoid storing full sensitive context)
     prompt_sha256: str = ""
@@ -1407,7 +1857,7 @@ def try_solve_user_provided_algebra(query_text: str) -> Optional[str]:
             f"- Vincolo richiesto: `Rr ≤ Ri / {denom}`\n"
             f"- Sostituzione: `{factor} × Vm ≤ ({factor} × V) / {denom}`\n"
             f"- Poiché `{factor}` è costante e positiva: `Vm ≤ V / {denom}`\n\n"
-            f"- Formula LaTeX: `V_m \\leq \\frac{{V}}{{{denom}}}`\n\n"
+            f"- Formula LaTeX:\n\n$$\nV_m \\leq \\frac{{V}}{{{denom}}}\n$$\n\n"
             "\n\n**B) Evidenze**\n\n"
             "- Le relazioni algebriche sono state estratte dalla domanda dell'utente.\n"
             "- La derivazione è stata eseguita in modo deterministico da Python, non dal modello LLM.\n\n"
@@ -1500,7 +1950,7 @@ def try_solve_user_provided_algebra(query_text: str) -> Optional[str]:
             f"- Disequazione = `{fmt_num(pct_decimal)} × {variable} > {fmt_num(threshold_millions)} milioni`\n"
             f"- Divisione per `{fmt_num(pct_decimal)}`: `{variable} > {fmt_num(threshold_millions)} / {fmt_num(pct_decimal)}`\n"
             f"- Risultato = **{variable} > {fmt_num(result_millions)} milioni**, cioè **{_format_euro_it(result_euro)} euro**.\n\n"
-            f"- Formula LaTeX: `{pct_decimal:g}{variable} > {threshold_millions:g}` ⇒ `{variable} > {result_millions:g}`\n\n"
+            f"- Formula LaTeX:\n\n$$\n{pct_decimal:g}{variable} > {threshold_millions:g} \\Rightarrow {variable} > {result_millions:g}\n$$\n\n"
             "\n\n**B) Evidenze**\n\n"
             "- La percentuale, la variabile e la soglia sono state estratte dalla domanda dell'utente.\n"
             "- La derivazione è stata eseguita in modo deterministico da Python, non dal modello LLM.\n\n"
@@ -1750,36 +2200,90 @@ def is_calculation_request(query_text: str) -> bool:
 
 def is_formula_lookup_query(query_text: str) -> bool:
     """
-    Riconosce richieste di recupero formule/metriche DALLE FONTI.
+    Riconosce richieste documentali di recupero di formule, equazioni,
+    metriche o regole di scoring tramite segnali composizionali.
 
-    Questa funzione serve solo per formula lookup documentale.
-    Non deve attivarsi per calcoli operativi richiesti dall'utente.
+    Non usa frasi complete legate a uno specifico test o documento e non
+    intercetta i calcoli operativi, gestiti dai solver deterministici.
     """
     q = (query_text or "").lower().strip()
 
+    if not q or is_calculation_request(query_text):
+        return False
+
+    has_formula_object = bool(
+        re.search(
+            r"\b(?:"
+            r"formula|formule|equazione|equazioni|"
+            r"metrica|metriche|indicatore|indicatori|"
+            r"modello\s+matematico|modelli\s+matematici|"
+            r"regola\s+di\s+scoring|regole\s+di\s+scoring|"
+            r"formulas?|equations?|metrics?|indicators?|"
+            r"mathematical\s+models?|scoring\s+rules?"
+            r")\b",
+            q,
+        )
+    )
+
+    has_lookup_action = bool(
+        re.search(
+            r"\b(?:"
+            r"elenca|estrai|mostra|riporta|fornisci|dammi|indica|trova|"
+            r"quale|quali|"
+            r"list|extract|show|report|provide|give|identify|find|which"
+            r")\b",
+            q,
+        )
+    )
+
+    has_source_or_collection_cue = bool(
+        re.search(
+            r"\b(?:"
+            r"documento|documenti|fonte|fonti|testo|"
+            r"presente|presenti|menzionata|menzionate|citata|citate|"
+            r"contenuta|contenute|definita|definite|tutte|tutti|"
+            r"document|documents|source|sources|text|"
+            r"present|mentioned|cited|contained|defined|all"
+            r")\b",
+            q,
+        )
+    )
+
+    return has_formula_object and (
+        has_lookup_action or has_source_or_collection_cue
+    )
+
+
+def should_query_neo4j_formulas(query_text: str) -> bool:
+    """
+    Attiva il recupero delle formule dal Knowledge Graph quando la domanda
+    riguarda formule, equazioni, metriche o calcoli documentali.
+
+    Diversamente da ``is_formula_lookup_query()``, non è limitata a poche
+    formulazioni letterali come "quale formula". I calcoli deterministici puri
+    vengono comunque intercettati prima del retrieval da ``handle_submit()``.
+    """
+    q = (query_text or "").strip()
     if not q:
         return False
 
-    # Se è una richiesta di calcolo, NON è formula lookup.
-    if is_calculation_request(query_text):
-        return False
+    if is_formula_lookup_query(q):
+        return True
 
-    lookup_terms = [
-        # IT
-        "quali formule", "quale formula", "formule presenti",
-        "formula presente", "riporta le formule", "riportale in latex",
-        "estrai le formule", "elenca le formule",
-        "quali metriche", "metriche presenti",
-        "modelli matematici presenti", "formule computazionali",
-        "regole di scoring presenti",
+    if detect_intent(q) == "formula" or is_formula_strict_query(q):
+        return True
 
-        # EN
-        "which formulas", "what formulas", "extract formulas",
-        "list formulas", "formulas in the document",
-        "metrics in the document", "scoring rules",
+    formula_terms = [
+        "formula", "formule", "equazione", "equazioni",
+        "disequazione", "disequazioni", "metrica", "metriche",
+        "scoring", "score", "calcolo", "calcolare", "calcola",
+        "formula matematica", "modello matematico",
+        "formulae", "formulas", "equation", "equations",
+        "inequality", "inequalities", "metric", "metrics",
+        "calculate", "calculation", "scoring rule",
     ]
-
-    return any(t in q for t in lookup_terms)
+    q_lower = q.lower()
+    return any(term in q_lower for term in formula_terms)
 
 
 def needs_math_document_context(query_text: str) -> bool:
@@ -2833,238 +3337,285 @@ def diversify(
 def append_audit_log(audit: AuditTrail):
     if not AUDIT_ENABLED:
         return
+    payload = audit.model_dump()
+    payload["query"] = ""  # nei log persistenti resta solo l'hash della domanda
     try:
         with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(audit.model_dump_json() + "\n")
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception as e:
-        print(f"⚠️ Audit log write error: {e}")
+        print(f"⚠️ Audit file write error: {e}")
+
+    if PG_ENRICH_ENABLED and pg_pool:
+        conn = pg_get_conn_secure()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.rag_query_audit (
+                        request_id, organization_id, user_id, roles, query_sha256,
+                        intent, filters, retrieved_sources, llm_model, corpus_version
+                    ) VALUES (%s::uuid, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s::jsonb, %s, %s)
+                    """,
+                    (
+                        audit.request_id, audit.organization_id, audit.user_id,
+                        json.dumps(audit.roles), audit.query_sha256, audit.intent,
+                        json.dumps(audit.filters, ensure_ascii=False),
+                        json.dumps(audit.retrieved_sources, ensure_ascii=False),
+                        audit.llm_model, audit.corpus_version,
+                    ),
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"⚠️ Audit PostgreSQL write error: {e}")
+        finally:
+            pg_put_conn_secure(conn)
 
 
 def get_graph_entities(chunk_ids: List[str]) -> Dict[str, List[GraphEntity]]:
-    """
-    Recupera le entità collegate ai chunk in modo bilanciato.
-    Coerente con l'ingestion:
-    - Entity -> Chunk usa MENTIONED_IN.
-    - PRESENT_IN resta come compatibilità per dati legacy.
-    - Bilancia il retrieval limitando le entità PER SINGOLO CHUNK,
-      evitando che un chunk troppo denso cannibalizzi il limite totale.
-    """
+    """Recupera entità solo da chunk visibili al tenant corrente."""
     if not chunk_ids or not neo4j_driver:
         return {}
 
     graph_map: Dict[str, List[GraphEntity]] = {}
-
-    # CYPHER QUERY OTTIMIZZATA
-    # 1. Usa UNWIND per iterare in modo sicuro sugli ID in input.
-    # 2. MATCH le relazioni con le entità.
-    # 3. CALL interno (subquery in Neo4j >= 4.1) permette di applicare
-    #    un LIMIT (es. max 15 entità) specifico PER OGNI chunk id.
-    # 4. Filtra le "Stop-Entities" (es. "Dati", "Sistema", "Azienda") che creano solo rumore.
     query = """
     UNWIND $ids AS target_id
     MATCH (c:Chunk)
     WHERE coalesce(c.chunk_id, c.id) = target_id
-    
-    // Subquery per limitare i risultati per singolo chunk
+      AND c.status = 'active'
+      AND (
+            (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier = 'A')
+            OR
+            (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN ['B', 'C'])
+      )
+
     CALL (c) {
-        MATCH (e:Entity)-[r:PRESENT_IN|MENTIONED_IN]->(c)
-        
-        // --- INIZIO FIX: Stop-Entities Filter ---
-        // Ignora entità troppo generiche che non aggiungono valore analitico
-        WHERE NOT toLower(coalesce(e.name, e.label, e.id)) IN [
-            'dato', 'dati', 'sistema', 'sistemi', 'azienda', 'aziende', 
+        MATCH (c)-[r:MENTIONS|PRESENT_IN|MENTIONED_IN]-(e:Entity)
+        WHERE r.status = 'active'
+          AND e.status = 'active'
+          AND NOT toLower(coalesce(e.name, e.label, e.canonical_id, e.id)) IN [
+            'dato', 'dati', 'sistema', 'sistemi', 'azienda', 'aziende',
             'utente', 'utenti', 'informazione', 'informazioni', 'documento',
             'data', 'system', 'company', 'user', 'information', 'document'
         ]
-        // --- FINE FIX ---
-        
-        RETURN 
-            coalesce(e.name, e.label, e.id) AS entity_name,
+        RETURN
+            coalesce(e.name, e.label, e.canonical_id, e.id) AS entity_name,
             coalesce(e.category, labels(e)[0], 'Entity') AS entity_type,
             type(r) AS rel_type
-        // Limitiamo le entità estratte PER OGNI CHUNK (es. max 10)
         LIMIT 10
     }
-    
-    RETURN 
-        target_id AS chunk_id, 
-        entity_name AS name, 
-        entity_type AS type, 
-        rel_type AS rel
+
+    RETURN target_id AS chunk_id,
+           entity_name AS name,
+           entity_type AS type,
+           rel_type AS rel
     """
 
     try:
         with neo4j_driver.session() as session:
-            result = session.run(query, ids=chunk_ids)
-
+            result = session.run(query, ids=chunk_ids, org_id=current_organization_id())
             for record in result:
-                cid = record["chunk_id"]
-
-                entity = GraphEntity(
-                    name=record["name"],
-                    type=record["type"],
-                    relation=record["rel"],
+                cid = str(record["chunk_id"])
+                graph_map.setdefault(cid, []).append(
+                    GraphEntity(
+                        name=record["name"],
+                        type=record["type"],
+                        relation=record["rel"],
+                    )
                 )
-
-                graph_map.setdefault(cid, []).append(entity)
-
     except Exception as e:
-        # Usa il logger invece del print per allineamento Enterprise
-        logger.error(f"Neo4j Query Error (get_graph_entities) - Failed on IDs {chunk_ids[:3]}...: {e}")
+        logger.error(
+            "Neo4j Query Error (get_graph_entities) - IDs %s: %s",
+            chunk_ids[:3],
+            e,
+        )
 
     return graph_map
 
-
-def get_formulas_for_chunks(chunk_ids: List[str], limit_per_chunk: int = 5) -> Dict[str, List[str]]:
+def get_formulas_for_chunks(
+    chunk_ids: List[str],
+    limit_per_chunk: int = 5,
+) -> Dict[str, List[str]]:
     """
-    Recupera formule collegate ai chunk in modo bilanciato.
-    Coerente con ingestion:
-    - Formula -> Chunk usa MENTIONED_IN o PRESENT_IN
-    Restituisce un dizionario {chunk_id: [formule_formattate]} per mantenere
-    la tracciabilità della fonte (documento/pagina).
+    Recupera formule dai chunk visibili al tenant corrente.
+
+    Supporta entrambi i modelli presenti o storicamente prodotti dalla
+    pipeline:
+    - ``Chunk-[:HAS_FORMULA|MENTIONS]->Formula/Entity(FORMULA)``;
+    - ``Chunk-[:MENTIONS]->Entity-[:HAS_FORMULA]->Formula/Entity(FORMULA)``.
     """
     if not chunk_ids or not neo4j_driver:
         return {}
 
     formula_map: Dict[str, List[str]] = {}
-
-    # CYPHER QUERY OTTIMIZZATA
-    # 1. UNWIND garantisce che iteriamo su ogni chunk_id.
-    # 2. CALL {} permette di applicare il limite PER SINGOLO CHUNK.
-    # 3. DISTINCT assicura che non estraiamo formule duplicate per lo stesso chunk.
     query = """
     UNWIND $ids AS target_id
     MATCH (c:Chunk)
     WHERE coalesce(c.chunk_id, c.id) = target_id
-    
+      AND c.status = 'active'
+      AND (
+            (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier = 'A')
+            OR
+            (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN ['B', 'C'])
+      )
+
     CALL (c) {
-        MATCH (f)-[:MENTIONED_IN|PRESENT_IN]->(c)
-        WHERE (f:Formula OR toUpper(coalesce(f.category, '')) = 'FORMULA')
-        
-        RETURN DISTINCT
-            coalesce(f.latex, f.formula, '') AS latex,
-            coalesce(f.plain, f.name, f.id, '') AS plain,
-            coalesce(f.meaning_it, f.meaning, f.description, '') AS meaning
-        LIMIT $lim
+        MATCH (c)-[rf:HAS_FORMULA|MENTIONS|MENTIONED_IN|PRESENT_IN]-(f)
+        WHERE rf.status = 'active'
+          AND f.status = 'active'
+          AND (
+                f:Formula
+                OR toUpper(coalesce(f.category, '')) = 'FORMULA'
+                OR toUpper(coalesce(f.type, '')) = 'FORMULA'
+          )
+        RETURN f
+
+        UNION
+
+        MATCH (c)-[re:MENTIONS|MENTIONED_IN|PRESENT_IN]-(e:Entity)
+              -[hf:HAS_FORMULA]-(f)
+        WHERE re.status = 'active'
+          AND e.status = 'active'
+          AND hf.status = 'active'
+          AND f.status = 'active'
+          AND (
+                f:Formula
+                OR toUpper(coalesce(f.category, '')) = 'FORMULA'
+                OR toUpper(coalesce(f.type, '')) = 'FORMULA'
+          )
+        RETURN f
     }
-    
-    RETURN 
-        target_id AS chunk_id,
-        latex,
-        plain,
-        meaning
+
+    WITH target_id, f,
+         coalesce(f.latex, f.formula, '') AS latex,
+         coalesce(f.plain, f.name, f.canonical_id, f.fid, f.id, '') AS plain,
+         coalesce(f.meaning_it, f.meaning, f.description, '') AS meaning
+    WHERE trim(toString(latex)) <> ''
+       OR trim(toString(plain)) <> ''
+       OR trim(toString(meaning)) <> ''
+    WITH target_id, collect(DISTINCT {
+        latex: latex,
+        plain: plain,
+        meaning: meaning
+    })[0..$lim] AS formulas
+    UNWIND formulas AS formula
+    RETURN target_id AS chunk_id,
+           formula.latex AS latex,
+           formula.plain AS plain,
+           formula.meaning AS meaning
     """
 
     try:
         with neo4j_driver.session() as session:
-            res = session.run(query, ids=chunk_ids, lim=limit_per_chunk)
-
-            for r in res:
-                cid = r["chunk_id"]
-                latex = (r["latex"] or "").strip()
-                plain = (r["plain"] or "").strip()
-                meaning = (r["meaning"] or "").strip()
-
-                parts = []
+            rows = session.run(
+                query,
+                ids=list(dict.fromkeys(str(x) for x in chunk_ids if str(x).strip())),
+                lim=max(1, int(limit_per_chunk)),
+                org_id=current_organization_id(),
+            )
+            for row in rows:
+                parts: List[str] = []
+                latex = str(row.get("latex") or "").strip()
+                plain = str(row.get("plain") or "").strip()
+                meaning = str(row.get("meaning") or "").strip()
                 if latex:
                     parts.append(f"LaTeX: {latex}")
-                if plain:
+                if plain and plain != latex:
                     parts.append(f"Plain: {plain}")
                 if meaning:
                     parts.append(f"Meaning: {meaning}")
-
                 if parts:
-                    formula_string = " | ".join(parts)
-                    formula_map.setdefault(cid, []).append(formula_string)
-
+                    rendered = " | ".join(parts)
+                    bucket = formula_map.setdefault(str(row["chunk_id"]), [])
+                    if rendered not in bucket:
+                        bucket.append(rendered)
     except Exception as e:
-        logger.error(f"Neo4j Query Error (get_formulas_for_chunks): {e}")
+        logger.error("Neo4j Query Error (get_formulas_for_chunks): %s", e)
 
     return formula_map
-
 
 def get_neighbor_chunk_ids(
     chunk_ids: List[str],
     limit: int = GRAPH_MAX_NEIGHBOR_CHUNKS,
 ) -> List[str]:
-    """
-    Espande semanticamente i chunk usando due livelli di provenance:
-    1. MENTIONED_IN/PRESENT_IN tra entità e chunk, con peso maggiore;
-    2. PRESENT_ON tra entità e pagine, con soglia più severa.
-    """
+    """Espande solo tra chunk ed entità appartenenti allo stesso perimetro visibile."""
     if not chunk_ids or not neo4j_driver:
         return []
 
     query = """
-    CALL () {
-        MATCH
-            (c1:Chunk)<-[:PRESENT_IN|MENTIONED_IN]-
-            (e:Entity)-[:PRESENT_IN|MENTIONED_IN]->
-            (c2:Chunk)
-        WHERE coalesce(c1.chunk_id, c1.id) IN $ids
-          AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
-          AND NOT toUpper(
-              coalesce(e.type, e.category, labels(e)[0], '')
-          ) IN ['GENERIC', 'YEAR', 'DATE']
-        WITH c2, count(DISTINCT e) AS entity_count
-        WHERE entity_count >= 2
-        RETURN c2, toFloat(entity_count) * 2.0 AS strength
-
-        UNION ALL
-
-        MATCH
-            (c1:Chunk)<-[:HAS_CHUNK]-(p1:Page)
-            <-[:PRESENT_ON]-(e:Entity)-[:PRESENT_ON]->
-            (p2:Page)-[:HAS_CHUNK]->(c2:Chunk)
-        WHERE coalesce(c1.chunk_id, c1.id) IN $ids
-          AND p1 <> p2
-          AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
-          AND NOT toUpper(
-              coalesce(e.type, e.category, labels(e)[0], '')
-          ) IN ['GENERIC', 'YEAR', 'DATE']
-        WITH c2, count(DISTINCT e) AS entity_count
-        WHERE entity_count >= 3
-        RETURN c2, toFloat(entity_count) AS strength
-    }
-
-    WITH c2, max(strength) AS strength
+    MATCH
+        (c1:Chunk)-[r1:MENTIONS|PRESENT_IN|MENTIONED_IN]-(e:Entity)-[r2:MENTIONS|PRESENT_IN|MENTIONED_IN]-(c2:Chunk)
+    WHERE coalesce(c1.chunk_id, c1.id) IN $ids
+      AND c1.status = 'active' AND c2.status = 'active' AND e.status = 'active'
+      AND r1.status = 'active' AND r2.status = 'active'
+      AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
+      AND (
+            (c1.scope = 'GLOBAL' AND c1.organization_id IS NULL AND c1.tier = 'A')
+            OR
+            (c1.scope = 'ACCOUNT' AND c1.organization_id = $org_id AND c1.tier IN ['B', 'C'])
+      )
+      AND (
+            (c2.scope = 'GLOBAL' AND c2.organization_id IS NULL AND c2.tier = 'A')
+            OR
+            (c2.scope = 'ACCOUNT' AND c2.organization_id = $org_id AND c2.tier IN ['B', 'C'])
+      )
+      AND (
+            (e.scope = 'GLOBAL' AND e.organization_id IS NULL AND e.tier = 'A')
+            OR
+            (e.scope = 'ACCOUNT' AND e.organization_id = $org_id AND e.tier IN ['B', 'C'])
+      )
+      AND NOT toUpper(coalesce(e.type, e.category, labels(e)[0], '')) IN ['GENERIC', 'YEAR', 'DATE']
+    WITH c2, count(DISTINCT e) AS entity_count
+    WHERE entity_count >= 2
     RETURN coalesce(c2.chunk_id, c2.id) AS cid
-    ORDER BY
-        strength DESC,
-        coalesce(c2.page, 0),
-        coalesce(c2.page_chunk_index, 0)
+    ORDER BY entity_count DESC,
+             coalesce(c2.page, 0),
+             coalesce(c2.page_chunk_index, 0)
     LIMIT $lim
     """
 
     try:
         with neo4j_driver.session() as session:
-            res = session.run(query, ids=chunk_ids, lim=limit)
-            return [str(r["cid"]) for r in res if r.get("cid")]
+            rows = session.run(
+                query,
+                ids=chunk_ids,
+                lim=limit,
+                org_id=current_organization_id(),
+            )
+            return [str(row["cid"]) for row in rows if row.get("cid")]
     except Exception as e:
         print(f"⚠️ Neo4j Semantic Neighbors Error: {e}")
         return []
 
 def fetch_chunks_from_qdrant_by_ids(ids: List[str]) -> List[SourceItem]:
-    """Fetch Qdrant points by IDs (for graph expansion neighbors)."""
+    """Recupera Point ID da Qdrant e applica sempre il tenant guard sul payload."""
     if not ids or not qdrant_client_inst:
         return []
+
     out: List[SourceItem] = []
     try:
-        # qdrant retrieve works with ids list
         points = qdrant_client_inst.retrieve(
             collection_name=COLLECTION_NAME,
             ids=ids,
             with_payload=True,
         )
-        for p in points:
-            payload = p.payload or {}
-            tier = get_payload_tier(payload)
+        for point in points:
+            payload = point.payload or {}
+            if not qdrant_payload_is_visible(payload):
+                logger.warning(
+                    "Qdrant tenant guard: point %s scartato per organization_id=%s",
+                    point.id,
+                    current_organization_id(),
+                )
+                continue
+
             content = safe_payload_text(payload)
             if not content:
                 continue
+
             out.append(
                 SourceItem(
-                    id=str(p.id),
+                    id=str(point.id),
                     content=content,
                     filename=str(payload.get("filename", "Unknown")),
                     page=get_payload_page(payload),
@@ -3075,11 +3626,21 @@ def fetch_chunks_from_qdrant_by_ids(ids: List[str]) -> List[SourceItem]:
                     graph_context=[],
                     section_hint=get_payload_section(payload),
                     image_id=get_payload_image_id(payload),
-                    tier=tier,  # ✅ NEW
+                    tier=normalize_tier_value(get_payload_tier(payload)),
+                    scope=str(payload.get("scope") or "").upper(),
+                    organization_id=_optional_int(payload.get("organization_id")),
+                    status=str(payload.get("status") or ""),
+                    ingestion_run_id=str(payload.get("ingestion_run_id") or ""),
+                    corpus_version=str(payload.get("corpus_version") or ""),
+                    classification=str(payload.get("classification") or "internal"),
+                    embedding_model=str(payload.get("embedding_model") or ""),
+                    request_id=get_tenant_context().request_id,
+                    db_origin="Qdrant Graph Expansion",
                 )
             )
     except Exception as e:
         print(f"⚠️ Qdrant retrieve error: {e}")
+
     return out
 
 def _parse_csv(s: str) -> List[str]:
@@ -3104,6 +3665,7 @@ def build_retrieval_audit_md(
     lines.append("### 🔎 Audit Retrieval (Multi-Database Analysis)")
     lines.append(f"- **Intent**: `{intent}`")
     lines.append(f"- **Query**: `{(query_text or '')[:180]}`")
+    lines.append(f"- **Organization ID**: `{current_organization_id()}`")
 
     # 🌌 SEZIONE QDRANT (Vettoriale)
     lines.append("\n#### 🌌 Qdrant (Vector Search)")
@@ -3167,49 +3729,25 @@ def build_retrieval_audit_md(
     return "\n".join(lines).strip()
 
 def fetch_pg_chunks_by_uuid(chunk_uuids: List[str]) -> Dict[str, Dict[str, Any]]:
-    """
-    Recupera da Postgres i chunk usando l'ID corretto: chunk_uuid.
-
-    Ritorna:
-    {
-        chunk_uuid: {
-            "chunk_uuid": ...,
-            "content_raw": ...,
-            "content_semantic": ...,
-            "metadata_json": ...,
-            "ingestion_ts": ...
-        }
-    }
-
-    Nota:
-    - chunk_uuid corrisponde all'id usato in Qdrant.
-    - chunk_uuid corrisponde al chunk_id usato in Neo4j.
-    - prende sempre la versione più recente del chunk in base a ingestion_ts.
-    """
+    """Recupera l'ultima versione visibile dei chunk, filtrando prima del ranking."""
     if not PG_ENRICH_ENABLED or not pg_pool or not chunk_uuids:
         return {}
 
-    # Dedup preservando l'ordine
-    seen = set()
-    uuids: List[str] = []
-
-    for u in chunk_uuids:
-        if not u:
-            continue
-
-        key = str(u).strip()
-        if not key or key in seen:
-            continue
-
-        seen.add(key)
-        uuids.append(key)
-
+    uuids = list(dict.fromkeys(str(value).strip() for value in chunk_uuids if str(value).strip()))
     if not uuids:
         return {}
 
     sql = """
-    WITH wanted(chunk_uuid) AS (
-        VALUES %s
+    WITH visible AS (
+        SELECT d.*
+        FROM public.document_chunks d
+        WHERE d.chunk_uuid::text = ANY(%s)
+          AND d.status = 'active'
+          AND (
+                (d.scope = 'GLOBAL' AND d.organization_id IS NULL AND d.tier = 'A')
+                OR
+                (d.scope = 'ACCOUNT' AND d.organization_id = %s AND d.tier IN ('B', 'C'))
+          )
     ),
     ranked AS (
         SELECT
@@ -3218,201 +3756,181 @@ def fetch_pg_chunks_by_uuid(chunk_uuids: List[str]) -> Dict[str, Dict[str, Any]]
             d.content_semantic,
             d.metadata_json,
             d.ingestion_ts,
+            d.scope,
+            d.organization_id,
+            d.tier,
             ROW_NUMBER() OVER (
-                PARTITION BY d.chunk_uuid
+                PARTITION BY d.chunk_uuid, d.scope, d.organization_id
                 ORDER BY d.ingestion_ts DESC
             ) AS rn
-        FROM public.document_chunks d
-        JOIN wanted w
-          ON d.chunk_uuid::text = w.chunk_uuid::text
+        FROM visible d
     )
     SELECT
         chunk_uuid,
         content_raw,
         content_semantic,
         metadata_json,
-        ingestion_ts
+        ingestion_ts,
+        scope,
+        organization_id,
+        tier
     FROM ranked
     WHERE rn = 1;
     """
 
-    conn = pg_pool.getconn()
-
+    conn = pg_get_conn_secure()
     try:
         with conn.cursor() as cur:
-            execute_values(
-                cur,
-                sql,
-                [(u,) for u in uuids]
-            )
+            cur.execute(sql, (uuids, current_organization_id()))
             rows = cur.fetchall()
 
-        out: Dict[str, Dict[str, Any]] = {}
-
-        for chunk_uuid, content_raw, content_semantic, metadata_json, ingestion_ts in rows:
-            # metadata_json può arrivare già come dict oppure come stringa JSON
-            if isinstance(metadata_json, str):
-                try:
-                    metadata_json = json.loads(metadata_json)
-                except Exception:
-                    metadata_json = {}
-
-            if metadata_json is None:
-                metadata_json = {}
-
-            out[str(chunk_uuid)] = {
+        result: Dict[str, Dict[str, Any]] = {}
+        for chunk_uuid, raw, semantic, metadata, ingestion_ts, scope, org_id, tier in rows:
+            metadata = metadata_with_tenant(metadata, scope, org_id, tier)
+            result[str(chunk_uuid)] = {
                 "chunk_uuid": str(chunk_uuid),
-                "content_raw": content_raw or "",
-                "content_semantic": content_semantic or "",
-                "metadata_json": metadata_json,
+                "content_raw": raw or "",
+                "content_semantic": semantic or "",
+                "metadata_json": metadata,
                 "ingestion_ts": ingestion_ts.isoformat() if ingestion_ts else "",
+                "scope": metadata.get("scope", ""),
+                "organization_id": metadata.get("organization_id"),
+                "tier": metadata.get("tier", ""),
             }
-
-        return out
-
+        return result
     except Exception as e:
         print(f"⚠️ PG enrich by chunk_uuid error: {e}")
         return {}
-
     finally:
-        pg_pool.putconn(conn)
-
+        pg_put_conn_secure(conn)
 
 def search_pg_bm25(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """
-    Ricerca keyword/BM25-like su Postgres usando full-text search.
-    PATCH: conserva acronimi brevi e usa websearch_to_tsquery.
-    """
-    if not PG_ENRICH_ENABLED or not pg_pool:
+    """Ricerca full-text limitata a Tier A globale e Tier B/C del tenant corrente."""
+    if not PG_ENRICH_ENABLED or not pg_pool or not (query_text or "").strip():
         return []
-    if not query_text or not query_text.strip():
-        return []
+
     tokens = extract_search_tokens(query_text)
     if not tokens:
         return []
     pg_query = " OR ".join(tokens)
+
     sql = """
     WITH q AS (SELECT websearch_to_tsquery('simple', %s) AS tsq)
     SELECT
-        chunk_uuid::text,
-        content_raw,
-        content_semantic,
-        metadata_json,
+        d.chunk_uuid::text,
+        d.content_raw,
+        d.content_semantic,
+        d.metadata_json,
+        d.scope,
+        d.organization_id,
+        d.tier,
         ts_rank_cd(
-            to_tsvector('simple', COALESCE(content_semantic, '') || ' ' || COALESCE(content_raw, '') || ' ' || COALESCE(metadata_json::text, '')),
+            to_tsvector('simple', COALESCE(d.content_semantic, '') || ' ' || COALESCE(d.content_raw, '') || ' ' || COALESCE(d.metadata_json::text, '')),
             q.tsq
         ) AS rank
-    FROM public.document_chunks, q
-    WHERE to_tsvector('simple', COALESCE(content_semantic, '') || ' ' || COALESCE(content_raw, '') || ' ' || COALESCE(metadata_json::text, '')) @@ q.tsq
+    FROM public.document_chunks d, q
+    WHERE d.status = 'active'
+      AND to_tsvector('simple', COALESCE(d.content_semantic, '') || ' ' || COALESCE(d.content_raw, '') || ' ' || COALESCE(d.metadata_json::text, '')) @@ q.tsq
+      AND (
+            (d.scope = 'GLOBAL' AND d.organization_id IS NULL AND d.tier = 'A')
+            OR
+            (d.scope = 'ACCOUNT' AND d.organization_id = %s AND d.tier IN ('B', 'C'))
+      )
     ORDER BY rank DESC
     LIMIT %s;
     """
-    conn = pg_pool.getconn()
+
+    conn = pg_get_conn_secure()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (pg_query, limit))
+            cur.execute(sql, (pg_query, current_organization_id(), limit))
             rows = cur.fetchall()
+
         out: List[Dict[str, Any]] = []
-        for chunk_uuid, content_raw, content_semantic, metadata_json, rank in rows:
-            if isinstance(metadata_json, str):
-                try:
-                    metadata_json = json.loads(metadata_json)
-                except Exception:
-                    metadata_json = {}
-            if metadata_json is None:
-                metadata_json = {}
-            out.append({"id": str(chunk_uuid), "content": content_semantic or content_raw or "", "metadata": metadata_json, "score": float(rank or 0.0), "origin": "PostgresBM25"})
+        for chunk_uuid, raw, semantic, metadata, scope, org_id, tier, rank in rows:
+            metadata = metadata_with_tenant(metadata, scope, org_id, tier)
+            out.append({
+                "id": str(chunk_uuid),
+                "content": semantic or raw or "",
+                "metadata": metadata,
+                "score": float(rank or 0.0),
+                "origin": "PostgresBM25",
+            })
         return out
     except Exception as e:
         print(f"⚠️ BM25 Error: {e}")
         return []
     finally:
-        pg_pool.putconn(conn)
-
+        pg_put_conn_secure(conn)
 
 def search_pg_exact_phrases(query_text: str, limit: int = 30) -> List[Dict[str, Any]]:
-    """
-    Ricerca deterministica bilanciata per ciascuna frase o acronimo.
-
-    Ogni termine estratto riceve una quota propria di risultati, evitando che
-    un solo termine o il documento ingerito più di recente saturi tutto il limite.
-    """
+    """Ricerca esatta per termine, con quota per frase e filtro tenant fail-closed."""
     if not PG_ENRICH_ENABLED or not pg_pool:
         return []
 
-    phrases = extract_exact_phrases(query_text)
+    phrases = extract_exact_phrases(query_text)[:12]
     if not phrases:
         return []
-
-    phrases = phrases[:12]
     per_phrase_limit = max(3, limit // len(phrases))
 
     sql_template = """
-    SELECT
-        chunk_uuid::text,
-        content_raw,
-        content_semantic,
-        metadata_json,
-        ingestion_ts
-    FROM public.document_chunks
-    WHERE {condition}
-    ORDER BY ingestion_ts DESC
-    LIMIT %s;
+        SELECT
+            chunk_uuid::text,
+            content_raw,
+            content_semantic,
+            metadata_json,
+            ingestion_ts,
+            scope,
+            organization_id,
+            tier
+        FROM public.document_chunks
+        WHERE status = 'active'
+          AND {condition}
+          AND (
+                (scope = 'GLOBAL' AND organization_id IS NULL AND tier = 'A')
+                OR
+                (scope = 'ACCOUNT' AND organization_id = %s AND tier IN ('B', 'C'))
+          )
+        ORDER BY ingestion_ts DESC
+        LIMIT %s;
     """
 
-    conn = pg_pool.getconn()
-
+    conn = pg_get_conn_secure()
     try:
         found: Dict[str, Dict[str, Any]] = {}
-
         with conn.cursor() as cur:
             for phrase in phrases:
                 condition, condition_params = _term_sql_condition(phrase)
                 if not condition:
                     continue
-
                 cur.execute(
                     sql_template.format(condition=condition),
-                    [*condition_params, per_phrase_limit],
+                    [*condition_params, current_organization_id(), per_phrase_limit],
                 )
-
-                for chunk_uuid, content_raw, content_semantic, metadata_json, ingestion_ts in cur.fetchall():
-                    if isinstance(metadata_json, str):
-                        try:
-                            metadata_json = json.loads(metadata_json)
-                        except Exception:
-                            metadata_json = {}
-
-                    if metadata_json is None:
-                        metadata_json = {}
-
+                for row in cur.fetchall():
+                    chunk_uuid, raw, semantic, metadata, ingestion_ts, scope, org_id, tier = row
+                    metadata = metadata_with_tenant(metadata, scope, org_id, tier)
                     uid = str(chunk_uuid)
-                    existing = found.get(uid)
-
-                    if existing is None:
+                    if uid not in found:
                         found[uid] = {
                             "id": uid,
-                            "content": content_semantic or content_raw or "",
-                            "metadata": metadata_json,
+                            "content": semantic or raw or "",
+                            "metadata": metadata,
                             "score": 2.0,
                             "origin": "PostgresExactPhrase",
+                            "scope": str(metadata.get("scope") or "").upper(),
+                            "organization_id": _optional_int(metadata.get("organization_id")),
                             "ingestion_ts": ingestion_ts.isoformat() if ingestion_ts else "",
                         }
                     else:
-                        existing["score"] = float(existing.get("score", 2.0)) + 1.0
+                        found[uid]["score"] = float(found[uid].get("score", 2.0)) + 1.0
 
-        return sorted(
-            found.values(),
-            key=lambda x: float(x.get("score", 0.0)),
-            reverse=True,
-        )[:limit]
-
+        return sorted(found.values(), key=lambda item: float(item.get("score", 0.0)), reverse=True)[:limit]
     except Exception as e:
         print(f"⚠️ Exact phrase search error: {e}")
         return []
-
     finally:
-        pg_pool.putconn(conn)
+        pg_put_conn_secure(conn)
 
 def _term_sql_condition(alias: str) -> Tuple[str, List[Any]]:
     """
@@ -3453,22 +3971,17 @@ def search_pg_glossary_term(
     aliases: List[str],
     limit: int = 5,
 ) -> List[Dict[str, Any]]:
-    """
-    Lookup atomico di una voce di glossario.
-    Non genera risposte e non contiene definizioni hard-coded: recupera solo chunk.
-    """
+    """Lookup di glossario limitato al perimetro tenant visibile."""
     if not PG_ENRICH_ENABLED or not pg_pool:
         return []
 
     clauses: List[str] = []
     params: List[Any] = []
-
     for alias in aliases:
-        cond, cond_params = _term_sql_condition(alias)
-        if cond:
-            clauses.append(cond)
-            params.extend(cond_params)
-
+        condition, condition_params = _term_sql_condition(alias)
+        if condition:
+            clauses.append(condition)
+            params.extend(condition_params)
     if not clauses:
         return []
 
@@ -3478,62 +3991,53 @@ def search_pg_glossary_term(
         content_raw,
         content_semantic,
         metadata_json,
-        ingestion_ts
+        ingestion_ts,
+        scope,
+        organization_id,
+        tier
     FROM public.document_chunks
-    WHERE
-        (
+    WHERE status = 'active'
+      AND (
             lower(COALESCE(metadata_json->>'filename', '')) LIKE %s
             OR lower(COALESCE(metadata_json->>'source_name', '')) LIKE %s
             OR lower(COALESCE(metadata_json::text, '')) LIKE %s
-        )
-        AND ({' OR '.join(clauses)})
+          )
+      AND ({' OR '.join(clauses)})
+      AND (
+            (scope = 'GLOBAL' AND organization_id IS NULL AND tier = 'A')
+            OR
+            (scope = 'ACCOUNT' AND organization_id = %s AND tier IN ('B', 'C'))
+      )
     ORDER BY ingestion_ts DESC
     LIMIT %s;
     """
 
-    # psycopg2 usa il carattere % per i placeholder; i pattern LIKE vanno passati
-    # come parametri e non scritti come '%glossario%' dentro la query, altrimenti
-    # si ottengono errori tipo: list index out of range.
     params = ["%glossario%", "%glossario%", "%glossario%"] + params
-    params.append(limit)
+    params.extend([current_organization_id(), limit])
 
-    conn = pg_pool.getconn()
-
+    conn = pg_get_conn_secure()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
 
         out: List[Dict[str, Any]] = []
-
-        for chunk_uuid, content_raw, content_semantic, metadata_json, ingestion_ts in rows:
-            if isinstance(metadata_json, str):
-                try:
-                    metadata_json = json.loads(metadata_json)
-                except Exception:
-                    metadata_json = {}
-
-            if metadata_json is None:
-                metadata_json = {}
-
+        for chunk_uuid, raw, semantic, metadata, ingestion_ts, scope, org_id, tier in rows:
+            metadata = metadata_with_tenant(metadata, scope, org_id, tier)
             out.append({
                 "id": str(chunk_uuid),
-                "content_raw": content_raw or "",
-                "content_semantic": content_semantic or "",
-                "metadata": metadata_json,
+                "content_raw": raw or "",
+                "content_semantic": semantic or "",
+                "metadata": metadata,
                 "ingestion_ts": ingestion_ts.isoformat() if ingestion_ts else "",
                 "term": canonical_term,
             })
-
         return out
-
     except Exception as e:
         print(f"⚠️ Glossary term lookup error for {canonical_term}: {e}")
         return []
-
     finally:
-        pg_pool.putconn(conn)
-
+        pg_put_conn_secure(conn)
 
 def extract_definition_snippet(
     canonical_term: str,
@@ -3619,6 +4123,14 @@ def answer_glossary_terms_directly(query_text: str) -> Tuple[str, List[SourceIte
                     type=meta.get("toon_type") or meta.get("type") or "text",
                     score=2.0,
                     tier=normalize_tier_value(meta.get("tier", "C")),
+                    scope=str(meta.get("scope") or "").upper(),
+                    organization_id=_optional_int(meta.get("organization_id")),
+                    status="active",
+                    ingestion_run_id=str(meta.get("ingestion_run_id") or ""),
+                    corpus_version=str(meta.get("corpus_version") or CORPUS_VERSION),
+                    classification=str(meta.get("classification") or "internal"),
+                    embedding_model=str(meta.get("embedding_model") or ""),
+                    request_id=get_tenant_context().request_id,
                     db_origin="PostgresGlossaryTerm",
                     section_hint=f"Glossary term: {term}",
                     pg_ingestion_ts=best.get("ingestion_ts", ""),
@@ -3821,6 +4333,38 @@ RAG_STOPWORDS = {
     "formula", "formule", "matematica", "matematiche", "latex", "concetto"
 }
 
+
+GRAPH_QUERY_NOISE_TERMS = {
+    # Istruzioni generiche
+    "mostra", "mostrami", "trova", "cerca", "elenca", "riporta",
+    "descrivi", "spiega", "analizza", "verifica", "interroga",
+    "show", "find", "search", "list", "report",
+    "describe", "explain", "analyze", "analyse", "verify", "query",
+
+    # Termini tecnici che descrivono la richiesta, non i concetti cercati
+    "neo4j", "cypher", "grafo", "grafi", "graph", "graphs",
+    "nodo", "nodi", "node", "nodes",
+    "arco", "archi", "edge", "edges",
+    "relazione", "relazioni", "relation", "relations",
+    "relationship", "relationships",
+    "collegamento", "collegamenti", "link", "links",
+    "connessione", "connessioni", "connection", "connections",
+    "percorso", "path", "traversamento", "traversal",
+    "multihop", "multi-hop",
+
+    # Formato della risposta
+    "tabella", "table", "markdown",
+    "colonna", "colonne", "column", "columns",
+    "riga", "righe", "row", "rows",
+
+    # Parole generiche
+    "entità", "entita", "entity", "entities",
+    "concetto", "concetti", "concept", "concepts",
+    "documento", "documenti", "document", "documents",
+    "fonte", "fonti", "source", "sources",
+}
+
+
 def extract_rag_tokens(query_text: str) -> List[str]:
     """
     Estrae token utili per filename matching, Neo4j e formula lookup.
@@ -3833,11 +4377,7 @@ def search_neo4j_entities(
     query_text: str,
     limit: int = 20,
 ) -> List[Dict[str, Any]]:
-    """
-    Ricerca Entity con due percorsi:
-    - MENTIONED_IN/PRESENT_IN -> Chunk: provenance precisa, peso 2;
-    - PRESENT_ON -> Page -> HAS_CHUNK -> Chunk: fallback di pagina, peso 1.
-    """
+    """Ricerca entità attraverso Chunk->MENTIONS, con filtro tenant sul Chunk."""
     if not neo4j_driver or not query_text.strip():
         return []
 
@@ -3846,175 +4386,222 @@ def search_neo4j_entities(
         return []
 
     cypher = """
-    CALL () {
-        MATCH (e:Entity)-[:PRESENT_IN|MENTIONED_IN]->(c:Chunk)
-        WHERE any(tok IN $tokens WHERE
-            toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
+    MATCH (c:Chunk)-[m:MENTIONS|PRESENT_IN|MENTIONED_IN]-(e:Entity)
+    WHERE c.status = 'active' AND e.status = 'active' AND m.status = 'active'
+      AND (
+            (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier = 'A')
+            OR
+            (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN ['B', 'C'])
+          )
+      AND any(tok IN $tokens WHERE
+            toLower(coalesce(e.name, e.canonical_id, e.id, '')) CONTAINS tok OR
             toLower(coalesce(e.description, '')) CONTAINS tok OR
             toLower(coalesce(e.category, e.type, labels(e)[0], '')) CONTAINS tok OR
             any(s IN coalesce(e.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
             toLower(coalesce(c.filename, '')) CONTAINS tok OR
             toLower(coalesce(c.text, '')) CONTAINS tok
-        )
-        RETURN c, e, 2.0 AS provenance_weight
-
-        UNION ALL
-
-        MATCH (e:Entity)-[:PRESENT_ON]->(p:Page)-[:HAS_CHUNK]->(c:Chunk)
-        WHERE any(tok IN $tokens WHERE
-            toLower(coalesce(e.name, e.id, '')) CONTAINS tok OR
-            toLower(coalesce(e.description, '')) CONTAINS tok OR
-            toLower(coalesce(e.category, e.type, labels(e)[0], '')) CONTAINS tok OR
-            any(s IN coalesce(e.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
-            toLower(coalesce(p.filename, c.filename, '')) CONTAINS tok OR
-            toLower(coalesce(c.text, '')) CONTAINS tok
-        )
-        AND (
-            coalesce(c.page_chunk_index, 0) = 0
-            OR any(tok IN $tokens WHERE toLower(coalesce(c.text, '')) CONTAINS tok)
-        )
-        RETURN c, e, 1.0 AS provenance_weight
-    }
-
-    WITH c, e, max(provenance_weight) AS entity_weight
-    WITH
-        c,
-        collect(DISTINCT coalesce(e.name, e.id)) AS entities,
-        count(DISTINCT e) AS rel_count,
-        sum(entity_weight) AS graph_score
+      )
+    WITH c,
+         collect(DISTINCT coalesce(e.name, e.canonical_id, e.id)) AS entities,
+         count(DISTINCT e) AS rel_count
     RETURN
         coalesce(c.chunk_id, c.id) AS chunk_id,
         coalesce(c.doc_id, '') AS doc_id,
         coalesce(c.filename, 'Neo4j') AS filename,
         coalesce(c.page, 0) AS page,
-        coalesce(c.chunk_index, 0) AS chunk_index,
         coalesce(c.page_chunk_index, 0) AS page_chunk_index,
+        c.scope AS scope,
+        c.organization_id AS organization_id,
+        c.tier AS source_tier,
         entities,
         rel_count,
-        graph_score
-    ORDER BY graph_score DESC, rel_count DESC, page ASC, page_chunk_index ASC
+        toFloat(rel_count) * 2.0 AS graph_score
+    ORDER BY graph_score DESC, page ASC, page_chunk_index ASC
     LIMIT $limit
     """
 
     out: List[Dict[str, Any]] = []
     try:
         with neo4j_driver.session() as session:
-            rows = session.run(cypher, tokens=tokens, limit=limit)
-            for r in rows:
-                cid = r.get("chunk_id")
+            rows = session.run(cypher, tokens=tokens, limit=limit, org_id=current_organization_id())
+            for row in rows:
+                cid = row.get("chunk_id")
                 if not cid:
                     continue
-                entities = r.get("entities") or []
+                entities = row.get("entities") or []
                 out.append({
                     "id": str(cid),
-                    "doc_id": str(r.get("doc_id") or ""),
+                    "doc_id": str(row.get("doc_id") or ""),
                     "content": "Entity match: " + ", ".join(str(x) for x in entities[:12]),
-                    "filename": r.get("filename") or "Neo4j",
-                    "page": int(r.get("page") or 0),
-                    "page_chunk_index": int(r.get("page_chunk_index") or 0),
+                    "filename": row.get("filename") or "Neo4j",
+                    "page": int(row.get("page") or 0),
+                    "page_chunk_index": int(row.get("page_chunk_index") or 0),
                     "type": "graph",
                     "tier": "GRAPH",
-                    "score_graph": float(r.get("graph_score") or r.get("rel_count") or 1.0),
+                    "source_tier": str(row.get("source_tier") or ""),
+                    "scope": str(row.get("scope") or "").upper(),
+                    "organization_id": _optional_int(row.get("organization_id")),
+                    "status": "active",
+                    "corpus_version": CORPUS_VERSION,
+                    "score_graph": float(row.get("graph_score") or row.get("rel_count") or 1.0),
                     "origin": "Neo4j Entity Search",
                     "section_hint": "Entities: " + ", ".join(str(x) for x in entities[:5]),
                 })
     except Exception as e:
         print(f"⚠️ Neo4j entity search error: {e}")
-
     return out
 
-def search_neo4j_formulas(query_text: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """Ricerca diretta delle formule nel Knowledge Graph."""
+def search_neo4j_formulas(
+    query_text: str,
+    limit: int = 20,
+    requested_doc: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Ricerca formule nel Knowledge Graph con filtro tenant sul Chunk.
+
+    La ricerca copre sia formule direttamente menzionate dal Chunk sia formule
+    collegate a un concetto menzionato dal Chunk. Se la domanda è generica
+    (es. "quali formule sono presenti?") la query non fallisce per lista token
+    vuota; il limite e l'eventuale documento richiesto delimitano i risultati.
+    """
     if not neo4j_driver or not query_text.strip():
         return []
 
     tokens = extract_rag_tokens(query_text)
-    if not tokens:
-        return []
+    requested_doc_norm = normalize_doc_name(requested_doc)
+    requested_doc_lower = os.path.basename(str(requested_doc or "")).strip().lower()
 
     cypher = """
-    MATCH (f)-[:MENTIONED_IN|PRESENT_IN]->(c:Chunk)
-    WHERE (
-        f:Formula OR toUpper(coalesce(f.category, '')) = 'FORMULA'
-    )
-    AND any(tok IN $tokens WHERE
-        toLower(coalesce(c.filename, '')) CONTAINS tok OR
-        toLower(coalesce(f.latex, '')) CONTAINS tok OR
-        toLower(coalesce(f.formula, '')) CONTAINS tok OR
-        toLower(coalesce(f.plain, '')) CONTAINS tok OR
-        toLower(coalesce(f.meaning_it, '')) CONTAINS tok OR
-        toLower(coalesce(f.description, '')) CONTAINS tok OR
-        toLower(coalesce(f.name, f.id, f.fid, '')) CONTAINS tok
-    )
-    RETURN
+    MATCH (c:Chunk)
+    WHERE c.status = 'active'
+      AND (
+            (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier = 'A')
+            OR
+            (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN ['B', 'C'])
+          )
+      AND (
+            $requested_doc_norm = ''
+            OR toLower(coalesce(c.filename, '')) CONTAINS $requested_doc_lower
+            OR replace(replace(replace(replace(replace(replace(
+                   toLower(coalesce(c.filename, '')), '.pdf', ''), '.md', ''),
+                   '.txt', ''), '_', ''), '-', ''), ' ', '') CONTAINS $requested_doc_norm
+          )
+
+    CALL (c) {
+        MATCH (c)-[rf:HAS_FORMULA|MENTIONS|MENTIONED_IN|PRESENT_IN]-(f)
+        WHERE rf.status = 'active'
+          AND f.status = 'active'
+          AND (
+                f:Formula
+                OR toUpper(coalesce(f.category, '')) = 'FORMULA'
+                OR toUpper(coalesce(f.type, '')) = 'FORMULA'
+          )
+        RETURN f
+
+        UNION
+
+        MATCH (c)-[re:MENTIONS|MENTIONED_IN|PRESENT_IN]-(e:Entity)
+              -[hf:HAS_FORMULA]-(f)
+        WHERE re.status = 'active'
+          AND e.status = 'active'
+          AND hf.status = 'active'
+          AND f.status = 'active'
+          AND (
+                f:Formula
+                OR toUpper(coalesce(f.category, '')) = 'FORMULA'
+                OR toUpper(coalesce(f.type, '')) = 'FORMULA'
+          )
+        RETURN f
+    }
+
+    WITH c, f,
+         coalesce(f.latex, f.formula, '') AS latex,
+         coalesce(f.plain, f.name, f.canonical_id, f.fid, f.id, '') AS plain,
+         coalesce(f.meaning_it, f.meaning, f.description, '') AS meaning
+    WHERE size($tokens) = 0
+       OR any(tok IN $tokens WHERE
+            toLower(coalesce(c.filename, '')) CONTAINS tok OR
+            toLower(coalesce(c.text, '')) CONTAINS tok OR
+            toLower(toString(latex)) CONTAINS tok OR
+            toLower(toString(plain)) CONTAINS tok OR
+            toLower(toString(meaning)) CONTAINS tok OR
+            any(k IN coalesce(f.keywords, []) WHERE toLower(toString(k)) CONTAINS tok)
+       )
+    RETURN DISTINCT
         coalesce(c.chunk_id, c.id) AS chunk_id,
         coalesce(c.doc_id, '') AS doc_id,
         coalesce(c.filename, 'Neo4j') AS filename,
         coalesce(c.page, 0) AS page,
-        coalesce(c.chunk_index, 0) AS chunk_index,
         coalesce(c.page_chunk_index, 0) AS page_chunk_index,
-        coalesce(f.latex, f.formula, '') AS latex,
-        coalesce(f.plain, f.name, f.id, f.fid, '') AS plain,
-        coalesce(f.meaning_it, f.description, '') AS meaning,
-        count(*) AS rel_count
-    ORDER BY page ASC, chunk_index ASC
+        c.scope AS scope,
+        c.organization_id AS organization_id,
+        c.tier AS source_tier,
+        latex,
+        plain,
+        meaning,
+        coalesce(f.fid, f.entity_key, f.id, plain, latex) AS formula_key
+    ORDER BY page ASC, page_chunk_index ASC
     LIMIT $limit
     """
 
     out: List[Dict[str, Any]] = []
     try:
         with neo4j_driver.session() as session:
-            rows = session.run(cypher, tokens=tokens, limit=limit)
-            for r in rows:
-                cid = r.get("chunk_id")
+            rows = session.run(
+                cypher,
+                tokens=tokens,
+                limit=max(1, int(limit)),
+                org_id=current_organization_id(),
+                requested_doc_norm=requested_doc_norm,
+                requested_doc_lower=requested_doc_lower,
+            )
+            seen = set()
+            for row in rows:
+                cid = row.get("chunk_id")
                 if not cid:
                     continue
-                latex = (r.get("latex") or "").strip()
-                plain = (r.get("plain") or "").strip()
-                meaning = (r.get("meaning") or "").strip()
-                formula_parts: List[str] = []
-                if latex:
-                    formula_parts.append(f"LaTeX: {latex}")
-                if plain:
-                    formula_parts.append(f"Plain: {plain}")
-                if meaning:
-                    formula_parts.append(f"Meaning: {meaning}")
-                if not formula_parts:
+
+                formula_key = str(row.get("formula_key") or "").strip()
+                dedupe_key = (str(cid), formula_key)
+                if dedupe_key in seen:
                     continue
+                seen.add(dedupe_key)
+
+                parts: List[str] = []
+                latex = str(row.get("latex") or "").strip()
+                plain = str(row.get("plain") or "").strip()
+                meaning = str(row.get("meaning") or "").strip()
+                if latex:
+                    parts.append(f"LaTeX: {latex}")
+                if plain and plain != latex:
+                    parts.append(f"Plain: {plain}")
+                if meaning:
+                    parts.append(f"Meaning: {meaning}")
+                if not parts:
+                    continue
+
                 out.append({
                     "id": str(cid),
-                    "doc_id": str(r.get("doc_id") or ""),
-                    "content": "Formula from Knowledge Graph:\n" + "\n".join(formula_parts),
-                    "filename": r.get("filename") or "Neo4j",
-                    "page": int(r.get("page") or 0),
-                    "page_chunk_index": int(r.get("page_chunk_index") or 0),
+                    "formula_key": formula_key,
+                    "doc_id": str(row.get("doc_id") or ""),
+                    "content": "Formula from Knowledge Graph:\n" + "\n".join(parts),
+                    "filename": row.get("filename") or "Neo4j",
+                    "page": int(row.get("page") or 0),
+                    "page_chunk_index": int(row.get("page_chunk_index") or 0),
                     "type": "formula",
                     "tier": "GRAPH",
-                    "score_graph": float(r.get("rel_count") or 5.0),
+                    "source_tier": str(row.get("source_tier") or ""),
+                    "scope": str(row.get("scope") or "").upper(),
+                    "organization_id": _optional_int(row.get("organization_id")),
+                    "status": "active",
+                    "corpus_version": CORPUS_VERSION,
+                    "score_graph": 5.0,
                     "origin": "Neo4j Formula Search",
                     "section_hint": "Formula node",
                 })
     except Exception as e:
         print(f"⚠️ Neo4j formula search error: {e}")
-
     return out
-
-GRAPH_QUERY_NOISE_TERMS = {
-    # IT generici / istruzionali
-    "usa", "usare", "spiega", "spiegare", "collegamenti", "collegamento",
-    "relazioni", "relazione", "documenti", "documento", "normativi",
-    "normativo", "glossario", "fonti", "fonte", "tabella", "catena",
-    "percorso", "passaggio", "traversamento", "ricostruisci", "traccia",
-    "mostra", "verifica", "grafo", "neo4j", "multihop", "multi-hop",
-
-    # EN generici / istruzionali
-    "using", "use", "explain", "relationship", "relationships",
-    "relation", "relations", "retrieved", "documents", "document",
-    "sources", "source", "glossary", "table", "chain", "path", "step",
-    "traversal", "reconstruct", "trace", "show", "verify", "graph",
-    "multihop", "multi-hop",
-}
-
 
 def graph_relevant_tokens(query_text: str) -> List[str]:
     """
@@ -4112,80 +4699,71 @@ def filter_neo4j_relation_rows(
     return [row for _, _, row in scored[:limit]]
 
 def search_neo4j_relations(query_text: str, limit: int = 60) -> List[Dict[str, Any]]:
-    """Restituisce relazioni Entity-[:REL]->Entity con provenance dell'ingestion."""
+    """Archi tenant-safe, inclusi i soli collegamenti diretti ACCOUNT -> GLOBAL."""
     if not neo4j_driver:
         return []
-
-    tokens = graph_relevant_tokens(query_text)
-    if not tokens:
-        tokens = extract_rag_tokens(query_text)
+    tokens = graph_relevant_tokens(query_text) or extract_rag_tokens(query_text)
     if not tokens:
         return []
-
     tokens = list(dict.fromkeys(tokens))
 
     cypher = """
     MATCH (e1:Entity)-[rel]->(e2:Entity)
-    WHERE any(tok IN $tokens WHERE
-        toLower(coalesce(e1.name, e1.id, '')) CONTAINS tok OR
-        toLower(coalesce(e2.name, e2.id, '')) CONTAINS tok OR
-        toLower(coalesce(e1.description, '')) CONTAINS tok OR
-        toLower(coalesce(e2.description, '')) CONTAINS tok OR
-        toLower(coalesce(e1.category, e1.type, labels(e1)[0], '')) CONTAINS tok OR
-        toLower(coalesce(e2.category, e2.type, labels(e2)[0], '')) CONTAINS tok OR
-        any(s IN coalesce(e1.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
-        any(s IN coalesce(e2.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok)
-    )
-
-    CALL (e1) {
-        OPTIONAL MATCH (e1)-[:PRESENT_IN|MENTIONED_IN]->(c1:Chunk)
-        RETURN head(collect(DISTINCT c1)) AS c1
-    }
-    CALL (e2) {
-        OPTIONAL MATCH (e2)-[:PRESENT_IN|MENTIONED_IN]->(c2:Chunk)
-        RETURN head(collect(DISTINCT c2)) AS c2
-    }
-    CALL (e1) {
-        OPTIONAL MATCH (e1)-[:PRESENT_ON]->(p1:Page)
-        RETURN head(collect(DISTINCT p1)) AS p1
-    }
-    CALL (e2) {
-        OPTIONAL MATCH (e2)-[:PRESENT_ON]->(p2:Page)
-        RETURN head(collect(DISTINCT p2)) AS p2
-    }
-
+    WHERE rel.status = 'active'
+      AND e1.status = 'active'
+      AND e2.status = 'active'
+      AND type(rel) IN $allowed_rels
+      AND (
+            (
+                rel.scope = 'GLOBAL' AND rel.organization_id IS NULL
+                AND e1.scope = 'GLOBAL' AND e1.organization_id IS NULL AND e1.tier = 'A'
+                AND e2.scope = 'GLOBAL' AND e2.organization_id IS NULL AND e2.tier = 'A'
+            )
+            OR
+            (
+                rel.scope = 'ACCOUNT' AND rel.organization_id = $org_id
+                AND e1.scope = 'ACCOUNT' AND e1.organization_id = $org_id AND e1.tier IN ['B','C']
+                AND (
+                    (e2.scope = 'ACCOUNT' AND e2.organization_id = $org_id AND e2.tier IN ['B','C'])
+                    OR
+                    (e2.scope = 'GLOBAL' AND e2.organization_id IS NULL AND e2.tier = 'A')
+                )
+            )
+          )
+      AND any(tok IN $tokens WHERE
+            toLower(coalesce(e1.name, e1.canonical_id, e1.id, '')) CONTAINS tok OR
+            toLower(coalesce(e2.name, e2.canonical_id, e2.id, '')) CONTAINS tok OR
+            toLower(coalesce(e1.description, '')) CONTAINS tok OR
+            toLower(coalesce(e2.description, '')) CONTAINS tok OR
+            any(s IN coalesce(e1.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok) OR
+            any(s IN coalesce(e2.synonyms, []) WHERE toLower(toString(s)) CONTAINS tok)
+      )
     RETURN
-        coalesce(e1.name, e1.id) AS source,
+        coalesce(e1.name, e1.canonical_id, e1.id) AS source,
         type(rel) AS relation,
-        coalesce(e2.name, e2.id) AS target,
+        coalesce(e2.name, e2.canonical_id, e2.id) AS target,
         properties(rel) AS props,
-        coalesce(
-            rel.source_file,
-            rel.filename,
-            rel.source_name,
-            p1.filename,
-            p2.filename,
-            c1.filename,
-            c2.filename,
-            ''
-        ) AS filename,
-        coalesce(
-            rel.page_no,
-            rel.page,
-            p1.page_no,
-            p2.page_no,
-            c1.page,
-            c2.page,
-            0
-        ) AS page
+        coalesce(rel.source_file, head(coalesce(rel.source_files, [])), '') AS filename,
+        coalesce(rel.page_no, head(coalesce(rel.page_nos, [])), 0) AS page,
+        rel.scope AS scope,
+        rel.organization_id AS organization_id,
+        CASE WHEN rel.scope = 'GLOBAL' THEN 'A' ELSE 'C' END AS tier,
+        rel.status AS status,
+        rel.ingestion_run_id AS ingestion_run_id,
+        rel.corpus_version AS corpus_version,
+        rel.classification AS classification
     LIMIT $limit
     """
-
     try:
         with neo4j_driver.session() as session:
-            scan_limit = max(limit * 4, limit)
-            rows = session.run(cypher, tokens=tokens, limit=scan_limit)
-            raw_rows = [dict(r) for r in rows]
+            rows = session.run(
+                cypher,
+                tokens=tokens,
+                limit=max(limit * 4, limit),
+                org_id=current_organization_id(),
+                allowed_rels=NEO4J_ALLOWED_RELATIONSHIPS,
+            )
+            raw_rows = [dict(row) for row in rows]
         return filter_neo4j_relation_rows(query_text, raw_rows, limit)
     except Exception as e:
         print(f"⚠️ Neo4j relation search error: {e}")
@@ -4260,6 +4838,11 @@ def graph_relations_to_source(rows: List[Dict[str, Any]]) -> Optional[SourceItem
         score=1.0,
         db_origin="Neo4j Relation Search",
         section_hint="Entity relations table",
+        scope="ACCOUNT",
+        organization_id=current_organization_id(),
+        status="active",
+        corpus_version=CORPUS_VERSION,
+        request_id=get_tenant_context().request_id,
     )
 
 
@@ -5057,20 +5640,13 @@ def candidate_matches_requested_doc(candidate: Dict[str, Any], requested_doc: st
 def search_pg_by_document_scope(
     requested_doc: str,
     query_text: str,
-    limit: int = 80
+    limit: int = 80,
 ) -> List[Dict[str, Any]]:
-    """
-    Recupera chunk da Postgres appartenenti al documento richiesto,
-    indipendentemente dal fatto che siano entrati nei primi risultati BM25 generici.
-
-    Serve per evitare falsi negativi quando l'utente chiede:
-    "nel documento X..."
-    """
+    """Recupera il documento richiesto applicando il tenant filter prima di ROW_NUMBER."""
     if not PG_ENRICH_ENABLED or not pg_pool:
         return []
 
     wanted_norm = normalize_doc_name(requested_doc)
-
     if not wanted_norm:
         return []
 
@@ -5078,116 +5654,91 @@ def search_pg_by_document_scope(
     WITH q AS (
         SELECT plainto_tsquery('simple', %s) AS tsq
     ),
-    ranked AS (
+    visible AS (
         SELECT
-            d.chunk_uuid::text AS chunk_uuid,
-            d.content_raw,
-            d.content_semantic,
-            d.metadata_json,
-            d.ingestion_ts,
-
+            d.*,
             regexp_replace(
                 regexp_replace(
                     regexp_replace(
-                        lower(
-                            coalesce(
-                                d.metadata_json->>'filename',
-                                d.metadata_json->>'source_name',
-                                ''
-                            )
-                        ),
-                        '\\.(pdf|md|txt|docx|html)$',
-                        '',
-                        'g'
+                        lower(coalesce(d.metadata_json->>'filename', d.metadata_json->>'source_name', '')),
+                        '\\.(pdf|md|txt|docx|html)$', '', 'g'
                     ),
-                    '[_\\-\\s]+(out|output)$',
-                    '',
-                    'g'
+                    '[_\\-\\s]+(out|output)$', '', 'g'
                 ),
-                '[^a-z0-9]+',
-                '',
-                'g'
+                '[^a-z0-9]+', '', 'g'
             ) AS filename_norm,
-
             ts_rank_cd(
-                to_tsvector(
-                    'simple',
-                    coalesce(d.content_semantic, '') || ' ' ||
-                    coalesce(d.content_raw, '') || ' ' ||
-                    coalesce(d.metadata_json::text, '')
-                ),
+                to_tsvector('simple', coalesce(d.content_semantic, '') || ' ' || coalesce(d.content_raw, '') || ' ' || coalesce(d.metadata_json::text, '')),
                 q.tsq
-            ) AS rank,
-
-            row_number() OVER (
-                PARTITION BY d.chunk_uuid
-                ORDER BY d.ingestion_ts DESC
-            ) AS rn
-
+            ) AS rank
         FROM public.document_chunks d, q
+        WHERE d.status = 'active'
+          AND (
+                (d.scope = 'GLOBAL' AND d.organization_id IS NULL AND d.tier = 'A')
+                OR
+                (d.scope = 'ACCOUNT' AND d.organization_id = %s AND d.tier IN ('B', 'C'))
+              )
+    ),
+    ranked AS (
+        SELECT *,
+               row_number() OVER (
+                    PARTITION BY chunk_uuid, scope, organization_id
+                    ORDER BY ingestion_ts DESC
+               ) AS rn
+        FROM visible
     )
     SELECT
-        chunk_uuid,
+        chunk_uuid::text,
         content_raw,
         content_semantic,
         metadata_json,
         ingestion_ts,
-        rank
+        rank,
+        scope,
+        organization_id,
+        tier
     FROM ranked
     WHERE rn = 1
       AND length(filename_norm) > 0
-      AND (
-            filename_norm LIKE %s
-            OR %s LIKE ('%%' || filename_norm || '%%')
-      )
+      AND (filename_norm LIKE %s OR %s LIKE ('%%' || filename_norm || '%%'))
     ORDER BY rank DESC, ingestion_ts DESC
     LIMIT %s;
     """
 
-    conn = pg_pool.getconn()
-
+    conn = pg_get_conn_secure()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 sql,
                 (
                     query_text,
+                    current_organization_id(),
                     f"%{wanted_norm}%",
                     wanted_norm,
                     limit,
-                )
+                ),
             )
             rows = cur.fetchall()
 
         out: List[Dict[str, Any]] = []
-
-        for chunk_uuid, content_raw, content_semantic, metadata_json, ingestion_ts, rank in rows:
-            if isinstance(metadata_json, str):
-                try:
-                    metadata_json = json.loads(metadata_json)
-                except Exception:
-                    metadata_json = {}
-
-            if metadata_json is None:
-                metadata_json = {}
-
+        for chunk_uuid, raw, semantic, metadata, ingestion_ts, rank, scope, org_id, tier in rows:
+            metadata = metadata_with_tenant(metadata, scope, org_id, tier)
             out.append({
                 "id": str(chunk_uuid),
-                "content": content_semantic or content_raw or "",
-                "metadata": metadata_json,
+                "content": semantic or raw or "",
+                "metadata": metadata,
                 "score": float(rank or 0.001),
                 "origin": "PostgresDocScope",
+                "scope": str(metadata.get("scope") or "").upper(),
+                "organization_id": _optional_int(metadata.get("organization_id")),
                 "ingestion_ts": ingestion_ts.isoformat() if ingestion_ts else "",
             })
-
         return out
-
     except Exception as e:
-        print(f"⚠️ PG document scope search error: {e}")
+        print(f"⚠️ Postgres document-scope search error: {e}")
         return []
-
     finally:
-        pg_pool.putconn(conn)
+        pg_put_conn_secure(conn)
 
 def relation_row_matches_requested_doc(row: Dict[str, Any], requested_doc: str) -> bool:
     """
@@ -5218,7 +5769,17 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
     print(f"❓ Query: '{query_text}'")
 
     if not embedder or not qdrant_client_inst:
-        return [SourceItem(id="error", content="Backend OFF", filename="System")], "Backend OFF"
+        return [SourceItem(
+            id="error",
+            content="Backend OFF",
+            filename="System",
+            tier="USER",
+            scope="ACCOUNT",
+            organization_id=current_organization_id(),
+            status="active",
+            corpus_version=CORPUS_VERSION,
+            request_id=get_tenant_context().request_id,
+        )], "Backend OFF"
 
     t_total0 = time.time()
     timings: Dict[str, float] = {}
@@ -5253,6 +5814,8 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
     # 2) Qdrant vector search
     t0 = time.time()
     hits = []
+    
+    tenant_filter = build_qdrant_tenant_filter()
 
     try:
         # Compatibilità universale per le versioni nuove e vecchie di Qdrant
@@ -5260,6 +5823,7 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
             response = qdrant_client_inst.query_points(
                 collection_name=COLLECTION_NAME,
                 query=query_vector,
+                query_filter=tenant_filter,
                 limit=qdrant_k,
                 with_payload=True,
             )
@@ -5268,9 +5832,12 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
             hits = qdrant_client_inst.search(
                 collection_name=COLLECTION_NAME,
                 query_vector=query_vector,
+                query_filter=tenant_filter,
                 limit=qdrant_k,
                 with_payload=True,
             )
+            
+            
         counts["qdrant_hits"] = len(hits)
         print(f"🌌 Qdrant ha trovato {len(hits)} chunk.")
     except Exception as e:
@@ -5352,10 +5919,14 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
         counts["neo4j_relation_scope_before"] = before_rel_scope
         counts["neo4j_relation_scope_after"] = len(neo4j_relation_rows)
 
-    formula_query = is_formula_lookup_query(query_text)
+    formula_query = should_query_neo4j_formulas(query_text)
 
     neo4j_formula_hits = (
-        search_neo4j_formulas(expanded_query, limit=GRAPH_MAX_FORMULAS)
+        search_neo4j_formulas(
+            query_text,
+            limit=GRAPH_MAX_FORMULAS,
+            requested_doc=requested_doc,
+        )
         if formula_query
         else []
     )
@@ -5382,6 +5953,10 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
         uid = str(hit.id)
         payload = hit.payload or {}
 
+        if not qdrant_payload_is_visible(payload):
+            logger.warning("Qdrant vector hit %s scartato dal tenant guard", uid)
+            continue
+
         content = safe_payload_text(payload)
         if not content:
             continue
@@ -5402,6 +5977,13 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
             "origin": "Qdrant",
             "section_hint": get_payload_section(payload),
             "image_id": get_payload_image_id(payload),
+            "scope": str(payload.get("scope") or "").upper(),
+            "organization_id": _optional_int(payload.get("organization_id")),
+            "status": str(payload.get("status") or ""),
+            "ingestion_run_id": str(payload.get("ingestion_run_id") or ""),
+            "corpus_version": str(payload.get("corpus_version") or ""),
+            "classification": str(payload.get("classification") or "internal"),
+            "embedding_model": str(payload.get("embedding_model") or ""),
         }
         
     # 5A-BIS) Import Postgres document-scope candidates
@@ -5534,6 +6116,8 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "score_bm25": float(b.get("score", 0.0)),
                 "score_graph": 0.0,
                 "origin": "Postgres",
+                "scope": str(meta.get("scope") or "").upper(),
+                "organization_id": _optional_int(meta.get("organization_id")),
                 "section_hint": meta.get("section_hint", ""),
                 "image_id": meta.get("image_id"),
             }
@@ -5567,12 +6151,33 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 "score_graph": float(g.get("score_graph", 0.0)),
                 "origin": g.get("origin", "Neo4j"),
                 "section_hint": g.get("section_hint", ""),
+                "scope": str(g.get("scope") or "").upper(),
+                "organization_id": _optional_int(g.get("organization_id")),
             }
         else:
             candidates_dict[uid]["score_graph"] = max(
                 float(candidates_dict[uid].get("score_graph", 0.0)),
                 float(g.get("score_graph", 0.0)),
             )
+
+            # Non perdere la formula quando lo stesso chunk è già arrivato da
+            # Qdrant/PostgreSQL. Prima il merge conservava solo lo score e
+            # scartava il contenuto del nodo formula.
+            if normalize_source_type(g.get("type", "")) == "formula":
+                formula_content = str(g.get("content") or "").strip()
+                current_content = str(candidates_dict[uid].get("content") or "").strip()
+                if formula_content and formula_content not in current_content:
+                    candidates_dict[uid]["content"] = (
+                        current_content
+                        + "\n\n--- Formula collegata dal Knowledge Graph ---\n"
+                        + formula_content
+                    ).strip()
+                candidates_dict[uid]["type"] = "formula"
+                candidates_dict[uid]["section_hint"] = g.get(
+                    "section_hint",
+                    candidates_dict[uid].get("section_hint", ""),
+                )
+
             if "Neo4j" not in candidates_dict[uid]["origin"]:
                 candidates_dict[uid]["origin"] += " + Neo4j"
 
@@ -5612,6 +6217,8 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                         "score_graph": 1.0,
                         "origin": "Neo4j_Expansion",
                         "section_hint": getattr(gs, "section_hint", ""),
+                        "scope": str(getattr(gs, "scope", "") or "").upper(),
+                        "organization_id": _optional_int(getattr(gs, "organization_id", None)),
                     }
 
             print(f"🕸️ Neo4j ha aggiunto {len(graph_sources)} chunk semanticamente collegati.")
@@ -5701,7 +6308,7 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
 
         intent_boost = 0.0
 
-        if is_formula_lookup_query(query_text) and ctype == "formula":
+        if formula_query and ctype == "formula":
             intent_boost = 0.25
         elif intent == "chart" and ctype in {"image", "chart"}:
             intent_boost = 0.20
@@ -5724,10 +6331,21 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
         )
 
 
-
     # 9) Reranking
-    candidates.sort(key=lambda x: x.get("pre_rerank_score", 0.0), reverse=True)
-    top_candidates = candidates[:rerank_k]
+    candidates.sort(
+        key=lambda x: x.get("pre_rerank_score", 0.0),
+        reverse=True,
+    )
+
+    # Un lookup documentale di formule deve mantenere tutti i chunk già
+    # filtrati sul documento, senza dipendere da un limite costruito sul caso.
+    exhaustive_formula_lookup = bool(
+        requested_doc and is_formula_lookup_query(query_text)
+    )
+    if exhaustive_formula_lookup:
+        top_candidates = list(candidates)
+    else:
+        top_candidates = candidates[:rerank_k]
 
     if reranker and top_candidates:
         t0 = time.time()
@@ -5761,12 +6379,17 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
     top_candidates.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
 
     # 10) Diversification
-    final_selection = diversify(
-        top_candidates,
-        max_per_page_k,
-        max_per_doc_k,
-        final_k,
-    )
+    # Il lookup esaustivo mantiene il perimetro documentale già applicato al
+    # punto 7B; le altre query conservano la diversificazione standard.
+    if exhaustive_formula_lookup:
+        final_selection = list(top_candidates)
+    else:
+        final_selection = diversify(
+            top_candidates,
+            max_per_page_k,
+            max_per_doc_k,
+            final_k,
+        )
 
     # 11) Final Postgres enrichment by chunk_uuid
     pg_rows = fetch_pg_chunks_by_uuid(
@@ -5789,11 +6412,18 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
             except Exception:
                 pg_meta = {}
 
-        preferred_content = (
-            pg_row.get("content_raw", "")
-            if PG_PREFER_RAW
-            else (pg_row.get("content_semantic", "") or pg_row.get("content_raw", ""))
-        )
+        # v4.14 - Per i lookup di formule il testo raw del documento è
+        # autoritativo. Il contenuto semantico può aver subito normalizzazioni
+        # LLM/OCR che alterano backslash, parentesi e operatori LaTeX.
+        raw_content = str(pg_row.get("content_raw", "") or "")
+        semantic_content = str(pg_row.get("content_semantic", "") or "")
+
+        if formula_query:
+            preferred_content = raw_content or semantic_content
+        elif PG_PREFER_RAW:
+            preferred_content = raw_content or semantic_content
+        else:
+            preferred_content = semantic_content or raw_content
 
         if preferred_content:
             t["content"] = preferred_content
@@ -5827,11 +6457,18 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
         else:
             t["type"] = current_type or "text"
 
-        t["tier"] = normalize_tier_value(
-            t.get("tier")
-            or pg_meta.get("tier")
-            or "C"
+        t["tier"] = normalize_tier_value(pg_row.get("tier") or pg_meta.get("tier") or t.get("tier") or "C")
+        t["scope"] = str(pg_row.get("scope") or pg_meta.get("scope") or t.get("scope") or "").upper()
+        t["organization_id"] = _optional_int(
+            pg_row.get("organization_id")
+            if pg_row.get("organization_id") is not None
+            else pg_meta.get("organization_id", t.get("organization_id"))
         )
+        t["status"] = str(pg_meta.get("status") or t.get("status") or "active")
+        t["ingestion_run_id"] = str(pg_meta.get("ingestion_run_id") or t.get("ingestion_run_id") or "")
+        t["corpus_version"] = str(pg_meta.get("corpus_version") or t.get("corpus_version") or CORPUS_VERSION)
+        t["classification"] = str(pg_meta.get("classification") or t.get("classification") or "internal")
+        t["embedding_model"] = str(pg_meta.get("embedding_model") or t.get("embedding_model") or "")
 
         t["pg_ingestion_ts"] = pg_row.get("ingestion_ts", "")
         t["pg_source_name"] = pg_meta.get("source_name", "")
@@ -5885,6 +6522,14 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                 db_origin=t.get("origin", "Unknown"),
                 section_hint=t.get("section_hint", ""),
                 image_id=t.get("image_id"),
+                scope=str(t.get("scope") or "").upper(),
+                organization_id=_optional_int(t.get("organization_id")),
+                status=str(t.get("status") or "active"),
+                ingestion_run_id=str(t.get("ingestion_run_id") or ""),
+                corpus_version=str(t.get("corpus_version") or CORPUS_VERSION),
+                classification=str(t.get("classification") or "internal"),
+                embedding_model=str(t.get("embedding_model") or ""),
+                request_id=get_tenant_context().request_id,
                 pg_ingestion_ts=t.get("pg_ingestion_ts", ""),
                 pg_source_name=t.get("pg_source_name", ""),
                 pg_source_type=t.get("pg_source_type", ""),
@@ -5903,7 +6548,7 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
 
         all_formulas_flat = []
 
-        if is_formula_lookup_query(query_text):
+        if formula_query:
             formulas_dict = get_formulas_for_chunks(
                 chunk_ids,
                 limit_per_chunk=GRAPH_MAX_FORMULAS,
@@ -5917,7 +6562,12 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
 
         counts["final_formulas"] = len(all_formulas_flat)
 
-        if all_formulas_flat:
+        # v4.14 - Il source aggregato "KG" non deve essere aggiunto dopo
+        # l'HARD DOCUMENT SCOPE FILTER. Quando è richiesto un documento preciso,
+        # le formule Neo4j sono già entrate come candidati con filename/pagina del
+        # chunk sorgente. L'aggregato generico perderebbe la provenienza e
+        # reintrodurrebbe formule esterne o duplicate.
+        if all_formulas_flat and not requested_doc:
             sources.append(
                 SourceItem(
                     id="graph",
@@ -5928,6 +6578,11 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
                     tier="GRAPH",
                     score=0.0,
                     db_origin="Neo4j Formula Lookup",
+                    scope="ACCOUNT",
+                    organization_id=current_organization_id(),
+                    status="active",
+                    corpus_version=CORPUS_VERSION,
+                    request_id=get_tenant_context().request_id,
                 )
             )
 
@@ -5935,17 +6590,52 @@ def retrieve_v2(query_text: str, active_doc: str = "") -> Tuple[List[SourceItem]
         if rel_source:
             sources.append(rel_source)
 
+    sources = filter_sources_for_current_organization(sources)
+    counts["final_sources_after_tenant_guard"] = len(sources)
+
+    ctx = get_tenant_context()
+    append_audit_log(
+        AuditTrail(
+            ts_utc=datetime.utcnow().isoformat() + "Z",
+            query="",
+            query_sha256=hashlib.sha256((query_text or "").encode("utf-8")).hexdigest(),
+            intent=intent,
+            organization_id=ctx.organization_id,
+            user_id=ctx.user_id,
+            roles=ctx.roles,
+            request_id=ctx.request_id,
+            corpus_version=CORPUS_VERSION,
+            filters={
+                "visibility": "GLOBAL/A or ACCOUNT/current/B,C",
+                "status": "active",
+                "active_doc": active_doc or "",
+            },
+            retrieved_sources=[
+                {
+                    "id": s.id, "doc_id": s.doc_id, "filename": s.filename,
+                    "page": s.page, "tier": s.tier, "scope": s.scope,
+                    "organization_id": s.organization_id, "status": s.status,
+                    "ingestion_run_id": s.ingestion_run_id,
+                }
+                for s in sources
+            ],
+            retrieval=RetrievalDebug(
+                query="", intent=intent, final_sources=len(sources),
+                tier_counts=dict(Counter(s.tier for s in sources)),
+            ),
+            llm_model=LLM_MODEL_NAME,
+            memory_limit=MEMORY_LIMIT,
+        )
+    )
+
     return sources, build_retrieval_audit_md(
-        query_text,
-        intent,
-        timings,
-        counts,
-        [],
+        query_text, intent, timings, counts, [],
     )
 
 
 def build_context_block(sources: List[SourceItem], max_chars: int = MAX_CONTEXT_CHARS) -> str:
-    """Build context with strong provenance and caps."""
+    """Build context only from sources visible to the current organization."""
+    sources = filter_sources_for_current_organization(sources)
     parts = []
     total = 0
 
@@ -6058,13 +6748,17 @@ INTENT: FORMULA / METRIC / ALGEBRA.
 FORMULA OUTPUT RULES:
 1. If the user asks to write, derive, express, isolate or solve an equation or inequality, always show the formula twice:
    - Formula testuale: `plain text formula`
-   - Formula LaTeX: `LaTeX code`
+   - Formula LaTeX, delimited as display math on separate lines:
+     $$
+     LaTeX code
+     $$
 2. The plain text formula is mandatory and must appear BEFORE the LaTeX version.
-3. Never leave blank mathematical placeholders.
-4. Never write empty parentheses for variables.
-5. If variables appear in the user question, preserve their names exactly in the plain text formula.
-6. If the formula is derived from user-provided values, explicitly state that it is derived from user-provided values.
-7. If the context does not contain a formula but the user provided all variables and relationships, you may derive the algebraic expression from the user-provided statement, marking it as user-provided derivation.
+3. Never wrap LaTeX in backticks or in fenced code blocks such as ```latex; those formats display code instead of rendering mathematics.
+4. Never leave blank mathematical placeholders.
+5. Never write empty parentheses for variables.
+6. If variables appear in the user question, preserve their names exactly in the plain text formula.
+7. If the formula is derived from user-provided values, explicitly state that it is derived from user-provided values.
+8. If the context does not contain a formula but the user provided all variables and relationships, you may derive the algebraic expression from the user-provided statement, marking it as user-provided derivation.
 """
     elif intent == "table":
         base += """
@@ -6164,6 +6858,68 @@ def safe_markdown(text: str) -> str:
         t += "\n```"
 
     return t
+
+
+
+def normalize_math_markdown_for_reflex(text: str) -> str:
+    """
+    Converte le forme LaTeX comunemente prodotte dall'LLM nel formato
+    riconosciuto da ``rx.markdown``/remark-math:
+
+    - inline: ``$ ... $``;
+    - display: ``$$ ... $$``.
+
+    I blocchi `````latex```, ``\\[...\\]`` e le formule racchiuse nei
+    backtick dopo l'etichetta "Formula LaTeX" vengono convertiti in display
+    math. Il contenuto matematico non viene trasformato in testo normale.
+    """
+    if not text:
+        return ""
+
+    out = str(text).replace("\r\n", "\n").replace("\r", "\n")
+
+    def _clean_formula_body(value: str) -> str:
+        body = (value or "").strip()
+        body = re.sub(r"^\$\$?\s*|\s*\$\$?$", "", body).strip()
+        body = re.sub(r"^\\\[\s*|\s*\\\]$", "", body).strip()
+        body = re.sub(r"^\\\(\s*|\s*\\\)$", "", body).strip()
+        return body
+
+    # Un fenced code block è codice, non matematica. Lo trasformiamo in
+    # display math affinché rehype-katex possa renderizzarlo.
+    out = re.sub(
+        r"```(?:latex|tex|math)\s*\n(.*?)\n```",
+        lambda m: "\n\n$$\n" + _clean_formula_body(m.group(1)) + "\n$$\n\n",
+        out,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Forma frequentemente prodotta dal prompt precedente:
+    # Formula LaTeX: `V_m \\leq \\frac{V}{3}`
+    out = re.sub(
+        r"(?im)(Formula\s+LaTeX\s*:)\s*`([^`\n]+)`",
+        lambda m: m.group(1) + "\n\n$$\n" + _clean_formula_body(m.group(2)) + "\n$$",
+        out,
+    )
+
+    # Delimitatori MathJax-style -> delimitatori remark-math/KaTeX.
+    out = re.sub(
+        r"\\\[(.*?)\\\]",
+        lambda m: "\n\n$$\n" + _clean_formula_body(m.group(1)) + "\n$$\n\n",
+        out,
+        flags=re.DOTALL,
+    )
+    out = re.sub(
+        r"\\\((.*?)\\\)",
+        lambda m: "$" + _clean_formula_body(m.group(1)) + "$",
+        out,
+        flags=re.DOTALL,
+    )
+
+    # Garantisce righe autonome per i delimitatori display.
+    out = re.sub(r"[^\S\n]*\$\$[^\S\n]*", "$$", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
 def short_text(s: str, n: int = 320) -> str:
     if not s:
         return ""
@@ -6191,9 +6947,13 @@ def make_analytics_sources(user_query: str) -> List[SourceItem]:
             section_hint="Dati forniti direttamente dall’utente (analytics_mode)",
             image_id=None,
             tier="USER",
+            scope="ACCOUNT",
+            organization_id=current_organization_id(),
+            status="active",
+            corpus_version=CORPUS_VERSION,
+            request_id=get_tenant_context().request_id,
         )
     ]
-
 
 
 def strip_id_leaks(text: str) -> str:
@@ -6749,6 +7509,14 @@ def prepare_sources_for_ui(sources: List[SourceItem]) -> List[SourceItem]:
                 section_hint=ui_safe_text(getattr(s, "section_hint", ""), 300),
                 image_id=getattr(s, "image_id", None),
                 tier=ui_safe_text(getattr(s, "tier", "C"), 40),
+                scope=ui_safe_text(getattr(s, "scope", ""), 20),
+                organization_id=_optional_int(getattr(s, "organization_id", None)),
+                status=ui_safe_text(getattr(s, "status", "active"), 30),
+                ingestion_run_id=ui_safe_text(getattr(s, "ingestion_run_id", ""), 80),
+                corpus_version=ui_safe_text(getattr(s, "corpus_version", ""), 80),
+                classification=ui_safe_text(getattr(s, "classification", "internal"), 40),
+                embedding_model=ui_safe_text(getattr(s, "embedding_model", ""), 160),
+                request_id=ui_safe_text(getattr(s, "request_id", ""), 80),
                 pg_ingestion_ts=ui_safe_text(getattr(s, "pg_ingestion_ts", ""), 80),
                 pg_source_name=ui_safe_text(getattr(s, "pg_source_name", ""), 160),
                 pg_source_type=ui_safe_text(getattr(s, "pg_source_type", ""), 80),
@@ -6829,6 +7597,14 @@ def normalize_sources_for_modal(raw_sources) -> List[SourceItem]:
                 ),
                 image_id=state_get(s, "image_id", None),
                 tier=ui_safe_text(state_get(s, "tier", "C"), 40),
+                scope=ui_safe_text(state_get(s, "scope", ""), 20),
+                organization_id=_optional_int(state_get(s, "organization_id", None)),
+                status=ui_safe_text(state_get(s, "status", ""), 30),
+                ingestion_run_id=ui_safe_text(state_get(s, "ingestion_run_id", ""), 80),
+                corpus_version=ui_safe_text(state_get(s, "corpus_version", ""), 80),
+                classification=ui_safe_text(state_get(s, "classification", "internal"), 80),
+                embedding_model=ui_safe_text(state_get(s, "embedding_model", ""), 160),
+                request_id=ui_safe_text(state_get(s, "request_id", ""), 80),
                 pg_ingestion_ts=ui_safe_text(
                     state_get(s, "pg_ingestion_ts", ""),
                     80,
@@ -7081,20 +7857,58 @@ def try_solve_date_offsets(query_text: str) -> Optional[str]:
 
 
 def _strip_math_wrappers(value: str) -> str:
+    """Rimuove soltanto delimitatori matematici esterni completi."""
     v = (value or "").strip()
     v = re.sub(r"^`+|`+$", "", v).strip()
-    v = re.sub(r"^\$+|\$+$", "", v).strip()
+
+    changed = True
+    while changed and v:
+        changed = False
+        wrapper_pairs = [
+            ("$$", "$$"),
+            ("$", "$"),
+            (r"\[", r"\]"),
+            (r"\(", r"\)"),
+        ]
+        for left, right in wrapper_pairs:
+            if v.startswith(left) and v.endswith(right) and len(v) >= len(left) + len(right):
+                v = v[len(left):-len(right)].strip()
+                changed = True
+                break
+
     return v
-
-
 def _looks_definitional_metric(latex: str, meaning: str = "") -> bool:
-    v = _strip_math_wrappers(latex)
-    if "=" in v:
-        _, right = v.split("=", 1)
-        if re.search(r"\\?text\{[^}]+\}", right.strip()):
+    """
+    Riconosce assegnazioni definitorie testuali senza usare termini di dominio.
+    """
+    value = _strip_math_wrappers(_normalize_latex_value(latex or ""))
+
+    if "=" in value:
+        _, right = value.split("=", 1)
+        right = right.strip()
+        right_plain = _formula_display_text(right, 1000)
+
+        if re.fullmatch(r"\\?text\{[^}]+\}", right):
             return True
-    m = (meaning or "").lower()
-    return any(t in m for t in ["tempo medio", "mean time", "metrica", "metric", "indicatore", "indicator"])
+
+        words = re.findall(r"[A-Za-zÀ-ÿ]{2,}", right_plain)
+        operators = re.findall(
+            r"[+\-*/×÷^]|\\frac|\\sum|\\prod|\\operatorname",
+            right,
+            flags=re.IGNORECASE,
+        )
+        if len(words) >= 3 and not operators:
+            return True
+
+    meaning_plain = _formula_display_text(meaning or "", 1000)
+    meaning_words = re.findall(r"[A-Za-zÀ-ÿ]{2,}", meaning_plain)
+    return len(meaning_words) >= 5 and bool(
+        re.search(
+            r"\b(?:definizione|definition|metrica|metric|indicatore|indicator)\b",
+            meaning_plain,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _is_noise_formula_row_v44(row: Dict[str, Any]) -> bool:
@@ -7386,7 +8200,9 @@ def postprocess_generated_answer(answer: str, query_text: str, sources: List[Sou
     ):
         out = _replace_final_sources_section(out, sources)
 
-    return quality_gate_postprocess(out, query_text, sources)
+    return normalize_math_markdown_for_reflex(
+        quality_gate_postprocess(out, query_text, sources)
+    )
 
 # =========================
 # 🔄 STATE MANAGEMENT
@@ -7445,40 +8261,45 @@ class State(rx.State):
     def get_context_by_tier(self, query: str, tier: str) -> str:
         try:
             query_vector = embedder.encode(query, normalize_embeddings=True).tolist()
+            tenant_filter = build_qdrant_tenant_filter(
+                extra_must=[
+                    models.FieldCondition(
+                        key="tier",
+                        match=models.MatchValue(value=tier),
+                    )
+                ]
+            )
 
-            # Compatibilità universale
-            if hasattr(qdrant_client_inst, 'query_points'):
+            if hasattr(qdrant_client_inst, "query_points"):
                 search_result = qdrant_client_inst.query_points(
                     collection_name=COLLECTION_NAME,
                     query=query_vector,
-                    query_filter=models.Filter(
-                        must=[models.FieldCondition(key="tier", match=models.MatchValue(value=tier))]
-                    ),
-                    limit=15
+                    query_filter=tenant_filter,
+                    limit=15,
+                    with_payload=True,
                 ).points
             else:
                 search_result = qdrant_client_inst.search(
                     collection_name=COLLECTION_NAME,
                     query_vector=query_vector,
-                    query_filter=models.Filter(
-                        must=[models.FieldCondition(key="tier", match=models.MatchValue(value=tier))]
-                    ),
-                    limit=15
+                    query_filter=tenant_filter,
+                    limit=15,
+                    with_payload=True,
                 )
-                
-            texts = []
-            for res in search_result:
-                p = res.payload or {}
-                content = safe_payload_text(p)
+
+            texts: List[str] = []
+            for result in search_result:
+                payload = result.payload or {}
+                if not qdrant_payload_is_visible(payload):
+                    continue
+                content = safe_payload_text(payload)
                 if content:
                     texts.append(content)
-
             return "\n".join(texts)
         except Exception as e:
             print(f"⚠️ Errore recupero Tier {tier}: {e}")
             return ""
 
-    # --- Metodi di gestione UI ---
     def toggle_inline_sources(self, msg_id: str):
         if self.inline_open_for == msg_id and self.inline_tab == "sources":
             self.inline_open_for = ""
@@ -7525,6 +8346,10 @@ class State(rx.State):
         self.show_sources_modal = False
 
     def on_load(self):
+        try:
+            init_resources()
+        except Exception as exc:
+            print(f"⚠️ Inizializzazione RAG on_load fallita: {exc}")
         self.refresh_gpu()
         self.refresh_backend_status()
 
@@ -7537,7 +8362,12 @@ class State(rx.State):
         if NEO4J_ENABLED:
             ready = ready and bool(neo4j_driver)
 
-        self.backend_status = "OK" if ready else "DEGRADED"
+        if ready:
+            self.backend_status = "OK"
+        elif RESOURCE_INIT_ERROR:
+            self.backend_status = f"DEGRADED: {RESOURCE_INIT_ERROR[:180]}"
+        else:
+            self.backend_status = "INITIALIZING"
 
 
 
@@ -7562,12 +8392,22 @@ class State(rx.State):
         # Import necessario per la gestione asincrona della UI
         import asyncio 
 
+        if embedder is None or qdrant_client_inst is None or llm_client is None:
+            await asyncio.to_thread(init_resources)
+            self.refresh_backend_status()
+
         if not self.input_text.strip() or self.is_processing:
             return
 
         user_query = self.input_text.strip()
         self.input_text = ""
         self.is_processing = True
+
+        session_obj = getattr(getattr(self, "router", None), "session", None)
+        session_user_id = str(getattr(session_obj, "client_token", "") or os.getenv("RAG_USER_ID", "service-user"))
+        tenant_token = _CURRENT_TENANT_CONTEXT.set(
+            resolve_tenant_context(request_id=str(uuid.uuid4()), user_id=session_user_id)
+        )
         
         # English instructions for the model
         language_reminder = "\n\nCRITICAL: You MUST detect the language of the user's question and answer EXCLUSIVELY in that same language."
@@ -7623,7 +8463,7 @@ class State(rx.State):
                     ChatMessage(
                         id=str(uuid.uuid4()),
                         role="assistant",
-                        content=math_answer,
+                        content=normalize_math_markdown_for_reflex(math_answer),
                         sources=[],
                         debug_md=prepare_debug_for_ui(
                             "### 🔎 Audit (Deterministic Math Direct Mode)\n"
@@ -7749,6 +8589,7 @@ class State(rx.State):
                     )
 
                 sources, debug_md = retrieve_v2(retrieval_query, active_doc=active_doc_for_query)
+                sources = filter_sources_for_current_organization(sources)
                 sources = dedupe_sources_for_answer(sources)
                 # --- FINE NUOVA LOGICA ---
 
@@ -7852,7 +8693,7 @@ class State(rx.State):
                             ChatMessage(
                                 id=str(uuid.uuid4()),
                                 role="assistant",
-                                content=formula_answer,
+                                content=normalize_math_markdown_for_reflex(formula_answer),
                                 sources=prepare_sources_for_ui(filter_sources_for_formula_answer(user_query, sources)),
                                 debug_md=prepare_debug_for_ui(
                                     (debug_md or "")
@@ -7989,10 +8830,17 @@ class State(rx.State):
                                     score=1.0,
                                     tier="A",
                                     db_origin="Qdrant Forced Tier A",
-                                    section_hint="Forced methodology context"
+                                    section_hint="Forced methodology context",
+                                    scope="GLOBAL",
+                                    organization_id=None,
+                                    status="active",
+                                    corpus_version=CORPUS_VERSION,
+                                    request_id=get_tenant_context().request_id,
                                 )
                             )
                                 
+                sources = filter_sources_for_current_organization(sources)
+
                 # 2. RAGGRUPPAMENTO FONTI CON BUDGET EQUO PER SORGENTE
                 c_a_list, c_b_list, c_c_list, c_g_list = [], [], [], []
                 current_context_length = 0
@@ -8323,6 +9171,7 @@ class State(rx.State):
                 self.messages[-1].debug_md = prepare_debug_for_ui(debug_md)
                 yield
         finally:
+            _CURRENT_TENANT_CONTEXT.reset(tenant_token)
             self.is_processing = False
             self.refresh_gpu()
 
@@ -8379,9 +9228,11 @@ def message_ui(msg: ChatMessage):
             rx.box(
                 rx.markdown(
                     msg.content,
+                    use_math=True,
+                    use_katex=True,
+                    use_gfm=True,
+                    class_name="rag-markdown",
                     width="100%",
-                    overflow_wrap="anywhere",
-                    word_break="break-word",
                 ),
                 width="100%",
                 min_width="0",
@@ -8842,7 +9693,7 @@ def index():
 def _looks_threshold_rule(text: str) -> bool:
     """
     v4.5: riconosce regole soglia anche quando i valori sono in LaTeX,
-    es. 5\% oppure 1\text{ milione}.
+    es. 5\\% oppure 1\\text{ milione}.
     """
     raw = text or ""
     plain = _formula_plain_text(raw).lower()
@@ -8879,20 +9730,80 @@ def filter_sources_for_formula_answer(query_text: str, sources: List[SourceItem]
 # ============================================================
 def _formula_display_text(value: Any, max_len: int = 600) -> str:
     """
-    Cleans formula/rule text for Markdown output.
-    Fixes literal LaTeX artefacts such as \t from \text and removes math wrappers.
+    Produce una rappresentazione testuale leggibile senza modificare i
+    comandi LaTeX per sostituzioni parziali.
+
+    In particolare ``\\left`` non deve mai essere interpretato come ``\\le``.
     """
-    text = str(value or "")
-    # literal escape artefacts coming from broken LaTeX/OCR, not real tabs only
-    text = text.replace("\\t", " ").replace("\\n", " ").replace("\\r", " ")
+    text = _strip_math_wrappers(_normalize_latex_value(str(value or "")))
     text = text.replace("\t", " ").replace("\n", " ").replace("\r", " ")
     text = text.replace("$$$", "$$")
     text = re.sub(r"^`+|`+$", "", text).strip()
-    text = re.sub(r"^\$+|\$+$", "", text).strip()
-    # normalize broken text macros: ext{...}, \text{...}, text{...}
-    text = re.sub(r"(?<![A-Za-z\\])ext\{([^}]*)\}", r"\1", text)
-    text = re.sub(r"\\text\{([^}]*)\}", r"\1", text)
-    text = re.sub(r"\btext\{([^}]*)\}", r"\1", text)
+
+    for _ in range(8):
+        previous = text
+        text = re.sub(
+            r"\\(?:mathrm|mathbf|mathit|text|operatorname)\s*\{([^{}]*)\}",
+            r"\1",
+            text,
+        )
+        if text == previous:
+            break
+
+    text = text.replace(r"\left", "").replace(r"\right", "")
+
+    def replace_fraction_plain(expression: str) -> str:
+        marker = r"\frac"
+        while marker in expression:
+            pos = expression.find(marker)
+            cursor = pos + len(marker)
+            while cursor < len(expression) and expression[cursor].isspace():
+                cursor += 1
+            if cursor >= len(expression) or expression[cursor] != "{":
+                break
+
+            def read_group(open_index: int):
+                depth = 0
+                for i in range(open_index, len(expression)):
+                    if expression[i] == "{":
+                        depth += 1
+                    elif expression[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return expression[open_index + 1:i], i + 1
+                return None, open_index
+
+            numerator, after_num = read_group(cursor)
+            if numerator is None:
+                break
+            while after_num < len(expression) and expression[after_num].isspace():
+                after_num += 1
+            if after_num >= len(expression) or expression[after_num] != "{":
+                break
+            denominator, after_den = read_group(after_num)
+            if denominator is None:
+                break
+            replacement = (
+                f"({replace_fraction_plain(numerator)})/"
+                f"({replace_fraction_plain(denominator)})"
+            )
+            expression = expression[:pos] + replacement + expression[after_den:]
+        return expression
+
+    text = replace_fraction_plain(text)
+
+    text = text.replace(r"\sum", "Σ")
+    text = text.replace(r"\prod", "Π")
+    text = text.replace(r"\times", " × ")
+    text = text.replace(r"\cdot", " · ")
+
+    # Boundary di comando obbligatorio: evita ``\left -> ≤ft``.
+    text = re.sub(r"\\leq?(?![A-Za-z])", " ≤ ", text)
+    text = re.sub(r"\\geq?(?![A-Za-z])", " ≥ ", text)
+    text = re.sub(r"\\neq(?![A-Za-z])", " ≠ ", text)
+    text = re.sub(r"\\Rightarrow(?![A-Za-z])", " ⇒ ", text)
+    text = re.sub(r"\\rightarrow(?![A-Za-z])", " → ", text)
+
     text = text.replace(r"\%", "%")
     text = re.sub(r"[{}]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -8900,23 +9811,47 @@ def _formula_display_text(value: Any, max_len: int = 600) -> str:
     if len(text) > max_len:
         text = text[:max_len].rstrip() + "..."
     return text
-
-
 def _formula_plain_text(value: str) -> str:
     return _formula_display_text(value, 1000)
 
 
+
 def _normalize_latex_value(value: str) -> str:
+    """
+    Normalizza escape tecnici senza riscrivere la semantica della formula.
+
+    Supporta sia comandi LaTeX normali (``\\frac``) sia comandi rimasti
+    doppiamente escapati nel testo persistito (``\\\\frac``).
+    """
     v = str(value or "").strip()
-    v = v.replace("\\t", " ").replace("\\n", " ").replace("\\r", " ")
+
+    v = re.sub(r"\t(?=imes\b|ext\{)", r"\\t", v)
+    v = re.sub(r"\r(?=ight\b)", r"\\r", v)
+    v = re.sub(r"\f(?=rac\b)", r"\\f", v)
+    v = re.sub("\x08(?=egin\\b)", r"\\b", v)
     v = v.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+
+    latex_commands = (
+        "frac", "sum", "prod", "left", "right", "mathrm", "mathbf",
+        "mathit", "text", "operatorname", "cdot", "times", "leq", "le",
+        "geq", "ge", "neq", "sqrt", "%", "_", "[", "]", "(", ")",
+    )
+    command_pattern = "|".join(re.escape(cmd) for cmd in latex_commands)
+    v = re.sub(
+        rf"\\{{2,}}(?=(?:{command_pattern})(?:\b|[^A-Za-z]))",
+        lambda _m: "\\",
+        v,
+    )
+
     v = v.replace("$$$", "$$")
-    v = re.sub(r"(?<!\\)ext\{", r"\\text{", v)
+    v = re.sub(r"(?<![A-Za-z\\])ight(?=\s*[)\]}])", r"\\right", v)
+    v = re.sub(r"(?<![A-Za-z\\])imes(?=\s*(?:\d|[A-Za-z\\({]))", r"\\times", v)
+    v = re.sub(r"(?<![A-Za-z\\])rac(?=\s*\{)", r"\\frac", v)
+    v = re.sub(r"(?<![A-Za-z\\])ext\{", r"\\text{", v)
+
     v = re.sub(r"\${3,}", "$$", v)
     v = re.sub(r"\s+", " ", v).strip()
     return v
-
-
 def _threshold_rule_name(name: str, formula_or_text: str) -> str:
     plain = _formula_plain_text(formula_or_text)
     n = _formula_display_text(name, 120)
@@ -8968,8 +9903,14 @@ def _classify_formula_row(row: Dict[str, Any]) -> Dict[str, Any]:
     if _looks_computational_formula(latex):
         rr["name"] = original_name
         rr["tipo"] = "Formula computazionale"
-        rr["latex"] = _formula_display_text(latex, 700)
-        rr["meaning"] = meaning or "Formula computazionale esplicita presente nella fonte recuperata."
+
+        # Il LaTeX deve essere preservato, non convertito in plain text.
+        rr["latex"] = latex
+
+        rr["meaning"] = (
+            meaning
+            or "Formula computazionale esplicita presente nella fonte recuperata."
+        )
         return rr
 
     if _looks_definitional_metric(latex, meaning):
@@ -9031,7 +9972,10 @@ def _is_noise_formula_row_v45(row: Dict[str, Any]) -> bool:
     if tipo == "regola soglia":
         return not _looks_threshold_rule(" ".join([name, formula, str(row.get("meaning") or "")]))
 
-    if name in generic_names:
+    if (
+        name in generic_names
+        and tipo not in {"formula computazionale", "regola soglia"}
+    ):
         return True
 
     # Exclude isolated values if they are not part of a threshold rule.
@@ -9190,26 +10134,53 @@ def _aggregate_threshold_rules(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
     return out
 
 
-def _formula_metrics_table(title: str, rows: List[Dict[str, Any]]) -> str:
+
+def _formula_metrics_table(
+    title: str,
+    rows: List[Dict[str, Any]],
+) -> str:
     if not rows:
         return ""
-    lines = [
-        f"**{title}**",
-        "",
-        "| Nome / metrica | Tipo | Formula / regola | Significato | Fonte | Pagina |",
-        "|---|---|---|---|---|---:|",
-    ]
-    for r in rows:
-        lines.append(
-            f"| {_formula_md_cell(r.get('name') or 'N/D', 180)} | "
-            f"{_formula_md_cell(r.get('tipo') or 'N/D', 120)} | "
-            f"{_formula_md_cell(r.get('latex') or 'formula esplicita non recuperata', 520)} | "
-            f"{_formula_md_cell(r.get('meaning') or '', 340)} | "
-            f"{_formula_md_cell(r.get('filename') or 'N/D', 180)} | "
-            f"{int(r.get('page') or 0)} |"
-        )
-    return "\n".join(lines)
 
+    lines = [f"**{title}**", ""]
+
+    for index, row in enumerate(rows, start=1):
+        name = _formula_display_text(
+            row.get("name") or f"Formula {index}", 180
+        )
+        formula = _strip_dangling_math_delimiters_v416(
+            str(row.get("latex") or "formula esplicita non recuperata")
+        )
+        row_type = _formula_display_text(row.get("tipo") or "N/D", 120)
+        meaning = _formula_display_text(row.get("meaning") or "", 340)
+        filename = _formula_display_text(row.get("filename") or "N/D", 180)
+        page = int(row.get("page") or 0)
+
+        plain_formula = _formula_plain_text(formula)
+        lines.extend([
+            f"### {index}. {name}",
+            "",
+            f"- **Formula testuale:** `{plain_formula}`",
+            "",
+            "- **Formula LaTeX:**",
+            "",
+            "$$",
+            formula,
+            "$$",
+            "",
+        ])
+
+        if row_type.lower() != "formula computazionale":
+            lines.append(f"- **Tipo:** {row_type}")
+            if meaning:
+                lines.append(f"- **Significato:** {meaning}")
+
+        lines.extend([
+            f"- **Fonte:** {filename}, pagina {page}",
+            "",
+        ])
+
+    return "\n".join(lines).strip()
 
 def _threshold_rules_table(title: str, rows: List[Dict[str, Any]]) -> str:
     if not rows:
@@ -9461,222 +10432,1099 @@ def _formula_is_kg_aggregate_source_v411(row: Dict[str, Any]) -> bool:
 
 def _looks_computational_formula(latex: str) -> bool:
     """
-    v4.11 stricter computational formula detector.
-
-    A computable formula must contain a real mathematical operator/function.
-    Equality with prose on the right side is NOT computable, even if the text
-    contains numbers or KG metadata tokens.
+    Riconosce formule computazionali tramite struttura matematica, non tramite
+    nomi di metriche o parole legate a uno specifico dominio.
     """
-    v = _strip_math_wrappers(_normalize_latex_value(str(latex or "")))
-    vl = v.lower()
+    value = _strip_math_wrappers(
+        _normalize_latex_value(str(latex or ""))
+    )
+    value_lower = value.lower()
 
-    if not v or "formula esplicita non recuperata" in vl:
+    if not value or "formula esplicita non recuperata" in value_lower:
         return False
 
-    if _formula_has_kg_artifacts_v411(v):
+    if _formula_has_kg_artifacts_v411(value):
         return False
 
-    # Strong mathematical constructs.
-    if any(x in v for x in ["\\frac", "\\sum", "\\prod", "√", "^", "×", "*", "/", "÷"]):
-        return True
+    if "=" not in value:
+        return bool(
+            re.search(
+                r"\\frac|\\sum|\\prod|[+\-*/×÷^]",
+                value,
+                flags=re.IGNORECASE,
+            )
+        )
 
-    if "=" not in v:
-        return False
-
-    left, right = v.split("=", 1)
+    left, right = value.split("=", 1)
     left = left.strip()
-    right_clean = right.strip()
-    right_plain = _formula_display_text(right_clean, 1000)
-    right_l = right_plain.lower()
+    right = right.strip()
 
-    if not left or not right_clean:
+    if not left or not right:
         return False
 
-    # Explicit text/prose definitions are definitional metrics, not formulas.
-    if re.fullmatch(r"\\?text\{[^}]+\}", right_clean):
+    if re.fullmatch(r"\\?text\{[^}]+\}", right):
         return False
 
-    if re.search(r"\b(tempo medio|mean time|necessario per|impiegato per|rilevare|risolvere|incident[ei]?|definizione|definition)\b", right_l):
+    right_plain = _formula_display_text(right, 1000)
+    word_pairs = re.findall(
+        r"\b[A-Za-zÀ-ÿ]{2,}\s+[A-Za-zÀ-ÿ]{2,}\b",
+        right_plain,
+    )
+    operator_tokens = re.findall(
+        r"[+\-*/×÷^]|\\frac|\\sum|\\prod|\\operatorname",
+        right,
+        flags=re.IGNORECASE,
+    )
+    has_strong_math_construct = bool(
+        re.search(
+            r"\\frac|\\sum|\\prod|\\operatorname|[()^]",
+            right,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    # Una sequenza prevalentemente discorsiva con un simbolo incidentale
+    # non è una formula computazionale.
+    if len(word_pairs) >= 2 and len(operator_tokens) <= 1:
         return False
 
-    # Equality is computable only when the RHS has math operators/functions or
-    # a numeric expression, not arbitrary prose with incidental numbers.
-    has_math_operator = bool(re.search(r"[+\-*/×÷^]|\\frac|\\sum|\\prod|sqrt|log|exp|min|max|avg|mean", right_clean, re.IGNORECASE))
-    if has_math_operator:
+    if operator_tokens and (
+        has_strong_math_construct
+        or len(operator_tokens) >= 1
+    ):
         return True
 
-    # Pure numeric assignment can be a value, but not enough for a formula in this RAG mode.
-    if re.fullmatch(r"\d+(?:[,.]\d+)?\s*(?:%|per cento|percent)?", right_plain):
+    # Un'assegnazione numerica isolata è un valore, non una formula.
+    if re.fullmatch(
+        r"\d+(?:[,.]\d+)?\s*(?:%|per cento|percent)?",
+        right_plain,
+    ):
         return False
 
     return False
 
 
-def _formula_row_quality_v411(row: Dict[str, Any]) -> Tuple[int, int, int]:
-    """
-    Higher is better. Used to keep the best duplicate when the same metric is
-    found through both document text and KG aggregate lookup.
-    """
+
+def _formula_row_quality_v411(row: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
+    """Attribuisce priorità alla formula documentale nominata e ben formata."""
     fname = str(row.get("filename") or "")
     page = int(row.get("page") or 0)
-    text = " ".join([str(row.get("name") or ""), str(row.get("latex") or ""), str(row.get("meaning") or "")])
+    name = str(row.get("name") or "")
+    latex = str(row.get("latex") or "")
+    text = " ".join([name, latex, str(row.get("meaning") or "")])
+    origin = str(row.get("formula_origin") or "")
     is_kg = _formula_is_kg_aggregate_source_v411(row)
     has_artifacts = _formula_has_kg_artifacts_v411(text)
-    has_real_doc = bool(fname and fname.lower() not in {"kg", "neo4j", "neo4j knowledge graph", "n/d"} and page > 0)
+    has_real_doc = bool(
+        fname
+        and fname.lower() not in {"kg", "neo4j", "neo4j knowledge graph", "n/d"}
+        and page > 0
+    )
+    named = 0 if _is_generic_formula_name(name) else 1
+    clean_latex = 0 if re.search(r"(?<![A-Za-z])(?:ight|imes|rac)(?![A-Za-z])", latex) else 1
+    origin_score = {
+        "document_equation": 3,
+        "latex": 2,
+        "knowledge_graph": 1,
+    }.get(origin, 0)
     return (
         2 if has_real_doc else (0 if is_kg else 1),
+        named,
+        clean_latex,
+        origin_score,
         0 if has_artifacts else 1,
-        min(len(_formula_display_text(row.get("meaning") or "", 1000)), 500),
     )
 
 
+
+# ============================================================
+# FORMULA SOURCE INTEGRITY GUARD - v4.14
+# ============================================================
+def _formula_has_invalid_latex_syntax_v414(value: Any) -> bool:
+    """
+    Rifiuta formule sintatticamente corrotte o ricostruite da nomi riservati
+    LaTeX scambiati per variabili/funzioni.
+    """
+    v = _normalize_latex_value(str(value or "").strip())
+    if not v:
+        return False
+
+    if re.search(r"\\(?:operatorname|mathrm|mathbf|mathit|text)(?!\s*\{)", v):
+        return True
+    if "\\№" in v or "№(" in v:
+        return True
+    if re.search(r"(?:≤|≥)\s*ft\b", v, flags=re.IGNORECASE):
+        return True
+    if v.count("{") != v.count("}"):
+        return True
+
+    reserved = r"left|right|frac|mathrm|mathbf|mathit|text|cdot|times|leq|geq|neq"
+    if re.search(rf"\\operatorname\{{(?:{reserved})\}}", v, flags=re.IGNORECASE):
+        return True
+    if re.search(rf"\\mathrm\{{(?:{reserved})\}}", v, flags=re.IGNORECASE):
+        return True
+    if "```" in v or re.search(r"(?:Formula\s+LaTeX|Formula\s+testuale)\s*:", v, re.I):
+        return True
+
+    return False
+def _scope_formula_sources_to_requested_document_v414(
+    query_text: str,
+    sources: List[SourceItem],
+) -> List[SourceItem]:
+    """
+    Applica il document scope e, quando disponibile, usa la copia canonica
+    arricchita da PostgreSQL al posto dei duplicati vettoriali/semantici.
+    """
+    requested_doc = extract_requested_document(query_text)
+    if not requested_doc:
+        return list(sources or [])
+
+    scoped: List[SourceItem] = []
+    for source in sources or []:
+        candidate = {"filename": str(getattr(source, "filename", "") or "")}
+        if candidate_matches_requested_doc(candidate, requested_doc):
+            scoped.append(source)
+
+    canonical = [
+        source
+        for source in scoped
+        if (
+            bool(str(getattr(source, "pg_ingestion_ts", "") or "").strip())
+            or bool(str(getattr(source, "pg_source_name", "") or "").strip())
+            or "PG_Enrich" in str(getattr(source, "db_origin", "") or "")
+            or str(getattr(source, "db_origin", "") or "").startswith("PostgresDocScope")
+        )
+    ]
+
+    return canonical or scoped
 def clean_formula_rows(rows: List[Dict[str, Any]], max_rows: int = 10) -> List[Dict[str, Any]]:
-    """
-    v4.11 clean-up:
-    - reclassify rows with stricter computational detection;
-    - remove generic KG aggregate artefact rows;
-    - if a KG aggregate row duplicates a document-backed metric, keep the
-      document-backed row only;
-    - preserve threshold aggregation inputs.
-    """
+    """Classifica e deduplica formule equivalenti provenienti da più database."""
     classified: List[Dict[str, Any]] = []
 
-    for r in rows or []:
-        rr = _classify_formula_row(r)
-
-        # Drop pure aggregate/generic KG artefacts.
-        name_l = _formula_display_text(rr.get("name") or "", 160).lower()
-        if name_l in {"formule collegate", "latex", "formula from knowledge graph"}:
+    for order, row in enumerate(rows or []):
+        # v4.14 - Non tentare di riparare semanticamente formule corrotte.
+        # Vengono scartate; una sorgente raw/documentale valida ha priorità.
+        if _formula_has_invalid_latex_syntax_v414(row.get("latex")):
             continue
 
-        if _is_noise_formula_row_v45(rr):
+        classified_row = _classify_formula_row(row)
+        classified_row["_formula_order"] = order
+
+        name_lower = _formula_display_text(
+            classified_row.get("name") or "", 160
+        ).lower()
+        if name_lower in {"formule collegate", "latex", "formula from knowledge graph"}:
+            continue
+        if _is_noise_formula_row_v45(classified_row):
             continue
 
-        # If KG artefacts forced a bad row, never keep it as computational.
-        if _formula_is_kg_aggregate_source_v411(rr) and str(rr.get("tipo") or "").lower() == "formula computazionale":
-            rr["tipo"] = "Metrica definitoria"
-            rr["latex"] = "formula computazionale non recuperata"
-            rr["meaning"] = "Definizione testuale della metrica; formula computazionale non recuperata nella fonte."
+        classified.append(classified_row)
 
-        classified.append(rr)
+    def identity_key(row: Dict[str, Any]) -> Tuple[str, str]:
+        row_type = str(row.get("tipo") or "").lower()
+        if row_type == "formula computazionale":
+            identity = _canonical_formula_identity(str(row.get("latex") or ""))
+            return "formula", identity
+        if row_type == "regola soglia":
+            identity = re.sub(
+                r"\s+", " ", _formula_display_text(row.get("latex") or "", 900).lower()
+            ).strip()
+            return "threshold", identity[:400]
+        name = re.sub(r"[^a-z0-9]+", "", str(row.get("name") or "").lower())
+        return row_type, name
 
-    # First pass: keep best row per metric/type/document/page.
-    by_key: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
-    for rr in classified:
-        tipo = str(rr.get("tipo") or "").lower()
-        fname = normalize_doc_name(str(rr.get("filename") or ""))
-        page = int(rr.get("page") or 0)
-        name_norm = re.sub(r"[^a-z0-9]+", "", str(rr.get("name") or "").lower())
-        formula_norm = re.sub(r"\s+", " ", _formula_display_text(rr.get("latex") or "", 1000).lower()).strip()
+    by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    first_order: Dict[Tuple[str, str], int] = {}
 
-        if tipo == "regola soglia":
-            key = ("threshold:" + formula_norm[:260], tipo, fname, page)
-        else:
-            key = (name_norm, tipo, fname, page)
-
+    for row in classified:
+        key = identity_key(row)
+        if not key[1]:
+            continue
+        first_order.setdefault(key, int(row.get("_formula_order") or 0))
         existing = by_key.get(key)
-        if existing is None or _formula_row_quality_v411(rr) > _formula_row_quality_v411(existing):
-            by_key[key] = rr
 
-    deduped = list(by_key.values())
-
-    # Second pass: remove KG aggregate definitional rows when the same canonical
-    # metric exists in a real document-backed source.
-    real_doc_metric_keys = {
-        (re.sub(r"[^a-z0-9]+", "", str(r.get("name") or "").lower()), str(r.get("tipo") or "").lower())
-        for r in deduped
-        if not _formula_is_kg_aggregate_source_v411(r)
-        and normalize_doc_name(str(r.get("filename") or "")) not in {"", "kg", "neo4j", "neo4jknowledgegraph"}
-        and int(r.get("page") or 0) > 0
-    }
-
-    filtered: List[Dict[str, Any]] = []
-    for r in deduped:
-        key = (re.sub(r"[^a-z0-9]+", "", str(r.get("name") or "").lower()), str(r.get("tipo") or "").lower())
-        if _formula_is_kg_aggregate_source_v411(r) and key in real_doc_metric_keys:
+        if existing is None:
+            by_key[key] = row
             continue
-        filtered.append(r)
 
+        current_quality = _formula_row_quality_v411(row)
+        existing_quality = _formula_row_quality_v411(existing)
+        if current_quality > existing_quality:
+            # Se la riga scelta ha un nome generico, conserva il nome migliore
+            # già trovato per la stessa identità matematica.
+            if _is_generic_formula_name(row.get("name")) and not _is_generic_formula_name(existing.get("name")):
+                row["name"] = existing.get("name")
+            by_key[key] = row
+        elif _is_generic_formula_name(existing.get("name")) and not _is_generic_formula_name(row.get("name")):
+            existing["name"] = row.get("name")
+
+    deduped = list(by_key.items())
     priority = {
         "formula computazionale": 0,
         "regola soglia": 1,
         "metrica definitoria": 2,
         "metrica/elemento citato": 3,
     }
-    filtered.sort(key=lambda x: (
-        priority.get(str(x.get("tipo") or "").lower(), 9),
-        str(x.get("filename") or ""),
-        int(x.get("page") or 0),
-        str(x.get("name") or ""),
-    ))
+    deduped.sort(
+        key=lambda pair: (
+            priority.get(str(pair[1].get("tipo") or "").lower(), 9),
+            first_order.get(pair[0], 10**9),
+        )
+    )
 
-    return filtered[:max_rows]
+    result = []
+    for _, row in deduped[:max_rows]:
+        row.pop("_formula_order", None)
+        result.append(row)
+    return result
+
+def _formula_examples_requested(query_text: str) -> bool:
+    q = (query_text or "").lower()
+
+    return bool(
+        re.search(
+            r"\b(esempio|esempi|example|examples)\b",
+            q,
+        )
+    )
+
+
+def _strip_dangling_math_delimiters_v416(value: str) -> str:
+    """Rimuove delimitatori matematici esterni, anche se rimasti spaiati."""
+    v = _strip_math_wrappers(_normalize_latex_value(value or "")).strip()
+    v = re.sub(r"^\s*\${1,2}\s*", "", v)
+    v = re.sub(r"\s*\${1,2}\s*$", "", v)
+    return v.strip()
+
+
+def _safe_eval_numeric_expression_v416(value: str) -> Optional[float]:
+    """
+    Valuta un'espressione aritmetica ASCII completamente numerica.
+
+    Sono consentiti soltanto numeri, parentesi, +, -, *, /, potenze e le
+    funzioni ``round`` e ``sqrt``. Nessun nome di variabile è ammesso.
+    """
+    expr = str(value or "").strip()
+    if not expr:
+        return None
+
+    expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**")
+    expr = re.sub(r"(?<=\d),(?=\d)", ".", expr)
+    expr = re.sub(r"\s+", "", expr)
+
+    # Se il modello ha restituito anche un'uguaglianza, valuta entrambi i lati
+    # e conserva il primo lato realmente numerico. Non si accettano variabili.
+    candidates = [expr]
+    if "=" in expr:
+        candidates = [part.strip() for part in expr.split("=") if part.strip()]
+
+    def evaluate_candidate(candidate: str) -> Optional[float]:
+        if not candidate:
+            return None
+        if re.search(r"[^0-9A-Za-z_.,+\-*/()]", candidate):
+            return None
+        residual = re.sub(r"\b(?:round|sqrt)\b", "", candidate, flags=re.I)
+        if re.search(r"[A-Za-z_]", residual):
+            return None
+        try:
+            node = ast.parse(candidate, mode="eval").body
+        except Exception:
+            return None
+
+        def evaluate(n):
+            if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+                return float(n.value)
+            if isinstance(n, ast.Num):
+                return float(n.n)
+            if isinstance(n, ast.BinOp) and type(n.op) in OPERATORS:
+                return float(OPERATORS[type(n.op)](evaluate(n.left), evaluate(n.right)))
+            if isinstance(n, ast.UnaryOp) and type(n.op) in OPERATORS:
+                return float(OPERATORS[type(n.op)](evaluate(n.operand)))
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and not n.keywords:
+                fn = n.func.id.lower()
+                args = [evaluate(arg) for arg in n.args]
+                if fn == "round" and 1 <= len(args) <= 2:
+                    return float(round(args[0], int(args[1]) if len(args) == 2 else 0))
+                if fn == "sqrt" and len(args) == 1 and args[0] >= 0:
+                    return float(args[0] ** 0.5)
+            raise TypeError("Espressione numerica non supportata")
+
+        try:
+            result = evaluate(node)
+            if result != result or abs(result) == float("inf"):
+                return None
+            return float(result)
+        except Exception:
+            return None
+
+    for candidate in candidates:
+        result = evaluate_candidate(candidate)
+        if result is not None:
+            return result
+    return None
+
+
+def _latex_numeric_candidates_v416(value: str) -> List[str]:
+    """Restituisce possibili lati numerici di una sostituzione LaTeX."""
+    v = _strip_dangling_math_delimiters_v416(value)
+    if not v:
+        return []
+
+    candidates = [v]
+    if "=" in v:
+        candidates = [part.strip() for part in v.split("=") if part.strip()]
+
+    out: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        clean = re.sub(
+            r"^(?:\\?(?:mathrm|mathbf|mathit|text)\s*\{[^{}]+\}|[A-Za-z_%][A-Za-z0-9_%\\]*)\s*",
+            "",
+            candidate,
+        ).strip()
+        clean = re.sub(r"(?:\\?%|%)\s*$", "", clean).strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            out.append(clean)
+
+    # In presenza di un'uguaglianza preferisce il lato che contiene
+    # l'operazione completa rispetto a un semplice risultato scalare.
+    out.sort(
+        key=lambda item: (
+            int(bool(re.search(r"\\frac|\\sqrt|\\times|\\cdot|[+*/()]", item))),
+            len(item),
+        ),
+        reverse=True,
+    )
+    return out
+
+
+def _safe_eval_numeric_latex_v416(value: str) -> Tuple[Optional[float], str]:
+    """
+    Valuta una sostituzione LaTeX numerica e restituisce anche l'espressione
+    effettivamente scelta. Le uguaglianze e le unità percentuali finali sono
+    tollerate, ma non vengono mai interpretate come variabili.
+    """
+    for candidate in _latex_numeric_candidates_v416(value):
+        expr = candidate
+        expr = expr.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+        expr = expr.replace(r"\left", "").replace(r"\right", "")
+        expr = expr.replace(r"\cdot", "*").replace(r"\cdotp", "*")
+        expr = expr.replace(r"\times", "*").replace("×", "*").replace("÷", "/")
+        expr = re.sub(r"\\(?:,|;|:|!|quad|qquad)\s*", "", expr)
+
+        def replace_command_group(text: str, command: str, replacement_builder):
+            marker = command
+            while marker in text:
+                pos = text.find(marker)
+                cursor = pos + len(marker)
+                while cursor < len(text) and text[cursor].isspace():
+                    cursor += 1
+                if cursor >= len(text) or text[cursor] != "{":
+                    break
+
+                depth = 0
+                end_group = None
+                for i in range(cursor, len(text)):
+                    if text[i] == "{":
+                        depth += 1
+                    elif text[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end_group = i + 1
+                            break
+                if end_group is None:
+                    break
+                inner = text[cursor + 1:end_group - 1]
+                text = text[:pos] + replacement_builder(inner) + text[end_group:]
+            return text
+
+        def replace_fraction(text: str) -> str:
+            marker = r"\frac"
+            while marker in text:
+                pos = text.find(marker)
+                cursor = pos + len(marker)
+                while cursor < len(text) and text[cursor].isspace():
+                    cursor += 1
+                if cursor >= len(text) or text[cursor] != "{":
+                    break
+
+                def read_group(open_index: int):
+                    depth = 0
+                    for i in range(open_index, len(text)):
+                        if text[i] == "{":
+                            depth += 1
+                        elif text[i] == "}":
+                            depth -= 1
+                            if depth == 0:
+                                return text[open_index + 1:i], i + 1
+                    return None, open_index
+
+                numerator, after_num = read_group(cursor)
+                if numerator is None:
+                    break
+                while after_num < len(text) and text[after_num].isspace():
+                    after_num += 1
+                if after_num >= len(text) or text[after_num] != "{":
+                    break
+                denominator, after_den = read_group(after_num)
+                if denominator is None:
+                    break
+                replacement = f"(({replace_fraction(numerator)})/({replace_fraction(denominator)}))"
+                text = text[:pos] + replacement + text[after_den:]
+            return text
+
+        expr = replace_fraction(expr)
+        expr = replace_command_group(expr, r"\sqrt", lambda inner: f"sqrt({inner})")
+        expr = re.sub(r"\\operatorname\s*\{\s*round\s*\}", "round", expr, flags=re.I)
+        expr = re.sub(r"\\(?:mathrm|text)\s*\{\s*round\s*\}", "round", expr, flags=re.I)
+        expr = expr.replace("{", "(").replace("}", ")")
+        expr = expr.replace("^", "**")
+        expr = re.sub(r"(?<=\d)\s*(?=\()", "*", expr)
+        expr = re.sub(r"(?<=\))\s*(?=\()", "*", expr)
+        expr = re.sub(r"(?<=\))\s*(?=\d)", "*", expr)
+        expr = re.sub(r"(?<=\d),(?=\d)", ".", expr)
+        expr = re.sub(r"\s+", "", expr)
+
+        result = _safe_eval_numeric_expression_v416(expr)
+        if result is not None:
+            return result, candidate
+
+    return None, ""
+
+
+def _format_verified_math_result_v416(
+    value: float,
+    original_result: str,
+    formula_latex: str = "",
+) -> str:
+    if abs(value - round(value)) < 1e-10:
+        rendered = str(int(round(value)))
+    else:
+        rendered = f"{value:.8f}".rstrip("0").rstrip(".")
+
+    percent_formula = bool(
+        re.search(r"(?:\\%|%)\s*=", formula_latex or "")
+        or re.search(r"\bpercent(?:uale)?\b", formula_latex or "", flags=re.I)
+    )
+    if "%" in (original_result or "") or percent_formula:
+        rendered += "%"
+    return rendered
+
+
+def _ascii_expression_to_latex_v416(value: str) -> str:
+    """Converte solo gli operatori ASCII essenziali per la visualizzazione."""
+    v = str(value or "").strip()
+    v = v.replace("**", "^")
+    v = v.replace("*", r" \cdot ")
+    return v
+
+
+def _parse_formula_examples_payload_v416(raw_result: str) -> Optional[Dict[str, Any]]:
+    json_text = re.sub(
+        r"^```(?:json)?\s*|\s*```$",
+        "",
+        str(raw_result or "").strip(),
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+    start = json_text.find("{")
+    end = json_text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        payload = json.loads(json_text[start:end + 1])
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+
+def _latex_fraction_parts_v417(value: str) -> Tuple[str, str]:
+    """Estrae numeratore e denominatore dalla prima frazione LaTeX valida."""
+    text = _strip_dangling_math_delimiters_v416(value or "")
+    text = text.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    marker = r"\frac"
+    pos = text.find(marker)
+    if pos < 0:
+        return "", ""
+
+    def read_group(open_index: int) -> Tuple[str, int]:
+        if open_index >= len(text) or text[open_index] != "{":
+            return "", open_index
+        depth = 0
+        for idx in range(open_index, len(text)):
+            if text[idx] == "{":
+                depth += 1
+            elif text[idx] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[open_index + 1:idx], idx + 1
+        return "", open_index
+
+    cursor = pos + len(marker)
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    numerator, after_num = read_group(cursor)
+    if not numerator:
+        return "", ""
+    cursor = after_num
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    denominator, _ = read_group(cursor)
+    return numerator.strip(), denominator.strip()
+
+
+def _formula_has_max_denominator_v417(formula_latex: str) -> bool:
+    """
+    True quando la prima frazione usa nel denominatore una variabile che
+    rappresenta esplicitamente un massimo teorico (nome contenente ``max``).
+    """
+    numerator, denominator = _latex_fraction_parts_v417(formula_latex)
+    if not denominator:
+        return False
+    den_plain = re.sub(r"[^A-Za-z0-9_]", "", denominator).lower()
+    num_plain = re.sub(r"[^A-Za-z0-9_]", "", numerator).lower()
+    return "max" in den_plain and "max" not in num_plain
+
+
+def _first_numeric_division_operands_v417(value: str) -> Tuple[Optional[float], Optional[float]]:
+    """Valuta gli operandi della prima divisione in un'espressione numerica AST-safe."""
+    expr = str(value or "").strip()
+    if not expr:
+        return None, None
+    expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**")
+    expr = re.sub(r"(?<=\d),(?=\d)", ".", expr)
+    if "=" in expr:
+        candidates = [part.strip() for part in expr.split("=") if part.strip()]
+        candidates.sort(key=lambda part: (part.count("/"), len(part)), reverse=True)
+        expr = candidates[0] if candidates else expr
+    try:
+        root = ast.parse(expr, mode="eval").body
+    except Exception:
+        return None, None
+
+    def find_division(node: ast.AST) -> Optional[ast.BinOp]:
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            return node
+        for child in ast.iter_child_nodes(node):
+            found = find_division(child)
+            if found is not None:
+                return found
+        return None
+
+    division = find_division(root)
+    if division is None:
+        return None, None
+    try:
+        left_expr = ast.unparse(division.left)
+        right_expr = ast.unparse(division.right)
+    except Exception:
+        return None, None
+    return (
+        _safe_eval_numeric_expression_v416(left_expr),
+        _safe_eval_numeric_expression_v416(right_expr),
+    )
+
+
+def _max_denominator_example_is_valid_v417(
+    formula_latex: str,
+    numeric_expression: str,
+) -> bool:
+    """
+    Impedisce esempi semanticamente impossibili quando la formula dichiara
+    esplicitamente un massimo al denominatore. Non si applica alle altre formule.
+    """
+    if not _formula_has_max_denominator_v417(formula_latex):
+        return True
+    numerator, denominator = _first_numeric_division_operands_v417(numeric_expression)
+    if numerator is None or denominator is None or denominator <= 0:
+        return False
+    return numerator <= denominator + 1e-12
+
+
+def _validate_formula_examples_item_v416(
+    formula: Dict[str, str],
+    item: Any,
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    """Valida gli esempi senza invalidare quelli già corretti."""
+    errors: List[str] = []
+    valid: List[Dict[str, str]] = []
+    examples = item.get("examples") if isinstance(item, dict) else None
+    if not isinstance(examples, list):
+        return [], ["campo examples assente o non valido"]
+
+    seen = set()
+    for example_index, example in enumerate(examples, start=1):
+        if len(valid) >= 2:
+            break
+        if not isinstance(example, dict):
+            errors.append(f"esempio {example_index}: oggetto JSON non valido")
+            continue
+
+        values = re.sub(
+            r"\s+", " ", str(example.get("values") or "").replace("`", "'")
+        ).strip()
+        numeric_expression = re.sub(
+            r"\s+", " ", str(
+                example.get("numeric_expression")
+                or example.get("expression")
+                or ""
+            ).replace("`", "'")
+        ).strip()
+        substitution_raw = re.sub(
+            r"\s+", " ", str(
+                example.get("substitution_latex")
+                or example.get("substitution")
+                or ""
+            ).replace("`", "'")
+        ).strip()
+        original_result = re.sub(
+            r"\s+", " ", str(example.get("result") or "").replace("`", "'")
+        ).strip()
+
+        if not values:
+            errors.append(f"esempio {example_index}: values mancante")
+            continue
+
+        verified_value: Optional[float] = None
+        chosen_latex = ""
+
+        if numeric_expression:
+            verified_value = _safe_eval_numeric_expression_v416(numeric_expression)
+
+        if substitution_raw:
+            normalized_latex = _strip_dangling_math_delimiters_v416(substitution_raw)
+            if normalized_latex and not _formula_has_invalid_latex_syntax_v414(normalized_latex):
+                latex_value, chosen_candidate = _safe_eval_numeric_latex_v416(normalized_latex)
+                if verified_value is None:
+                    verified_value = latex_value
+                if latex_value is not None and chosen_candidate:
+                    chosen_latex = chosen_candidate
+
+        if verified_value is None:
+            errors.append(
+                f"esempio {example_index}: nessuna espressione completamente numerica valutabile"
+            )
+            continue
+
+        if not _max_denominator_example_is_valid_v417(
+            formula.get("formula", ""),
+            numeric_expression,
+        ):
+            errors.append(
+                f"esempio {example_index}: il numeratore supera il massimo dichiarato dal denominatore"
+            )
+            continue
+
+        if not chosen_latex:
+            if numeric_expression:
+                chosen_latex = _ascii_expression_to_latex_v416(numeric_expression)
+            else:
+                errors.append(f"esempio {example_index}: sostituzione visualizzabile assente")
+                continue
+
+        dedupe_key = (
+            re.sub(r"\s+", "", numeric_expression or chosen_latex),
+            round(float(verified_value), 12),
+        )
+        if dedupe_key in seen:
+            errors.append(f"esempio {example_index}: duplicato")
+            continue
+        seen.add(dedupe_key)
+
+        valid.append({
+            "values": values,
+            "substitution_latex": chosen_latex,
+            "result": _format_verified_math_result_v416(
+                verified_value,
+                original_result,
+                formula.get("formula", ""),
+            ),
+        })
+
+    if len(valid) < 2:
+        errors.append(f"ottenuti {len(valid)} esempi validi su 2 richiesti")
+    return valid[:2], errors
+
+
+def _request_formula_examples_v416(
+    query_text: str,
+    formulas: List[Dict[str, str]],
+    formula_indexes: List[int],
+    validation_feedback: Optional[Dict[int, List[str]]] = None,
+) -> Optional[Dict[str, Any]]:
+    requested = [
+        {
+            "formula_index": index,
+            **formulas[index - 1],
+        }
+        for index in formula_indexes
+        if 1 <= index <= len(formulas)
+    ]
+    if not requested:
+        return None
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Riceverai un elenco chiuso di formule già recuperate e verificate. "
+                "Non modificare, rinominare o aggiungere formule. Per ogni formula "
+                "genera esattamente due esempi numerici distinti. Restituisci "
+                "esclusivamente JSON valido con questa struttura: "
+                "{\"items\":[{\"formula_index\":1,\"examples\":["
+                "{\"values\":\"...\",\"numeric_expression\":\"...\","
+                "\"substitution_latex\":\"...\"},{\"values\":\"...\","
+                "\"numeric_expression\":\"...\",\"substitution_latex\":\"...\"}]}]}. "
+                "numeric_expression deve essere una singola espressione aritmetica "
+                "ASCII completamente numerica, senza variabili, unità, percentuali, "
+                "testo o segno di uguaglianza; sono ammessi solo numeri, parentesi, "
+                "+, -, *, /, **, round e sqrt. substitution_latex deve rappresentare "
+                "la stessa identica operazione con tutte le variabili e sommatorie "
+                "sostituite da numeri. Non inserire il risultato, delimitatori $, $$, "
+                "\\(, \\) o Markdown. Usa il punto come separatore decimale. "
+                "Se una frazione usa al denominatore una variabile il cui nome "
+                "contiene 'max', scegli valori con numeratore minore o uguale al "
+                "denominatore. Usa nei valori testuali la stessa lingua della richiesta."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "original_request": query_text,
+                    "formulas": requested,
+                    "validation_feedback": validation_feedback or {},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        },
+    ]
+
+    raw_result = (call_ollama_chat_native(messages) or "").strip()
+    if not raw_result:
+        return None
+    return _parse_formula_examples_payload_v416(raw_result)
+
+
+def _generate_formula_examples(
+    query_text: str,
+    formula_rows: List[Dict[str, Any]],
+) -> str:
+    """
+    Genera due esempi per formula con validazione progressiva.
+
+    La prima chiamata è batch. Solo le formule mancanti o non valide vengono
+    richieste nuovamente. Un errore su una formula non elimina gli esempi già
+    validati delle altre formule.
+    """
+    formulas: List[Dict[str, str]] = []
+    for row in formula_rows or []:
+        name = str(row.get("name") or "").strip()
+        latex = _strip_dangling_math_delimiters_v416(str(row.get("latex") or ""))
+        if not name or not latex or "non recuperata" in latex.lower():
+            continue
+        formulas.append({"name": name, "formula": latex})
+
+    if not formulas:
+        return ""
+
+    validated: Dict[int, List[Dict[str, str]]] = {}
+    feedback: Dict[int, List[str]] = {}
+    all_indexes = list(range(1, len(formulas) + 1))
+
+    try:
+        # Primo tentativo batch.
+        payload = _request_formula_examples_v416(
+            query_text,
+            formulas,
+            all_indexes,
+        )
+        items = payload.get("items") if isinstance(payload, dict) else None
+        by_index: Dict[int, Any] = {}
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    index = int(item.get("formula_index"))
+                except Exception:
+                    continue
+                by_index[index] = item
+
+        for index in all_indexes:
+            valid, errors = _validate_formula_examples_item_v416(
+                formulas[index - 1],
+                by_index.get(index),
+            )
+            if len(valid) == 2:
+                validated[index] = valid
+            else:
+                feedback[index] = errors
+
+        # Ripara soltanto le formule fallite, con massimo due tentativi mirati.
+        for _attempt in range(2):
+            missing = [index for index in all_indexes if index not in validated]
+            if not missing:
+                break
+
+            for index in missing:
+                repair_payload = _request_formula_examples_v416(
+                    query_text,
+                    formulas,
+                    [index],
+                    {index: feedback.get(index, [])},
+                )
+                repair_items = (
+                    repair_payload.get("items")
+                    if isinstance(repair_payload, dict)
+                    else None
+                )
+                repair_item = None
+                if isinstance(repair_items, list):
+                    for candidate in repair_items:
+                        if not isinstance(candidate, dict):
+                            continue
+                        try:
+                            if int(candidate.get("formula_index")) == index:
+                                repair_item = candidate
+                                break
+                        except Exception:
+                            continue
+
+                valid, errors = _validate_formula_examples_item_v416(
+                    formulas[index - 1],
+                    repair_item,
+                )
+                if len(valid) == 2:
+                    validated[index] = valid
+                    feedback.pop(index, None)
+                else:
+                    feedback[index] = errors
+                    print(
+                        "⚠️ Formula examples validation failed "
+                        f"| formula_index={index} "
+                        f"| name={formulas[index - 1]['name'][:80]} "
+                        f"| errors={errors}"
+                    )
+
+        rendered: List[str] = []
+        for formula_index, formula in enumerate(formulas, start=1):
+            examples = validated.get(formula_index)
+            if not examples:
+                rendered.extend([
+                    f"#### {formula_index}. {_formula_display_text(formula['name'], 160)}",
+                    "",
+                    "- Esempi non prodotti: la risposta generativa non ha superato "
+                    "la validazione numerica deterministica.",
+                    "",
+                ])
+                continue
+
+            rendered.extend([
+                f"#### {formula_index}. {_formula_display_text(formula['name'], 160)}",
+                "",
+            ])
+            for example_index, example in enumerate(examples, start=1):
+                rendered.extend([
+                    f"**Esempio {example_index}**",
+                    "",
+                    f"- **Valori:** `{example['values']}`",
+                    "- **Sostituzione:**",
+                    "",
+                    "$$",
+                    example["substitution_latex"],
+                    "$$",
+                    "",
+                    f"- **Risultato:** **{example['result']}**.",
+                    "",
+                ])
+            rendered.append("")
+
+        return "\n".join(rendered).strip()
+
+    except Exception as exc:
+        print(f"⚠️ Formula examples generation error: {exc}")
+        return ""
 
 def _answer_formula_strict_core(query_text: str, sources: List[SourceItem]) -> Optional[str]:
     """
-    v4.8:
-    - keeps formulas/definitional metrics separate from normative thresholds;
-    - threshold rows use Elemento/Criterio/Ambito to avoid semantic ambiguity;
-    - no corpus-specific hardcoded mappings.
+    Costruisce una risposta deterministica per formule, metriche e soglie.
+
+    Le categorie richieste vengono determinate semanticamente; le formule
+    estratte non vengono inventate o riscritte dall'LLM.
     """
-    rows = clean_formula_rows(extract_formula_rows_from_sources(sources), max_rows=20)
+    rows = clean_formula_rows(
+        extract_formula_rows_from_sources(sources),
+        max_rows=30,
+    )
 
     if not rows:
         return (
             "**A) Risposta**\n\n"
-            "Non ho trovato formule computazionali, metriche definitorie o regole di scoring esplicite nelle fonti recuperate.\n\n"
-            "\n\n**B) Evidenze**\n\n"
-            "- Il sistema ha cercato formule, metriche e regole di scoring nei chunk recuperati e nel Knowledge Graph.\n\n"
-            "\n\n**C) Limiti / Conflitti**\n\n"
+            "Non ho trovato formule computazionali, metriche definitorie "
+            "o regole di scoring esplicite nelle fonti recuperate.\n\n"
+            "**B) Evidenze**\n\n"
+            "- Il sistema ha cercato formule, metriche e regole di scoring "
+            "nei chunk recuperati e nel Knowledge Graph.\n\n"
+            "**C) Limiti / Conflitti**\n\n"
             "- La risposta non inventa formule mancanti.\n"
-            "- Percentuali isolate, intestazioni o righe generiche non sono state considerate formule.\n\n"
+            "- Percentuali isolate, intestazioni o righe generiche non sono "
+            "state considerate formule.\n\n"
             "**D) Fonti**\n\n"
             "- Vedi pannello Fonti/Audit per i chunk recuperati."
         )
 
-    computational = [r for r in rows if str(r.get("tipo") or "").lower() == "formula computazionale"]
-    definitional = [r for r in rows if str(r.get("tipo") or "").lower() == "metrica definitoria"]
+    computational = [
+        row
+        for row in rows
+        if str(row.get("tipo") or "").lower()
+        == "formula computazionale"
+    ]
+    definitional = [
+        row
+        for row in rows
+        if str(row.get("tipo") or "").lower()
+        == "metrica definitoria"
+    ]
     thresholds = _aggregate_threshold_rules(rows)
-    cited = [r for r in rows if str(r.get("tipo") or "").lower() == "metrica/elemento citato"]
+    cited = [
+        row
+        for row in rows
+        if str(row.get("tipo") or "").lower()
+        == "metrica/elemento citato"
+    ]
 
-    primary_rows = computational + definitional
+    query_lower = (query_text or "").lower()
+    has_formula_terms = bool(
+        re.search(
+            r"\b(?:formula|formule|equazione|equazioni|formulas?|equations?)\b",
+            query_lower,
+        )
+    )
+    has_metric_terms = bool(
+        re.search(
+            r"\b(?:metrica|metriche|indicatore|indicatori|"
+            r"scoring|metrics?|indicators?)\b",
+            query_lower,
+        )
+    )
+    asks_only_formulas = has_formula_terms and not has_metric_terms
+
+    primary_rows = (
+        computational
+        if asks_only_formulas
+        else computational + definitional
+    )
+
     blocks: List[str] = []
 
     if primary_rows:
-        blocks.append(_formula_metrics_table("Formule computazionali e metriche recuperate", primary_rows[:8]))
+        title = (
+            "Formule computazionali recuperate"
+            if asks_only_formulas
+            else "Formule computazionali e metriche recuperate"
+        )
+        blocks.append(
+            _formula_metrics_table(
+                title,
+                primary_rows,
+            )
+        )
 
-    if thresholds:
-        blocks.append(_threshold_rules_table("Soglie normative recuperate ma non classificabili come scoring", thresholds[:4]))
+        if _formula_examples_requested(query_text) and computational:
+            examples_text = _generate_formula_examples(
+                query_text,
+                computational,
+            )
+            if examples_text:
+                blocks.append(
+                    "### Esempi applicativi illustrativi\n\n"
+                    + examples_text
+                )
+            else:
+                blocks.append(
+                    "### Esempi applicativi illustrativi\n\n"
+                    "Le formule sono state recuperate, ma non è stato possibile "
+                    "produrre esempi strutturati validi."
+                )
 
-    if cited and not primary_rows and not thresholds:
-        blocks.append(_formula_metrics_table("Elementi citati senza formula esplicita", cited[:6]))
+    if thresholds and not asks_only_formulas:
+        blocks.append(
+            _threshold_rules_table(
+                "Soglie normative recuperate ma non classificabili come scoring",
+                thresholds,
+            )
+        )
+
+    if (
+        cited
+        and not asks_only_formulas
+        and not primary_rows
+        and not thresholds
+    ):
+        blocks.append(
+            _formula_metrics_table(
+                "Elementi citati senza formula esplicita",
+                cited,
+            )
+        )
 
     if not blocks:
-        blocks.append("Non ho trovato formule computazionali o metriche sufficientemente esplicite nelle fonti recuperate.")
+        blocks.append(
+            "Non ho trovato formule computazionali sufficientemente "
+            "esplicite nelle fonti recuperate."
+        )
 
-    rows_for_sources: List[Dict[str, Any]] = primary_rows + thresholds + cited
-    used_files = []
+    rows_for_sources: List[Dict[str, Any]] = (
+        primary_rows
+        if asks_only_formulas
+        else primary_rows + thresholds + cited
+    )
+
+    used_files: List[str] = []
     seen_files = set()
-    for r in rows_for_sources:
-        fname = str(r.get("filename") or "").strip()
-        page = int(r.get("page") or 0)
-        if not fname:
+    for row in rows_for_sources:
+        filename = str(row.get("filename") or "").strip()
+        page = int(row.get("page") or 0)
+        if not filename:
             continue
-        label = f"{fname} (p.{page})" if page else fname
+        label = f"{filename} (p.{page})" if page else filename
         if label not in seen_files:
             seen_files.add(label)
             used_files.append(label)
 
-    missing_terms = _requested_formula_terms_missing(query_text, primary_rows + thresholds + cited)
+    missing_terms = _requested_formula_terms_missing(
+        query_text,
+        rows_for_sources,
+    )
 
     evidence_lines = [
-        "- Gli elementi sono stati classificati in modo deterministico.",
-        "- Le metriche definitorie sono distinte dalle formule computazionali.",
+        "- Gli elementi sono stati classificati in modo deterministico."
     ]
-    if thresholds:
-        evidence_lines.append("- Le soglie normative sono riportate in una tabella separata con criterio e ambito, perché non sono formule né regole di scoring.")
+    if asks_only_formulas:
+        evidence_lines.append(
+            "- Sono state incluse esclusivamente le formule computazionali "
+            "esplicite recuperate dalle fonti."
+        )
+    else:
+        evidence_lines.append(
+            "- Le metriche definitorie sono distinte dalle formule "
+            "computazionali."
+        )
+
+    if thresholds and not asks_only_formulas:
+        evidence_lines.append(
+            "- Le soglie normative sono riportate separatamente perché non "
+            "sono automaticamente formule o regole di scoring."
+        )
     if missing_terms:
-        evidence_lines.append("- Non sono state recuperate formule computazionali esplicite per: " + ", ".join(missing_terms) + ".")
+        evidence_lines.append(
+            "- Non sono state recuperate formule computazionali esplicite per: "
+            + ", ".join(missing_terms)
+            + "."
+        )
 
     return (
         "**A) Risposta**\n\n"
@@ -9685,10 +11533,16 @@ def _answer_formula_strict_core(query_text: str, sources: List[SourceItem]) -> O
         + "\n".join(evidence_lines)
         + "\n\n**C) Limiti / Conflitti**\n\n"
         + "- La risposta non inventa formule mancanti.\n"
-        + "- Una metrica definitoria non viene trattata come formula computazionale se la fonte non contiene un calcolo esplicito.\n"
-        + "- Una soglia normativa indica una condizione/criterio; non misura automaticamente un punteggio o una maturità.\n\n"
+        + "- Una metrica definitoria non viene trattata come formula "
+        + "computazionale se la fonte non contiene un calcolo esplicito.\n"
+        + "- Una soglia normativa indica una condizione o un criterio; non "
+        + "misura automaticamente un punteggio o una maturità.\n\n"
         + "**D) Fonti**\n\n"
-        + ("\n".join(f"- {f}" for f in used_files) if used_files else "- Fonti non disponibili.")
+        + (
+            "\n".join(f"- {item}" for item in used_files)
+            if used_files
+            else "- Fonti non disponibili."
+        )
     )
 
 
@@ -9698,10 +11552,16 @@ def answer_formula_strict(query_text: str, sources: List[SourceItem]) -> Optiona
 
     Integra:
     - core v4.8/v4.11 per classificazione formule/metriche/soglie;
-    - supplemento v4.12 per recuperare soglie normative se la prima retrieval non le contiene.
+    - supplemento v4.12 per recuperare soglie normative se la prima retrieval non le contiene;
+    - v4.14: document-scope finale e preferenza per la text layer raw.
     """
+    scoped_sources = _scope_formula_sources_to_requested_document_v414(
+        query_text,
+        sources,
+    )
+
     try:
-        current_rows = clean_formula_rows(extract_formula_rows_from_sources(sources), max_rows=30)
+        current_rows = clean_formula_rows(extract_formula_rows_from_sources(scoped_sources), max_rows=30)
         has_threshold = any(str(r.get("tipo") or "").lower() == "regola soglia" for r in current_rows)
     except Exception:
         has_threshold = False
@@ -9714,10 +11574,14 @@ def answer_formula_strict(query_text: str, sources: List[SourceItem]) -> Optiona
     if wants_threshold and not has_threshold:
         extra_sources = _threshold_supplemental_sources_v412(query_text)
         if extra_sources:
-            merged = dedupe_sources_for_answer(list(sources or []) + extra_sources)
+            merged = dedupe_sources_for_answer(list(scoped_sources or []) + extra_sources)
+            merged = _scope_formula_sources_to_requested_document_v414(
+                query_text,
+                merged,
+            )
             return _answer_formula_strict_core(query_text, merged)
 
-    return _answer_formula_strict_core(query_text, sources)
+    return _answer_formula_strict_core(query_text, scoped_sources)
 
 # ============================================================
 # 🔎 FORMULA / THRESHOLD CATEGORY PRESERVATION PATCH - v4.12
@@ -9841,6 +11705,14 @@ def _threshold_supplemental_sources_v412(query_text: str, limit: int = 18) -> Li
                 type=source_type,
                 score=float(h.get("score", 0.0) or 0.0),
                 tier=tier,
+                scope=str(meta.get("scope") or "").upper(),
+                organization_id=_optional_int(meta.get("organization_id")),
+                status="active",
+                ingestion_run_id=str(meta.get("ingestion_run_id") or ""),
+                corpus_version=str(meta.get("corpus_version") or CORPUS_VERSION),
+                classification=str(meta.get("classification") or "internal"),
+                embedding_model=str(meta.get("embedding_model") or ""),
+                request_id=get_tenant_context().request_id,
                 db_origin=str(h.get("origin") or "PostgresThresholdSupplement"),
                 section_hint="v4.12 threshold supplemental retrieval",
             )
@@ -9900,62 +11772,471 @@ def _threshold_rule_segments_v413(text: str, max_segments: int = 8) -> List[str]
 
     return out
 
+
+
+
+
+def _formula_text_to_latex(lhs: str, rhs: str) -> str:
+    """
+    Converte un'espressione aritmetica testuale in LaTeX valido.
+
+    Il parser è indipendente dal dominio e supporta identificatori, numeri,
+    chiamate di funzione, parentesi e operatori aritmetici comuni.
+    """
+    token_pattern = re.compile(
+        r"\s*(?:(?P<number>\d+(?:[.,]\d+)?)|"
+        r"(?P<name>[A-Za-z][A-Za-z0-9_]*)|"
+        r"(?P<op>[+\-*/^(),]))"
+    )
+
+    def tokenize(expression: str):
+        tokens = []
+        position = 0
+        while position < len(expression):
+            match = token_pattern.match(expression, position)
+            if not match:
+                position += 1
+                continue
+            kind = "number" if match.group("number") else "name" if match.group("name") else "op"
+            value = match.group(kind)
+            tokens.append((kind, value))
+            position = match.end()
+        return tokens
+
+    class Parser:
+        def __init__(self, tokens):
+            self.tokens = tokens
+            self.pos = 0
+
+        def peek(self, value=None):
+            if self.pos >= len(self.tokens):
+                return False
+            return value is None or self.tokens[self.pos][1] == value
+
+        def take(self):
+            token = self.tokens[self.pos]
+            self.pos += 1
+            return token
+
+        def parse(self):
+            return self.expression()
+
+        def expression(self):
+            node = self.term()
+            while self.peek("+") or self.peek("-"):
+                op = self.take()[1]
+                node = ("bin", op, node, self.term())
+            return node
+
+        def term(self):
+            node = self.power()
+            while self.peek("*") or self.peek("/"):
+                op = self.take()[1]
+                node = ("bin", op, node, self.power())
+            return node
+
+        def power(self):
+            node = self.unary()
+            if self.peek("^"):
+                self.take()
+                node = ("bin", "^", node, self.power())
+            return node
+
+        def unary(self):
+            if self.peek("+") or self.peek("-"):
+                return ("unary", self.take()[1], self.unary())
+            return self.primary()
+
+        def primary(self):
+            if self.pos >= len(self.tokens):
+                return ("raw", "")
+
+            kind, value = self.take()
+            if kind == "number":
+                return ("number", value.replace(",", "."))
+
+            if kind == "name":
+                if self.peek("("):
+                    self.take()
+                    args = []
+                    if not self.peek(")"):
+                        while True:
+                            args.append(self.expression())
+                            if self.peek(","):
+                                self.take()
+                                continue
+                            break
+                    if self.peek(")"):
+                        self.take()
+                    return ("call", value, args)
+                return ("name", value)
+
+            if value == "(":
+                node = self.expression()
+                if self.peek(")"):
+                    self.take()
+                return ("group", node)
+
+            return ("raw", value)
+
+    def render_name(name: str) -> str:
+        if "_" in name:
+            base, suffix = name.split("_", 1)
+            base_latex = base if len(base) == 1 else rf"\mathrm{{{base}}}"
+            suffix_latex = suffix if len(suffix) == 1 else rf"\mathrm{{{suffix}}}"
+            return rf"{base_latex}_{{{suffix_latex}}}"
+        return name if len(name) == 1 else rf"\mathrm{{{name}}}"
+
+    def render(node, parent_precedence=0):
+        kind = node[0]
+        if kind == "number":
+            return node[1]
+        if kind == "name":
+            return render_name(node[1])
+        if kind == "raw":
+            return node[1]
+        if kind == "group":
+            return rf"\left({render(node[1])}\right)"
+        if kind == "unary":
+            return node[1] + render(node[2], 4)
+        if kind == "call":
+            function_name = node[1]
+            args = node[2]
+            rendered_args = ", ".join(render(arg) for arg in args)
+            if function_name.lower() == "sum":
+                return rf"\sum\left({rendered_args}\right)"
+            return rf"\operatorname{{{function_name}}}\left({rendered_args}\right)"
+        if kind == "bin":
+            op, left, right = node[1], node[2], node[3]
+            if op == "/":
+                return rf"\frac{{{render(left)}}}{{{render(right)}}}"
+            if op == "^":
+                return rf"{{{render(left, 3)}}}^{{{render(right)}}}"
+            precedence = 1 if op in {"+", "-"} else 2
+            symbol = r" \cdot " if op == "*" else f" {op} "
+            rendered = render(left, precedence) + symbol + render(right, precedence + 1)
+            if precedence < parent_precedence:
+                return rf"\left({rendered}\right)"
+            return rendered
+        return ""
+
+    lhs_clean = re.sub(r"\s+", " ", str(lhs or "").strip())
+    rhs_clean = re.sub(r"\s+", " ", str(rhs or "").strip())
+
+    lhs_latex = r"\%" if lhs_clean == "%" else render_name(lhs_clean)
+    tokens = tokenize(rhs_clean)
+    rhs_latex = render(Parser(tokens).parse()) if tokens else rhs_clean
+    return f"{lhs_latex} = {rhs_latex}"
+
+
+
+def _canonical_formula_identity(value: str) -> str:
+    """Restituisce una chiave canonica per deduplicare LaTeX e testo equivalenti."""
+    v = _normalize_latex_value(value)
+    v = _strip_math_wrappers(v)
+    v = v.replace("\\(", "").replace("\\)", "")
+    v = v.replace("\\[", "").replace("\\]", "")
+    v = v.replace(r"\left", "").replace(r"\right", "")
+
+    # Mantiene il contenuto dei wrapper tipografici.
+    for _ in range(8):
+        previous = v
+        v = re.sub(r"\\(?:mathrm|text|operatorname)\{([^{}]*)\}", r"\1", v)
+        if v == previous:
+            break
+
+    # Normalizza underscore escapati e pedici dopo aver rimosso i wrapper tipografici.
+    v = re.sub(r"\\+_", "_", v)
+    v = re.sub(r"([A-Za-z][A-Za-z0-9]*)_\{([^{}]+)\}", r"\1\2", v)
+    v = re.sub(r"([A-Za-z][A-Za-z0-9]*)_([A-Za-z0-9]+)", r"\1\2", v)
+
+    def replace_fractions(expression: str) -> str:
+        """Sostituisce \frac{A}{B} rispettando parentesi graffe annidate."""
+        marker = r"\frac"
+        start = 0
+        while True:
+            pos = expression.find(marker, start)
+            if pos < 0:
+                return expression
+
+            index = pos + len(marker)
+            while index < len(expression) and expression[index].isspace():
+                index += 1
+            if index >= len(expression) or expression[index] != "{":
+                start = index
+                continue
+
+            def read_group(open_index: int):
+                depth = 0
+                for cursor in range(open_index, len(expression)):
+                    char = expression[cursor]
+                    if char == "{":
+                        depth += 1
+                    elif char == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return expression[open_index + 1:cursor], cursor + 1
+                return None, open_index
+
+            numerator, after_num = read_group(index)
+            if numerator is None:
+                start = index + 1
+                continue
+            while after_num < len(expression) and expression[after_num].isspace():
+                after_num += 1
+            if after_num >= len(expression) or expression[after_num] != "{":
+                start = after_num
+                continue
+            denominator, after_den = read_group(after_num)
+            if denominator is None:
+                start = after_num + 1
+                continue
+
+            replacement = f"({numerator})/({denominator})"
+            expression = expression[:pos] + replacement + expression[after_den:]
+            start = max(0, pos - 1)
+
+    v = replace_fractions(v)
+    v = v.replace(r"\sum", "sum")
+    v = v.replace(r"\cdot", "*").replace(r"\times", "*")
+    v = v.replace("×", "*").replace(r"\%", "%")
+    v = re.sub(r"[${}`\\]", "", v)
+    v = re.sub(r"[{}()]", "", v)
+    v = re.sub(r"\s+", "", v).lower()
+    return v
+
+def _is_generic_formula_name(value: Any) -> bool:
+    name = _formula_display_text(value or "", 180).strip().lower()
+    return name in {
+        "", "formula", "formula recuperata", "formula/metric",
+        "formula from knowledge graph", "elemento recuperato", "score", "%", "level",
+    }
+
+
+def _formula_context_name(content: str, match_start: int, previous_end: int) -> str:
+    """
+    Ricava il nome associato all'equazione dal blocco testuale precedente.
+
+    Usa solo caratteristiche tipografiche generali: prossimità, brevità,
+    parentesi descrittive e presenza di un identificatore iniziale.
+    """
+    start = max(0, previous_end)
+    segment = (content or "")[start:match_start]
+    lines = [re.sub(r"\s+", " ", line).strip() for line in segment.splitlines()]
+    lines = [line for line in lines if line and "=" not in line]
+    lines = lines[-10:]
+
+    # Combina solo continuazioni brevi che chiudono una parentesi aperta.
+    combined = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if (
+            line.count("(") > line.count(")")
+            and index + 1 < len(lines)
+            and lines[index + 1].endswith(")")
+            and len(lines[index + 1].split()) <= 4
+        ):
+            line = line + " " + lines[index + 1]
+            index += 1
+        combined.append(line)
+        index += 1
+
+    header_words = {
+        "formula", "formulas", "formule", "equation", "equations",
+        "modello", "modelli", "model", "models", "descrizione", "description",
+    }
+
+    best_name = ""
+    best_score = -999
+    for position, line in enumerate(combined):
+        clean = line.strip(" -–—•|\t")
+        if not clean or len(clean) > 100:
+            continue
+        words = re.findall(r"[A-Za-zÀ-ÿ0-9_.-]+", clean)
+        if not words or len(words) > 12:
+            continue
+        if clean.lower() in header_words:
+            continue
+
+        score = 0
+        first = words[0]
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{1,30}", first):
+            score += 2
+        if "(" in clean:
+            score += 3
+        if re.fullmatch(r"[A-Z0-9_.-]{2,30}", first):
+            score += 2
+        if len(words) <= 6:
+            score += 1
+        if clean.endswith(('.', ':', ';')):
+            score -= 2
+        # A parità di qualità, preferisce il candidato più vicino.
+        score += position / 100.0
+
+        if score > best_score:
+            best_score = score
+            best_name = clean
+
+    if best_score < 3:
+        return ""
+    if best_name.count("(") == best_name.count(")") + 1:
+        best_name += ")"
+    return best_name
+
+
+def _formula_name_from_equation_line_v415(content: str, match_start: int) -> str:
+    """Ricava il nome del modello dalla stessa riga/cella dell'equazione."""
+    raw = content or ""
+    line_start = raw.rfind("\n", 0, match_start) + 1
+    prefix = raw[line_start:match_start].strip(" \t|;:-")
+    if not prefix:
+        return ""
+
+    header_terms = {"modello", "model", "descrizione", "description", "formula"}
+    if "|" in prefix:
+        cells = [c.strip() for c in prefix.split("|") if c.strip()]
+    elif "\t" in prefix:
+        cells = [c.strip() for c in prefix.split("\t") if c.strip()]
+    else:
+        cells = [c.strip() for c in re.split(r"\s{2,}", prefix) if c.strip()]
+
+    for cell in cells:
+        clean = re.sub(r"^[-*•\d.()\s]+", "", cell).strip()
+        if not clean or clean.lower() in header_terms or "=" in clean:
+            continue
+        if len(clean) <= 120:
+            code_match = re.match(
+                r"^([A-Za-z][A-Za-z0-9_.-]{1,30}(?:\s*\([^)]{1,80}\))?)",
+                clean,
+            )
+            if code_match:
+                candidate = code_match.group(1).strip()
+                if candidate.count("(") > candidate.count(")"):
+                    line_end = raw.find("\n", match_start)
+                    if line_end >= 0:
+                        next_end = raw.find("\n", line_end + 1)
+                        next_line = raw[line_end + 1: next_end if next_end >= 0 else len(raw)]
+                        continuation = re.split(r"\s{2,}|\t|\|", next_line.strip(), maxsplit=1)[0].strip()
+                        if ")" in continuation and len(continuation) <= 60:
+                            candidate += " " + continuation.split(")", 1)[0].strip() + ")"
+                return candidate
+
+    match = re.match(
+        r"^([A-Za-z][A-Za-z0-9_.-]{1,30}(?:\s*\([^)]{1,80}\))?)",
+        prefix,
+    )
+    return match.group(1).strip() if match else ""
+
+
 def _extract_formula_rows_from_sources_core(sources: List[SourceItem]) -> List[Dict[str, Any]]:
     """
-    Estrae formule o metriche dai SourceItem recuperati.
+    Estrae formule e metriche dai SourceItem recuperati.
 
-    Non inventa formule:
-    - se trova LaTeX esplicito, lo usa;
-    - se trova una formula testuale esplicita tipo X = Y / Z, la riporta;
-    - se trova solo una metrica/indicatore, dichiara che la formula esplicita non è recuperata.
+    Le equazioni testuali del documento sono considerate la rappresentazione
+    primaria perché conservano il contesto e il nome associato. Le versioni
+    LaTeX o Knowledge Graph restano disponibili come fallback e vengono poi
+    deduplicate semanticamente.
     """
     rows: List[Dict[str, Any]] = []
     seen = set()
 
-    latex_pat = re.compile(r"(?<!\\)(\$\$.*?\$\$|\$[^$\n]{2,300}\$)", re.DOTALL)
+    latex_pat = re.compile(
+        r"(?<!\\)(\$\$.*?\$\$|\$[^$\n]{2,500}\$)",
+        re.DOTALL,
+    )
     explicit_equation_pat = re.compile(
-        r"(?i)\b([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9_\-/ ]{1,80})\s*=\s*([^;\n]{2,260})"
+        r"(?im)(?<![A-Za-z0-9_])"
+        r"(?P<lhs>%|[A-Za-z][A-Za-z0-9_]{0,60})"
+        r"\s*=\s*(?P<rhs>[^\n;|]{2,320})"
     )
     metric_line_pat = re.compile(
-        r"(?i)\b("
-        r"formula|formulas|formulae|equation|equations|"
-        r"formule|equazione|equazioni|"
-        r"metric|metrics|metrica|metriche|"
-        r"indicator|indicators|indicatore|indicatori|"
-        r"score|scoring|punteggio|"
-        r"calculation|calculation model|calcolo|modello di calcolo|"
-        r"mean time|tempo medio|index|indice|ratio|coverage|copertura|"
-        r"maturity|maturità|severity|severità"
-        r")\b"
+        r"(?i)\b(formula|formulas|formulae|equation|equations|formule|"
+        r"equazione|equazioni|metric|metrics|metrica|metriche|indicator|"
+        r"indicators|indicatore|indicatori|score|scoring|punteggio|"
+        r"calculation|calcolo|mean time|tempo medio|index|indice|ratio|"
+        r"coverage|copertura|maturity|maturità|severity|severità)\b"
     )
 
-    for s in sources or []:
-        content = s.content or ""
-        filename = s.filename or "N/D"
-        page = int(s.page or 0)
-        source_type = normalize_source_type(getattr(s, "type", "") or "")
+    for source in sources or []:
+        content = source.content or ""
+        filename = source.filename or "N/D"
+        page = int(source.page or 0)
+        source_type = normalize_source_type(getattr(source, "type", "") or "")
 
-        # Caso 1: formule LaTeX esplicite nel contenuto.
-        for lx in latex_pat.findall(content):
-            latex = lx.strip()
-            key = ("latex", latex.lower(), filename.lower(), page)
+        # 1. Equazioni testuali: preservano nome e ordine del documento.
+        previous_equation_end = 0
+        for equation_match in explicit_equation_pat.finditer(content):
+            lhs = re.sub(r"\s+", " ", equation_match.group("lhs")).strip()
+            rhs = re.sub(r"\s+", " ", equation_match.group("rhs")).strip()
+            if not lhs or len(rhs) < 2:
+                continue
+
+            raw_equation = f"{lhs} = {rhs}"
+            identity = _canonical_formula_identity(raw_equation)
+            if not identity:
+                continue
+
+            line_name = _formula_name_from_equation_line_v415(
+                content,
+                equation_match.start(),
+            )
+            context_name = line_name or _formula_context_name(
+                content,
+                equation_match.start(),
+                previous_equation_end,
+            )
+            previous_equation_end = equation_match.end()
+
+            key = ("equation", identity, filename.lower(), page)
+            if key in seen:
+                continue
+            seen.add(key)
+            rhs_words = re.findall(r"[A-Za-zÀ-ÿ]{2,}", rhs)
+            rhs_operators = re.findall(r"[+\-*/×÷^]|\b(?:sum|round)\s*\(", rhs, flags=re.IGNORECASE)
+            textual_assignment = len(rhs_words) >= 3 and len(rhs_operators) <= 1
+
+            rows.append({
+                "name": context_name or lhs,
+                "latex": (
+                    raw_equation
+                    if textual_assignment
+                    else _formula_text_to_latex(lhs, rhs)
+                ),
+                "meaning": (
+                    "Definizione testuale esplicita presente nella fonte recuperata."
+                    if textual_assignment
+                    else "Equazione esplicita presente nella fonte recuperata."
+                ),
+                "filename": filename,
+                "page": page,
+                "formula_origin": "document_equation",
+            })
+
+        # 2. Formule LaTeX esplicite: fallback per contenuti senza testo lineare.
+        for latex_match in latex_pat.findall(content):
+            latex = _normalize_latex_value(latex_match.strip())
+            identity = _canonical_formula_identity(latex)
+            if not identity:
+                continue
+            key = ("latex", identity, filename.lower(), page)
             if key in seen:
                 continue
             seen.add(key)
             rows.append({
-                "name": "Formula recuperata",
-                "latex": latex,
+                "name": _extract_left_name_from_equation(latex) or "Formula recuperata",
+                "latex": _strip_math_wrappers(latex),
                 "meaning": "Formula LaTeX esplicita presente nella fonte recuperata.",
                 "filename": filename,
                 "page": page,
+                "formula_origin": "latex",
             })
 
-        # Caso 2: contenuti provenienti da Neo4j Formula Search.
+        # 3. Formula nodes del Knowledge Graph: fallback strutturato.
         if "Formula from Knowledge Graph" in content or source_type == "formula":
             latex = ""
             plain = ""
             meaning = ""
-
             for line in content.splitlines():
                 clean = line.strip()
                 low = clean.lower()
@@ -9966,72 +12247,55 @@ def _extract_formula_rows_from_sources_core(sources: List[SourceItem]) -> List[D
                 elif low.startswith("meaning:"):
                     meaning = clean.split(":", 1)[1].strip()
 
-            name = plain or meaning or "Formula/metric"
-            key = ("kg", name.lower(), latex.lower(), filename.lower(), page)
+            formula_value = latex or plain
+            identity = _canonical_formula_identity(formula_value)
+            if identity:
+                key = ("kg", identity, filename.lower(), page)
+                if key not in seen:
+                    seen.add(key)
+                    rows.append({
+                        "name": plain or _extract_left_name_from_equation(latex) or "Formula recuperata",
+                        "latex": _strip_math_wrappers(_normalize_latex_value(formula_value)),
+                        "meaning": meaning,
+                        "filename": filename,
+                        "page": page,
+                        "formula_origin": "knowledge_graph",
+                    })
 
-            if key not in seen:
-                seen.add(key)
-                rows.append({
-                    "name": name,
-                    "latex": latex if latex else "formula esplicita non recuperata",
-                    "meaning": meaning,
-                    "filename": filename,
-                    "page": page,
-                })
-
-        # Caso 3: equazioni testuali esplicite tipo "X = Y / Z".
-        for m in explicit_equation_pat.finditer(content):
-            left = re.sub(r"\s+", " ", m.group(1)).strip()
-            right = re.sub(r"\s+", " ", m.group(2)).strip()
-
-            if len(left) < 2 or len(right) < 2:
-                continue
-
-            latex = f"{left} = {right}"
-            key = ("eq", left.lower(), latex.lower(), filename.lower(), page)
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append({
-                "name": left,
-                "latex": latex,
-                "meaning": "Formula testuale esplicita presente nella fonte recuperata.",
-                "filename": filename,
-                "page": page,
-            })
-
-        # Caso 4: righe che citano metriche/indicatori senza formula esplicita.
+        # 4. Metriche citate senza equazione esplicita.
         for raw_line in content.splitlines():
             line = re.sub(r"\s+", " ", raw_line or "").strip()
-            if not line or not metric_line_pat.search(line):
+            if not line or not metric_line_pat.search(line) or "=" in line:
                 continue
 
             name = "Metrica/indicatore citato"
-            m_name = re.match(r"^[-*•\s]*([A-Za-zÀ-ÿ0-9_\-/ ]{2,80})\s*[:=–-]", line)
-            if m_name:
-                name = m_name.group(1).strip()
+            name_match = re.match(
+                r"^[-*•\s]*([A-Za-zÀ-ÿ0-9_\-/ ]{2,80})\s*[:=–-]",
+                line,
+            )
+            if name_match:
+                name = name_match.group(1).strip()
 
             key = ("metric", name.lower(), filename.lower(), page, line[:120].lower())
             if key in seen:
                 continue
             seen.add(key)
-
             rows.append({
                 "name": name,
                 "latex": "formula esplicita non recuperata",
                 "meaning": (
-                    "Metrica/indicatore citato nelle fonti recuperate; "
-                    "nessuna formula esplicita è stata individuata nello stesso chunk."
+                    "Metrica o indicatore citato nella fonte; nessuna equazione "
+                    "esplicita è stata individuata nella stessa riga."
                 ),
                 "filename": filename,
                 "page": page,
+                "formula_origin": "metric_text",
             })
 
-            if len(rows) >= 20:
+            if len(rows) >= 60:
                 return rows
 
     return rows
-
 
 def extract_formula_rows_from_sources(sources: List[SourceItem]) -> List[Dict[str, Any]]:
     """
@@ -10113,13 +12377,15 @@ def _search_pg_threshold_regex_v413(limit: int = 12) -> List[SourceItem]:
     sql = f"""
     SELECT chunk_uuid::text, content_raw, content_semantic, metadata_json, ingestion_ts
     FROM public.document_chunks
-    WHERE {' OR '.join(clauses)}
+    WHERE status = 'active'
+      AND ({' OR '.join(clauses)})
+      AND ((scope = 'GLOBAL' AND organization_id IS NULL AND tier = 'A') OR (scope = 'ACCOUNT' AND organization_id = %s AND tier IN ('B', 'C')))
     ORDER BY ingestion_ts DESC
     LIMIT %s;
     """
-    params.append(limit)
+    params.extend([current_organization_id(), limit])
 
-    conn = pg_pool.getconn()
+    conn = pg_get_conn_secure()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params)
@@ -10149,6 +12415,14 @@ def _search_pg_threshold_regex_v413(limit: int = 12) -> List[SourceItem]:
                 type=metadata_json.get("toon_type") or metadata_json.get("type") or "text",
                 score=2.5,
                 tier=normalize_tier_value(metadata_json.get("tier", "C")),
+                scope=str(metadata_json.get("scope") or "").upper(),
+                organization_id=_optional_int(metadata_json.get("organization_id")),
+                status="active",
+                ingestion_run_id=str(metadata_json.get("ingestion_run_id") or ""),
+                corpus_version=str(metadata_json.get("corpus_version") or CORPUS_VERSION),
+                classification=str(metadata_json.get("classification") or "internal"),
+                embedding_model=str(metadata_json.get("embedding_model") or ""),
+                request_id=get_tenant_context().request_id,
                 db_origin="PostgresThresholdRegex",
                 section_hint="v4.13 threshold regex retrieval (Dynamic)",
                 pg_ingestion_ts=ingestion_ts.isoformat() if ingestion_ts else "",
@@ -10164,8 +12438,119 @@ def _search_pg_threshold_regex_v413(limit: int = 12) -> List[SourceItem]:
         print(f"⚠️ v4.13 threshold regex supplement error: {e}")
         return []
     finally:
-        pg_pool.putconn(conn)
+        pg_put_conn_secure(conn)
 
 
-app = rx.App()
+
+# ============================================================
+# FORMULA TABLE NAME + KATEX VISIBILITY PATCH - v4.17
+# ============================================================
+_formula_name_from_equation_line_v416 = _formula_name_from_equation_line_v415
+
+
+def _formula_name_from_equation_line_v415(content: str, match_start: int) -> str:
+    """
+    Estrae il nome del modello da una riga/tabella in modo generalista.
+
+    Mantiene il parser precedente e, solo se il risultato è generico, cerca
+    l'identificatore strutturale più vicino composto da maiuscole/cifre, con
+    eventuale descrizione tra parentesi. Non contiene nomi di modelli specifici.
+    """
+    previous = _formula_name_from_equation_line_v416(content, match_start)
+    if previous and not _is_generic_formula_name(previous):
+        return previous
+
+    raw = content or ""
+    line_start = raw.rfind("\n", 0, match_start) + 1
+    previous_line_start = raw.rfind("\n", 0, max(0, line_start - 1)) + 1
+    window_start = max(previous_line_start, match_start - 500)
+    prefix = raw[window_start:match_start]
+
+    header_tokens = {
+        "FORMULA", "FORMULE", "MODEL", "MODELLI", "MODELLO",
+        "DESCRIPTION", "DESCRIZIONE", "SCORE", "LEVEL",
+    }
+    candidates: List[Tuple[int, int, str]] = []
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_])"
+        r"(?P<code>[A-Z][A-Z0-9_.-]{1,24})"
+        r"(?:\s*\((?P<label>[^)\n]{1,80})\))?"
+    )
+    for match in pattern.finditer(prefix):
+        code = match.group("code").strip()
+        if code in header_tokens:
+            continue
+        # Esclude parole capitalizzate: il codice deve essere realmente
+        # maiuscolo oppure contenere almeno una cifra strutturale.
+        if code.upper() != code and not re.search(r"\d", code):
+            continue
+        label = re.sub(r"\s+", " ", match.group("label") or "").strip()
+        candidate = f"{code} ({label})" if label else code
+        same_line = int("\n" not in prefix[match.end():])
+        distance = match_start - (window_start + match.end())
+        candidates.append((same_line, -distance, candidate))
+
+    if candidates:
+        candidates.sort(reverse=True)
+        return candidates[0][2]
+    return previous or ""
+
+
+RAG_GLOBAL_STYLE = {
+    ".rag-markdown p": {
+        "overflow_wrap": "anywhere",
+        "word_break": "break-word",
+    },
+    ".rag-markdown li": {
+        "overflow_wrap": "anywhere",
+        "word_break": "break-word",
+    },
+    ".rag-markdown .katex": {
+        "white_space": "nowrap",
+        "word_break": "normal",
+        "overflow_wrap": "normal",
+    },
+    ".rag-markdown .katex-display": {
+        "display": "block",
+        "max_width": "100%",
+        "overflow_x": "auto",
+        "overflow_y": "hidden",
+        "padding_bottom": "0.25rem",
+    },
+    ".rag-markdown .katex-display > .katex": {
+        "display": "inline-block",
+        "min_width": "max-content",
+    },
+    # KaTeX produce HTML + MathML per accessibilità. Senza il foglio CSS
+    # completo il browser mostra entrambi; questa regola nasconde soltanto
+    # visivamente il layer MathML, mantenendolo disponibile agli screen reader.
+    ".rag-markdown .katex-mathml": {
+        "position": "absolute",
+        "width": "1px",
+        "height": "1px",
+        "padding": "0",
+        "margin": "-1px",
+        "overflow": "hidden",
+        "clip": "rect(0, 0, 0, 0)",
+        "white_space": "nowrap",
+        "border": "0",
+    },
+    ".rag-markdown .katex-html": {
+        "display": "inline-block",
+        "white_space": "nowrap",
+        "word_break": "normal",
+        "overflow_wrap": "normal",
+    },
+}
+
+# Il CDN è configurabile/disattivabile; le regole locali sopra restano un
+# fallback per installazioni Docker senza accesso Internet.
+KATEX_CSS_URL = os.getenv(
+    "KATEX_CSS_URL",
+    "https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.css",
+).strip()
+KATEX_USE_CDN = os.getenv("KATEX_USE_CDN", "1") == "1"
+KATEX_STYLESHEETS = [KATEX_CSS_URL] if KATEX_USE_CDN and KATEX_CSS_URL else []
+
+app = rx.App(style=RAG_GLOBAL_STYLE, stylesheets=KATEX_STYLESHEETS)
 app.add_page(index, on_load=State.on_load)

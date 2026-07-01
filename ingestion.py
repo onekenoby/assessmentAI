@@ -1,3 +1,4 @@
+# FINAL MULTI-TENANT HARDENED VERSION - aligned with Architecture v1.1
 
 """
 set EMBED_BATCH_SIZE=16
@@ -22,6 +23,17 @@ Ingestion Engine - v2.4 HYPER-FAST (Virtual Markdown + Asset Parking)
 import os
 
 import sys
+
+# Output immediato nel terminale/container.
+# Evita che i messaggi di producer, consumer, embedding, KG e database
+# restino nel buffer fino alla fine del processo Docker.
+os.environ["PYTHONUNBUFFERED"] = "1"
+try:
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
+except (AttributeError, ValueError):
+    # Compatibilità con stream sostituiti da IDE/test runner.
+    pass
 
 # --- FIX ANTI-BLOCCO ---
 # Impostiamo queste variabili PRIMA di importare altre librerie pesanti.
@@ -52,10 +64,9 @@ import gc
 import queue
 import threading
 
-'''
-import pytesseract
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-'''
+
+#import pytesseract
+#pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 import pytesseract
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "")
@@ -92,9 +103,6 @@ except Exception:
 
 from sentence_transformers import util
 import torch
-
-
-
 
 
 # =========================
@@ -341,10 +349,43 @@ def dispatch_document(file_path: str, root_dir: str) -> dict:
     if base.get("tier") == "C" and not base.get("effective_date"):
         base["effective_date"] = time.strftime("%Y-%m-%d")
 
-    # Sidecar meta JSON: override finale e puntuale.
+    # Sidecar meta JSON: può arricchire i metadati descrittivi, ma non può
+    # cambiare tier/scope/organization_id calcolati dall'alberatura e dal job.
     side = read_sidecar_meta(file_path)
     if isinstance(side, dict) and side:
-        base.update(side)
+        safe_side = {
+            key: value
+            for key, value in side.items()
+            if key not in SECURITY_META_FIELDS
+        }
+        base.update(safe_side)
+
+    # Invarianti fail-closed della segregazione.
+    tier = str(base.get("tier") or "").strip().upper()
+    scope = str(base.get("scope") or "").strip().upper()
+
+    if scope == "GLOBAL":
+        if tier != "A":
+            raise ValueError("Solo il Tier A può avere scope GLOBAL")
+        base["organization_id"] = None
+    elif scope == "ACCOUNT":
+        if tier not in {"B", "C"}:
+            raise ValueError("Lo scope ACCOUNT è consentito solo ai Tier B/C")
+        base["organization_id"] = int(ORGANIZATION_ID)
+    else:
+        raise ValueError(f"Scope documento non valido: {scope!r}")
+
+    classification = str(base.get("classification") or DEFAULT_CLASSIFICATION).strip().lower()
+    if classification not in {"public", "internal", "confidential", "restricted"}:
+        raise ValueError(f"Classificazione documento non valida: {classification!r}")
+
+    base["tier"] = tier
+    base["scope"] = scope
+    base["tenant_key"] = build_tenant_key(scope, base.get("organization_id"))
+    base["status"] = DOCUMENT_ACTIVE_STATUS
+    base["classification"] = classification
+    base["embedding_model"] = EMBEDDING_MODEL_NAME
+    base["corpus_version"] = CORPUS_VERSION
 
     return base
 
@@ -395,7 +436,92 @@ def ensure_inbox_structure(inbox_dir: str):
 # =========================
 # MULTI-TENANT CONTEXT
 # =========================
-ORGANIZATION_ID = 1234
+# L'organizzazione arriva esclusivamente dal contesto trusted del job/container.
+# Nessun fallback implicito: un job senza tenant esplicito non deve partire.
+def _required_positive_int_env(name: str) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        raise RuntimeError(f"Variabile ambiente obbligatoria non configurata: {name}")
+    try:
+        value = int(str(raw).strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} deve essere un intero positivo") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} deve essere maggiore di zero")
+    return value
+
+
+
+# ============================================================
+# POC TENANT CONFIGURATION
+# ============================================================
+# Nel POC l'organizzazione è intenzionalmente fissa e trusted.
+# IMPORTANTE: deve essere un intero. La precedente espressione
+#     os.getenv("ORGANIZATION_ID", "1234") == "1234"
+# restituiva un booleano (True/False), causando organization_id=1/0.
+POC_MODE = True
+ORGANIZATION_ID: int = 1234
+
+# Per una futura versione multi-tenant autenticata sostituire la riga sopra con:
+# ORGANIZATION_ID = _required_positive_int_env("ORGANIZATION_ID")
+CORPUS_VERSION = (os.getenv("CORPUS_VERSION", "v1").strip() or "v1")
+DEFAULT_CLASSIFICATION = (os.getenv("DEFAULT_CLASSIFICATION", "internal").strip().lower() or "internal")
+DOCUMENT_ACTIVE_STATUS = "active"
+INGESTION_RUN_STATUSES = {"RUNNING", "DONE", "FAILED", "PARTIAL_FAILED"}
+PG_AUTO_HARDEN_SCHEMA = os.getenv("PG_AUTO_HARDEN_SCHEMA", "0") == "1"
+PG_SCHEMA_MIGRATION_ONLY = os.getenv("PG_SCHEMA_MIGRATION_ONLY", "0") == "1"
+
+# Nel POC il database usa ancora il ruolo admin/superuser.
+# Il controllo resta disponibile per il futuro, ma non blocca il POC.
+PG_ENFORCE_LEAST_PRIVILEGE = False
+
+
+def build_tenant_key(scope: str, organization_id: Optional[int]) -> str:
+    """Namespace stabile usato negli identificativi persistiti."""
+    normalized_scope = str(scope or "").strip().upper()
+
+    if normalized_scope == "GLOBAL":
+        return "GLOBAL"
+
+    if normalized_scope != "ACCOUNT":
+        raise ValueError(f"Scope multi-tenant non valido: {scope!r}")
+
+    if organization_id is None:
+        raise ValueError("organization_id obbligatorio per scope ACCOUNT")
+
+    org_id = int(organization_id)
+    if org_id <= 0:
+        raise ValueError("organization_id deve essere maggiore di zero")
+
+    return f"ORG:{org_id}"
+
+
+def tenant_scoped_doc_id(file_path: str, doc_meta: Optional[dict]) -> str:
+    """
+    ID documento deterministico e segregato.
+    - Tier A/GLOBAL: stesso file -> stesso ID globale.
+    - Tier B/C/ACCOUNT: stesso file in tenant diversi -> ID diversi.
+    """
+    meta = doc_meta or {}
+    tenant_key = build_tenant_key(
+        meta.get("scope", "ACCOUNT"),
+        meta.get("organization_id", ORGANIZATION_ID),
+    )
+    file_hash = sha256_file(file_path)
+    return sha256_hex(f"{tenant_key}::{file_hash}".encode("utf-8"))[:32]
+
+
+SECURITY_META_FIELDS = {
+    "tier",
+    "scope",
+    "organization_id",
+    "tenant_key",
+    "status",
+    "ingestion_run_id",
+    "embedding_model",
+    "corpus_version",
+    "classification",
+}
 
 # -------------------------
 # KG LIMITS (coherent names)
@@ -745,6 +871,9 @@ EMBEDDING_MODEL_NAME = os.getenv(
 
 
 QDRANT_TEXT_MAX_CHARS = int(os.getenv("QDRANT_TEXT_MAX_CHARS", "2500"))
+# Timeout HTTP del client Qdrant. Il default del client è troppo breve per
+# create_payload_index/upsert con wait=True su Docker e può produrre "timed out".
+QDRANT_TIMEOUT_S = int(os.getenv("QDRANT_TIMEOUT_S", "120"))
 
 # LLM reliability
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1300"))
@@ -769,7 +898,11 @@ def get_embedder():
 def get_qdrant_client():
     global qdrant_client
     if qdrant_client is None:
-        qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        qdrant_client = QdrantClient(
+            host=QDRANT_HOST,
+            port=QDRANT_PORT,
+            timeout=QDRANT_TIMEOUT_S,
+        )
     return qdrant_client
 
 neo4j_driver = None
@@ -2338,146 +2471,490 @@ def log_phase(filename: str, label: str, ms: int):
 # Postgres helpers
 # =========================
 def pg_get_conn():
-    return pg_pool.getconn()
-
-def pg_put_conn(conn):
-    pg_pool.putconn(conn)
-
-def pg_start_log(source_name: str, source_type: str, doc_meta: dict = None) -> int:
-    conn = pg_get_conn()
-    org_id = doc_meta.get("organization_id") if doc_meta else None
-    tier = doc_meta.get("tier") if doc_meta else None
-    scope = doc_meta.get("scope") if doc_meta else None
-    
+    conn = pg_pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO ingestion_logs (source_name, source_type, ingestion_ts, status, organization_id, tier, scope) "
-                "VALUES (%s, %s, NOW(), %s, %s, %s, %s) RETURNING log_id",
-                (source_name, source_type, "RUNNING", org_id, tier, scope)
+                "SELECT set_config('app.current_customer_account_id', %s, false), "
+                "set_config('app.allow_global_ingestion', '1', false)",
+                (str(ORGANIZATION_ID),),
+            )
+        conn.commit()
+        return conn
+    except Exception:
+        conn.rollback()
+        pg_pool.putconn(conn)
+        raise
+
+def pg_put_conn(conn):
+    if conn is None:
+        return
+    try:
+        if not conn.closed:
+            with conn.cursor() as cur:
+                cur.execute("RESET app.current_customer_account_id")
+                cur.execute("RESET app.allow_global_ingestion")
+            conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        pg_pool.putconn(conn)
+
+
+def _pg_role_security_check(cur) -> None:
+    """
+    Verifica il ruolo PostgreSQL.
+
+    Nel POC il ruolo admin/superuser è ammesso e produce soltanto un warning.
+    In produzione basta impostare POC_MODE=False e
+    PG_ENFORCE_LEAST_PRIVILEGE=True per ripristinare il blocco fail-closed.
+    """
+    cur.execute(
+        "SELECT current_user, rolsuper, rolbypassrls "
+        "FROM pg_roles WHERE rolname = current_user"
+    )
+    row = cur.fetchone() or ("unknown", False, False)
+    role_name, is_superuser, bypass_rls = row
+    privileged = bool(is_superuser) or bool(bypass_rls)
+
+    if not privileged:
+        return
+
+    if PG_ENFORCE_LEAST_PRIVILEGE and not POC_MODE:
+        raise RuntimeError(
+            "Il ruolo PostgreSQL applicativo non può essere SUPERUSER o BYPASSRLS. "
+            "Usare un ruolo dedicato privo di privilegi di bypass."
+        )
+
+    print(
+        "⚠️ POC MODE: ruolo PostgreSQL privilegiato consentito "
+        f"(user={role_name}, superuser={bool(is_superuser)}, "
+        f"bypassrls={bool(bypass_rls)})."
+    )
+
+
+def ensure_postgres_security_schema() -> None:
+    """
+    Bootstrap o verifica dello schema multi-tenant.
+
+    Modalità normali (default):
+    - PG_AUTO_HARDEN_SCHEMA=0
+    - verifica RLS/FORCE RLS, policy e colonne richieste;
+    - richiede un ruolo non SUPERUSER e senza BYPASSRLS.
+
+    Bootstrap una tantum:
+    - PG_AUTO_HARDEN_SCHEMA=1
+    - PG_SCHEMA_MIGRATION_ONLY=1
+    - usare un ruolo proprietario/migrator; il processo termina dopo la migrazione.
+    """
+    conn = pg_pool.getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            if PG_AUTO_HARDEN_SCHEMA or POC_MODE:
+                if PG_AUTO_HARDEN_SCHEMA and not POC_MODE and not PG_SCHEMA_MIGRATION_ONLY:
+                    raise RuntimeError(
+                        "PG_AUTO_HARDEN_SCHEMA=1 è consentito solo con "
+                        "PG_SCHEMA_MIGRATION_ONLY=1. Il ruolo di migrazione non deve "
+                        "essere usato per l'ingestion ordinaria."
+                    )
+
+                cur.execute("ALTER TABLE public.ingestion_logs ADD COLUMN IF NOT EXISTS ingestion_run_id UUID")
+                cur.execute("ALTER TABLE public.ingestion_logs ADD COLUMN IF NOT EXISTS tenant_key TEXT")
+                cur.execute("ALTER TABLE public.ingestion_logs ADD COLUMN IF NOT EXISTS corpus_version TEXT")
+                cur.execute("ALTER TABLE public.ingestion_logs ADD COLUMN IF NOT EXISTS classification TEXT")
+                cur.execute("ALTER TABLE public.ingestion_logs ADD COLUMN IF NOT EXISTS embedding_model TEXT")
+                cur.execute("ALTER TABLE public.ingestion_logs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ")
+
+                cur.execute("ALTER TABLE public.document_chunks ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'")
+                cur.execute("ALTER TABLE public.document_chunks ADD COLUMN IF NOT EXISTS ingestion_run_id UUID")
+                cur.execute("ALTER TABLE public.document_chunks ADD COLUMN IF NOT EXISTS tenant_key TEXT")
+                cur.execute("ALTER TABLE public.document_chunks ADD COLUMN IF NOT EXISTS corpus_version TEXT")
+                cur.execute("ALTER TABLE public.document_chunks ADD COLUMN IF NOT EXISTS classification TEXT")
+                cur.execute("ALTER TABLE public.document_chunks ADD COLUMN IF NOT EXISTS embedding_model TEXT")
+
+                cur.execute("ALTER TABLE public.ingestion_images ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'")
+                cur.execute("ALTER TABLE public.ingestion_images ADD COLUMN IF NOT EXISTS ingestion_run_id UUID")
+                cur.execute("ALTER TABLE public.ingestion_images ADD COLUMN IF NOT EXISTS tenant_key TEXT")
+                cur.execute("ALTER TABLE public.ingestion_images ADD COLUMN IF NOT EXISTS corpus_version TEXT")
+                cur.execute("ALTER TABLE public.ingestion_images ADD COLUMN IF NOT EXISTS classification TEXT")
+
+                for table in ("ingestion_logs", "document_chunks", "ingestion_images"):
+                    constraint_name = f"ck_{table}_tenant_tier_scope"
+                    cur.execute(
+                        f"""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM pg_constraint
+                                WHERE conname = '{constraint_name}'
+                                  AND conrelid = 'public.{table}'::regclass
+                            ) THEN
+                                ALTER TABLE public.{table}
+                                ADD CONSTRAINT {constraint_name}
+                                CHECK (
+                                    (tier = 'A' AND scope = 'GLOBAL' AND organization_id IS NULL)
+                                    OR
+                                    (tier IN ('B','C') AND scope = 'ACCOUNT' AND organization_id IS NOT NULL)
+                                ) NOT VALID;
+                            END IF;
+                        END $$;
+                        """
+                    )
+                    cur.execute(f"ALTER TABLE public.{table} ENABLE ROW LEVEL SECURITY")
+                    cur.execute(f"ALTER TABLE public.{table} FORCE ROW LEVEL SECURITY")
+
+                visible_expr = """
+                    (
+                        (scope = 'GLOBAL' AND tier = 'A' AND organization_id IS NULL)
+                        OR
+                        (scope = 'ACCOUNT' AND tier IN ('B','C')
+                         AND organization_id::text = current_setting('app.current_customer_account_id', true))
+                    )
+                """
+                writable_expr = """
+                    (
+                        (scope = 'GLOBAL' AND tier = 'A' AND organization_id IS NULL
+                         AND current_setting('app.allow_global_ingestion', true) = '1')
+                        OR
+                        (scope = 'ACCOUNT' AND tier IN ('B','C')
+                         AND organization_id::text = current_setting('app.current_customer_account_id', true))
+                    )
+                """
+
+                for table in ("ingestion_logs", "document_chunks", "ingestion_images"):
+                    cur.execute(f"DROP POLICY IF EXISTS {table}_tenant_select ON public.{table}")
+                    cur.execute(
+                        f"CREATE POLICY {table}_tenant_select ON public.{table} "
+                        f"FOR SELECT USING ({visible_expr})"
+                    )
+                    cur.execute(f"DROP POLICY IF EXISTS {table}_tenant_insert ON public.{table}")
+                    cur.execute(
+                        f"CREATE POLICY {table}_tenant_insert ON public.{table} "
+                        f"FOR INSERT WITH CHECK ({writable_expr})"
+                    )
+                    cur.execute(f"DROP POLICY IF EXISTS {table}_tenant_update ON public.{table}")
+                    cur.execute(
+                        f"CREATE POLICY {table}_tenant_update ON public.{table} "
+                        f"FOR UPDATE USING ({visible_expr}) WITH CHECK ({writable_expr})"
+                    )
+                    cur.execute(f"DROP POLICY IF EXISTS {table}_tenant_delete ON public.{table}")
+                    cur.execute(
+                        f"CREATE POLICY {table}_tenant_delete ON public.{table} "
+                        f"FOR DELETE USING ({visible_expr})"
+                    )
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.rag_query_audit (
+                        audit_id BIGSERIAL PRIMARY KEY,
+                        request_id UUID NOT NULL,
+                        organization_id BIGINT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        roles JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        query_sha256 TEXT NOT NULL,
+                        intent TEXT,
+                        filters JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        retrieved_sources JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        llm_model TEXT,
+                        corpus_version TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute("ALTER TABLE public.rag_query_audit ENABLE ROW LEVEL SECURITY")
+                cur.execute("ALTER TABLE public.rag_query_audit FORCE ROW LEVEL SECURITY")
+                cur.execute("DROP POLICY IF EXISTS rag_query_audit_tenant_all ON public.rag_query_audit")
+                cur.execute(
+                    """
+                    CREATE POLICY rag_query_audit_tenant_all ON public.rag_query_audit
+                    USING (organization_id::text = current_setting('app.current_customer_account_id', true))
+                    WITH CHECK (organization_id::text = current_setting('app.current_customer_account_id', true))
+                    """
+                )
+
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_document_chunks_tenant_status "
+                    "ON public.document_chunks(scope, organization_id, tier, status, chunk_uuid)"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ingestion_images_tenant_status "
+                    "ON public.ingestion_images(scope, organization_id, tier, status, image_hash)"
+                )
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_ingestion_logs_run_id "
+                    "ON public.ingestion_logs(ingestion_run_id) WHERE ingestion_run_id IS NOT NULL"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_rag_query_audit_tenant_time "
+                    "ON public.rag_query_audit(organization_id, created_at DESC)"
+                )
+                return
+
+            # Runtime ordinario.
+            _pg_role_security_check(cur)
+
+            # Nel POC manteniamo i filtri tenant applicativi e i metadati
+            # organization_id/scope/tier, ma non blocchiamo l'avvio se il DB
+            # usa ancora admin oppure se RLS/FORCE RLS non è stata bootstrapata.
+            # La validazione rigorosa resta attiva fuori dal POC.
+            if POC_MODE:
+                print(
+                    f"ℹ️ POC MODE attivo | ORGANIZATION_ID={ORGANIZATION_ID} | "
+                    "controllo RLS/least-privilege non bloccante."
+                )
+                return
+
+            required_tables = ("ingestion_logs", "document_chunks", "ingestion_images")
+            for table in required_tables:
+                cur.execute(
+                    """
+                    SELECT relrowsecurity, relforcerowsecurity
+                    FROM pg_class
+                    WHERE oid = %s::regclass
+                    """,
+                    (f"public.{table}",),
+                )
+                flags = cur.fetchone()
+                if not flags or not all(bool(x) for x in flags):
+                    raise RuntimeError(f"RLS/FORCE RLS non attive su public.{table}")
+
+                cur.execute(
+                    """
+                    SELECT count(*)
+                    FROM pg_policies
+                    WHERE schemaname='public' AND tablename=%s
+                      AND policyname IN (%s, %s, %s, %s)
+                    """,
+                    (
+                        table,
+                        f"{table}_tenant_select",
+                        f"{table}_tenant_insert",
+                        f"{table}_tenant_update",
+                        f"{table}_tenant_delete",
+                    ),
+                )
+                if int(cur.fetchone()[0]) != 4:
+                    raise RuntimeError(f"Policy RLS tenant incomplete su public.{table}")
+
+            cur.execute("SELECT to_regclass('public.rag_query_audit')")
+            if cur.fetchone()[0] is None:
+                raise RuntimeError("Tabella public.rag_query_audit assente: eseguire bootstrap schema")
+    finally:
+        try:
+            conn.autocommit = False
+        except Exception:
+            pass
+        pg_pool.putconn(conn)
+
+
+
+def pg_start_log(source_name: str, source_type: str, doc_meta: dict = None) -> int:
+    meta = doc_meta if isinstance(doc_meta, dict) else {}
+    org_id = meta.get("organization_id")
+    tier = str(meta.get("tier") or "").upper()
+    scope = str(meta.get("scope") or "").upper()
+    tenant_key = str(meta.get("tenant_key") or build_tenant_key(scope, org_id))
+    run_id = str(meta.get("ingestion_run_id") or uuid.uuid4())
+    meta["ingestion_run_id"] = run_id
+    meta.setdefault("corpus_version", CORPUS_VERSION)
+    meta.setdefault("classification", DEFAULT_CLASSIFICATION)
+    meta.setdefault("embedding_model", EMBEDDING_MODEL_NAME)
+
+    conn = pg_get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.ingestion_logs (
+                    source_name, source_type, ingestion_ts, status,
+                    organization_id, tier, scope, ingestion_run_id,
+                    tenant_key, corpus_version, classification, embedding_model
+                )
+                VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s::uuid, %s, %s, %s, %s)
+                RETURNING log_id
+                """,
+                (
+                    source_name, source_type, "RUNNING", org_id, tier, scope,
+                    run_id, tenant_key, meta["corpus_version"],
+                    meta["classification"], meta["embedding_model"],
+                ),
             )
             log_id = cur.fetchone()[0]
         conn.commit()
-        return log_id
+        return int(log_id)
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         pg_put_conn(conn)
         
         
 def pg_close_log(log_id: int, status: str, total_chunks: int, processing_ms: int, error_msg: str = None):
+    status = str(status or "FAILED").upper()
+    if status not in INGESTION_RUN_STATUSES:
+        raise ValueError(f"Stato ingestion non valido: {status}")
     conn = pg_get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE ingestion_logs SET status = %s, total_chunks = %s, processing_time_ms = %s, error_message = %s "
-                "WHERE log_id = %s",
-                (status, total_chunks, processing_ms, error_msg, log_id)
+                """
+                UPDATE public.ingestion_logs
+                SET status = %s,
+                    total_chunks = %s,
+                    processing_time_ms = %s,
+                    error_message = %s,
+                    completed_at = NOW()
+                WHERE log_id = %s
+                """,
+                (status, total_chunks, processing_ms, error_msg, log_id),
             )
         conn.commit()
     except Exception:
         conn.rollback()
+        raise
     finally:
         pg_put_conn(conn)
 
-def pg_get_image_by_hash(image_hash: str, cur) -> Optional[Tuple[int, str]]:
+def pg_get_image_by_hash(
+    image_hash: str,
+    log_id: int,
+    cur,
+) -> Optional[Tuple[int, str]]:
+    """Deduplica immagini soltanto nello stesso namespace tenant."""
     cur.execute(
-        "SELECT image_id, description_ai FROM ingestion_images WHERE image_hash = %s LIMIT 1",
-        (image_hash,)
+        """
+        SELECT i.image_id, i.description_ai
+        FROM ingestion_images i
+        JOIN ingestion_logs current_log
+          ON current_log.log_id = %s
+        WHERE i.image_hash = %s
+          AND i.scope IS NOT DISTINCT FROM current_log.scope
+          AND i.tier IS NOT DISTINCT FROM current_log.tier
+          AND i.organization_id IS NOT DISTINCT FROM current_log.organization_id
+        LIMIT 1
+        """,
+        (log_id, image_hash),
     )
     return cur.fetchone()
 
+
 def pg_save_image(log_id: int, image_bytes: bytes, mime_type: str, description: str, cur) -> int:
     img_hash = sha256_hex(image_bytes)
-    cached = pg_get_image_by_hash(img_hash, cur)
+    cached = pg_get_image_by_hash(img_hash, log_id, cur)
     if cached:
         return cached[0]
+
+    # I metadati tenant vengono copiati dal log già all'inserimento; in questo
+    # modo anche più immagini uguali nello stesso documento sono deduplicate.
     cur.execute(
-        "INSERT INTO ingestion_images (log_id, image_data, image_hash, mime_type, description_ai, ingestion_ts) "
-        "VALUES (%s, %s, %s, %s, %s, NOW()) RETURNING image_id",
-        (log_id, psycopg2.Binary(image_bytes), img_hash, mime_type, description)
+        """
+        INSERT INTO ingestion_images (
+            log_id,
+            image_data,
+            image_hash,
+            mime_type,
+            description_ai,
+            ingestion_ts,
+            organization_id,
+            tier,
+            scope,
+            status,
+            ingestion_run_id,
+            tenant_key,
+            corpus_version,
+            classification
+        )
+        SELECT
+            l.log_id,
+            %s,
+            %s,
+            %s,
+            %s,
+            NOW(),
+            l.organization_id,
+            l.tier,
+            l.scope,
+            'active',
+            l.ingestion_run_id,
+            l.tenant_key,
+            l.corpus_version,
+            l.classification
+        FROM ingestion_logs l
+        WHERE l.log_id = %s
+        RETURNING image_id
+        """,
+        (
+            psycopg2.Binary(image_bytes),
+            img_hash,
+            mime_type,
+            description,
+            log_id,
+        ),
     )
-    return cur.fetchone()[0]
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"Log ingestion non trovato: {log_id}")
+    return row[0]
 
 
 def flush_postgres_chunks_batch(batch_data: List[Tuple]):
     if not batch_data:
-        return
+        return True
 
     now = time.strftime('%Y-%m-%d %H:%M:%S')
-
-    # batch_data è costruito così:
-    # (
-    #   log_id,
-    #   chunk_index,
-    #   toon_type,
-    #   content_raw,
-    #   content_semantic,
-    #   metadata_json,
-    #   chunk_uuid
-    # )
     rows = [row + (now,) for row in batch_data]
-
-    chunk_uuids = []
+    dedupe_keys = []
     seen = set()
 
     for row in batch_data:
-        if len(row) < 7:
-            continue
-
+        if len(row) < 16:
+            raise ValueError("Riga document_chunks priva dei metadati di sicurezza obbligatori")
         chunk_uuid = str(row[6]).strip()
-
-        if chunk_uuid and chunk_uuid not in seen:
-            seen.add(chunk_uuid)
-            chunk_uuids.append(chunk_uuid)
+        organization_id = row[7]
+        scope = str(row[9] or "").strip().upper()
+        key = (chunk_uuid, organization_id, scope)
+        if chunk_uuid and key not in seen:
+            seen.add(key)
+            dedupe_keys.append(key)
 
     conn = pg_get_conn()
-
     try:
         with conn.cursor() as cur:
-            # 1) Dedup applicativa compatibile con TimescaleDB.
-            # Non richiede UNIQUE(chunk_uuid), quindi evita l'errore TS103.
-            if chunk_uuids:
+            if dedupe_keys:
                 execute_values(
                     cur,
                     """
-                    WITH doomed(chunk_uuid) AS (
-                        VALUES %s
-                    )
+                    WITH doomed(chunk_uuid, organization_id, scope) AS (VALUES %s)
                     DELETE FROM public.document_chunks d
                     USING doomed
-                    WHERE d.chunk_uuid::text = doomed.chunk_uuid::text;
+                    WHERE d.chunk_uuid::text = doomed.chunk_uuid::text
+                      AND d.scope IS NOT DISTINCT FROM doomed.scope
+                      AND d.organization_id IS NOT DISTINCT FROM doomed.organization_id::bigint
                     """,
-                    [(u,) for u in chunk_uuids]
+                    dedupe_keys,
                 )
 
-            # 2) Inserimento nuova versione corrente dei chunk.
-            # 2) Inserimento nuova versione corrente dei chunk.
             execute_values(
                 cur,
                 """
                 INSERT INTO public.document_chunks (
-                    log_id,
-                    chunk_index,
-                    toon_type,
-                    content_raw,
-                    content_semantic,
-                    metadata_json,
-                    chunk_uuid,
-                    organization_id,
-                    tier,
-                    scope,
-                    ingestion_ts
-                )
-                VALUES %s
+                    log_id, chunk_index, toon_type, content_raw, content_semantic,
+                    metadata_json, chunk_uuid, organization_id, tier, scope,
+                    status, ingestion_run_id, tenant_key, corpus_version,
+                    classification, embedding_model, ingestion_ts
+                ) VALUES %s
                 """,
-                rows
+                rows,
             )
-
         conn.commit()
-
-    except Exception as e:
+        return True
+    except Exception:
         conn.rollback()
-        print(f"   ⚠️ Postgres Batch Error: {e}")
-
+        raise
     finally:
         pg_put_conn(conn)
 
@@ -2499,23 +2976,48 @@ def get_embedding_dimension_safe(model) -> int:
 
 def ensure_qdrant_collection():
     dim = get_embedding_dimension_safe(embedder)
-
     try:
         info = qdrant_client.get_collection(QDRANT_COLLECTION)
-
         if info.config.params.vectors.size != dim:
-            print(f"⚠️ Vector dim mismatch! {info.config.params.vectors.size} vs {dim}")
-
+            raise RuntimeError(
+                f"Qdrant vector dimension mismatch: {info.config.params.vectors.size} != {dim}"
+            )
+    except RuntimeError:
+        raise
     except Exception:
         print(f"🆕 Creating Qdrant collection '{QDRANT_COLLECTION}' (dim={dim})")
-
         qdrant_client.create_collection(
             collection_name=QDRANT_COLLECTION,
-            vectors_config=models.VectorParams(
-                size=dim,
-                distance=models.Distance.COSINE,
-            ),
+            vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
         )
+
+    indexes = {
+        "scope": models.PayloadSchemaType.KEYWORD,
+        "tier": models.PayloadSchemaType.KEYWORD,
+        "organization_id": models.PayloadSchemaType.INTEGER,
+        "status": models.PayloadSchemaType.KEYWORD,
+        "doc_id": models.PayloadSchemaType.KEYWORD,
+        "chunk_id": models.PayloadSchemaType.KEYWORD,
+        "ingestion_run_id": models.PayloadSchemaType.KEYWORD,
+        "source_type": models.PayloadSchemaType.KEYWORD,
+        "classification": models.PayloadSchemaType.KEYWORD,
+        "corpus_version": models.PayloadSchemaType.KEYWORD,
+        "embedding_model": models.PayloadSchemaType.KEYWORD,
+    }
+    for field_name, schema_type in indexes.items():
+        try:
+            qdrant_client.create_payload_index(
+                collection_name=QDRANT_COLLECTION,
+                field_name=field_name,
+                field_schema=schema_type,
+                # La creazione dell'indice è idempotente e può proseguire lato
+                # Qdrant senza bloccare l'ingestion del primo documento.
+                wait=False,
+            )
+        except Exception as exc:
+            message = str(exc).lower()
+            if "already exists" not in message and "already indexed" not in message:
+                raise
 
 NEO4J_STRUCTURE_QUERY = """
 UNWIND $rows AS r
@@ -2528,8 +3030,14 @@ SET d.filename = r.filename,
     d.tier = r.tier,
     d.scope = r.scope,
     d.organization_id = r.organization_id,
+    d.tenant_key = r.tenant_key,
     d.ontology = r.ontology,
     d.log_id = r.log_id,
+    d.status = r.status,
+    d.ingestion_run_id = r.ingestion_run_id,
+    d.corpus_version = r.corpus_version,
+    d.classification = r.classification,
+    d.embedding_model = r.embedding_model,
     d.ingested_at = datetime()
 
 MERGE (p:Page {pid: r.doc_id + "::" + toString(r.page_no)})
@@ -2539,7 +3047,12 @@ SET p.doc_id = r.doc_id,
     p.tier = r.tier,
     p.scope = r.scope,
     p.organization_id = r.organization_id,
-    p.ontology = r.ontology
+    p.tenant_key = r.tenant_key,
+    p.ontology = r.ontology,
+    p.status = r.status,
+    p.ingestion_run_id = r.ingestion_run_id,
+    p.corpus_version = r.corpus_version,
+    p.classification = r.classification
 MERGE (d)-[:HAS_PAGE]->(p)
 
 MERGE (c:Chunk {id: r.chunk_id})
@@ -2553,7 +3066,13 @@ SET c.chunk_id = r.chunk_id,
     c.tier = r.tier,
     c.scope = r.scope,
     c.organization_id = r.organization_id,
+    c.tenant_key = r.tenant_key,
     c.ontology = r.ontology,
+    c.status = r.status,
+    c.ingestion_run_id = r.ingestion_run_id,
+    c.corpus_version = r.corpus_version,
+    c.classification = r.classification,
+    c.embedding_model = r.embedding_model,
     c.text = left(r.text_sem, 2500),
     c.section_hint = coalesce(r.section_hint, "")
 MERGE (p)-[:HAS_CHUNK]->(c)
@@ -2568,8 +3087,11 @@ UNWIND coalesce(r.nodes, []) AS n
 WITH r, c, n
 WHERE n.id IS NOT NULL AND trim(toString(n.id)) <> ""
 
-MERGE (e:Entity {id: n.id})
+MERGE (e:Entity {id: r.tenant_key + "::" + n.id})
 ON CREATE SET
+    e.canonical_id = n.id,
+    e.entity_key = r.tenant_key + "::" + n.id,
+    e.tenant_key = r.tenant_key,
     e.name = coalesce(n.name, n.id),
     e.category = CASE
         WHEN n.category IS NOT NULL AND n.category <> "UNCLASSIFIED"
@@ -2580,7 +3102,12 @@ ON CREATE SET
     e.scope = r.scope,
     e.organization_id = r.organization_id,
     e.sources = [r.filename_norm],
-    e.source_refs = [r.source_ref]
+    e.source_refs = [r.source_ref],
+    e.status = r.status,
+    e.corpus_version = r.corpus_version,
+    e.classification = r.classification,
+    e.embedding_model = r.embedding_model,
+    e.ingestion_run_ids = [r.ingestion_run_id]
 ON MATCH SET
     e.name = CASE
         WHEN n.name IS NOT NULL
@@ -2620,8 +3147,25 @@ ON MATCH SET
         WHEN r.source_ref IN coalesce(e.source_refs, [])
         THEN coalesce(e.source_refs, [])
         ELSE coalesce(e.source_refs, []) + r.source_ref
-    END
+    END,
+    e.ingestion_run_ids = CASE
+        WHEN r.ingestion_run_id IN coalesce(e.ingestion_run_ids, [])
+        THEN coalesce(e.ingestion_run_ids, [])
+        ELSE coalesce(e.ingestion_run_ids, []) + r.ingestion_run_id
+    END,
+    e.status = 'active' 
 SET e += coalesce(n.props, {})
+// I props estratti dall'LLM non possono modificare il confine tenant.
+SET e.canonical_id = n.id,
+    e.entity_key = r.tenant_key + "::" + n.id,
+    e.tenant_key = r.tenant_key,
+    e.tier = r.tier,
+    e.scope = r.scope,
+    e.organization_id = r.organization_id,
+    e.status = r.status,
+    e.corpus_version = r.corpus_version,
+    e.classification = r.classification,
+    e.embedding_model = r.embedding_model
 
 // Provenance esclusivamente a livello Chunk.
 // Non esiste più alcun collegamento diretto Page -> Entity o Entity -> Page.
@@ -2635,6 +3179,11 @@ SET m.filename = r.filename,
     m.tier = r.tier,
     m.scope = r.scope,
     m.organization_id = r.organization_id,
+    m.tenant_key = r.tenant_key,
+    m.status = r.status,
+    m.ingestion_run_id = r.ingestion_run_id,
+    m.corpus_version = r.corpus_version,
+    m.classification = r.classification,
     m.evidence_type = "chunk_entity_mention"
 
 RETURN count(*) AS entity_mentions_written
@@ -2654,11 +3203,24 @@ SET f.latex = r.latex,
     f.meaning_it = r.meaning_it,
     f.keywords = r.keywords,
     f.page = r.page_no,
-    f.source = r.filename
+    f.source = r.filename,
+    f.tier = r.tier,
+    f.scope = r.scope,
+    f.organization_id = r.organization_id,
+    f.tenant_key = r.tenant_key,
+    f.status = r.status,
+    f.ingestion_run_id = r.ingestion_run_id,
+    f.corpus_version = r.corpus_version,
+    f.classification = r.classification
 MERGE (c)-[hf:HAS_FORMULA]->(f)
 SET hf.filename = r.filename,
     hf.page_no = r.page_no,
-    hf.chunk_id = r.chunk_id
+    hf.chunk_id = r.chunk_id,
+    hf.tier = r.tier,
+    hf.scope = r.scope,
+    hf.organization_id = r.organization_id,
+    hf.status = r.status,
+    hf.ingestion_run_id = r.ingestion_run_id
 """
 
 def _flat_props(props) -> Dict[str, Any]:
@@ -2973,6 +3535,31 @@ def _cleanup_legacy_neo4j_links(
         ).consume()
 
 
+
+NEO4J_GLOBAL_TARGET_RELATIONS = {
+    "EVIDENCES", "IMPLEMENTS", "SATISFIES", "REFERENCES_REQUIREMENT",
+    "COMPLIES_WITH", "MAPS_TO", "ALIGNS_WITH", "SUPPORTS",
+}
+
+
+def ensure_neo4j_security_schema() -> None:
+    if not NEO4J_ENABLED or not neo4j_driver:
+        return
+    statements = [
+        "CREATE CONSTRAINT document_doc_id_unique IF NOT EXISTS FOR (n:Document) REQUIRE n.doc_id IS UNIQUE",
+        "CREATE CONSTRAINT page_pid_unique IF NOT EXISTS FOR (n:Page) REQUIRE n.pid IS UNIQUE",
+        "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (n:Chunk) REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT entity_id_unique IF NOT EXISTS FOR (n:Entity) REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT formula_fid_unique IF NOT EXISTS FOR (n:Formula) REQUIRE n.fid IS UNIQUE",
+        "CREATE INDEX chunk_tenant_status IF NOT EXISTS FOR (n:Chunk) ON (n.scope, n.organization_id, n.status)",
+        "CREATE INDEX entity_tenant_status IF NOT EXISTS FOR (n:Entity) ON (n.scope, n.organization_id, n.status)",
+        "CREATE INDEX document_tenant_status IF NOT EXISTS FOR (n:Document) ON (n.scope, n.organization_id, n.status)",
+    ]
+    with neo4j_driver.session() as session:
+        for statement in statements:
+            session.run(statement).consume()
+
+
 def flush_neo4j_rows_batch(rows: List[Dict[str, Any]]) -> bool:
     """
     Scrive il modello:
@@ -3006,7 +3593,7 @@ def flush_neo4j_rows_batch(rows: List[Dict[str, Any]]) -> bool:
             session.run(NEO4J_STRUCTURE_QUERY, rows=rows).consume()
             session.run(NEO4J_ENTITY_QUERY, rows=rows).consume()
 
-            edges_by_type: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}
+            edges_by_type: Dict[str, Dict[Tuple[str, str, str], Dict[str, Any]]] = {}
 
             for row in rows:
                 for edge in row.get("edges", []):
@@ -3058,13 +3645,30 @@ def flush_neo4j_rows_batch(rows: List[Dict[str, Any]]) -> bool:
                         or ""
                     )
 
+                    tenant_key = str(row.get("tenant_key") or "")
+                    if not tenant_key:
+                        continue
+
                     bucket = edges_by_type.setdefault(rel_type, {})
-                    key = (source, target)
+                    key = (tenant_key, source, target)
                     entry = bucket.setdefault(
                         key,
                         {
                             "source": source,
                             "target": target,
+                            "source_key": f"{tenant_key}::{source}",
+                            "target_key": f"{tenant_key}::{target}",
+                            "tenant_key": tenant_key,
+                            "scope": row.get("scope"),
+                            "organization_id": row.get("organization_id"),
+                            "status": row.get("status", "active"),
+                            "ingestion_run_id": row.get("ingestion_run_id"),
+                            "corpus_version": row.get("corpus_version"),
+                            "classification": row.get("classification"),
+                            "allow_global_target": (
+                                str(row.get("scope") or "").upper() == "ACCOUNT"
+                                and rel_type in NEO4J_GLOBAL_TARGET_RELATIONS
+                            ),
                             "props": {},
                             "source_files": set(),
                             "page_nos": set(),
@@ -3093,6 +3697,17 @@ def flush_neo4j_rows_batch(rows: List[Dict[str, Any]]) -> bool:
                     batch_edges.append({
                         "source": entry["source"],
                         "target": entry["target"],
+                        "source_key": entry["source_key"],
+                        "target_key": entry["target_key"],
+                        "tenant_key": entry["tenant_key"],
+                        "scope": entry["scope"],
+                        "organization_id": entry["organization_id"],
+                        "status": entry["status"],
+                        "ingestion_run_id": entry["ingestion_run_id"],
+                        "corpus_version": entry["corpus_version"],
+                        "classification": entry["classification"],
+                        "allow_global_target": entry["allow_global_target"],
+                        "global_target_key": f"GLOBAL::{entry['target']}",
                         "props": entry["props"],
                         "source_files": sorted(entry["source_files"]),
                         "page_nos": sorted(entry["page_nos"]),
@@ -3106,8 +3721,13 @@ def flush_neo4j_rows_batch(rows: List[Dict[str, Any]]) -> bool:
 
                 edge_query = f"""
                 UNWIND $batch AS e
-                MATCH (s:Entity {{id: e.source}})
-                MATCH (t:Entity {{id: e.target}})
+                MATCH (s:Entity {{id: e.source_key}})
+                MATCH (tenant_target:Entity {{id: e.target_key}})
+                OPTIONAL MATCH (global_target:Entity {{id: e.global_target_key, scope: 'GLOBAL', tier: 'A', status: 'active'}})
+                WITH e, s, CASE
+                    WHEN e.allow_global_target AND global_target IS NOT NULL THEN global_target
+                    ELSE tenant_target
+                END AS t
                 MERGE (s)-[r:{rel_type}]->(t)
                 ON CREATE SET
                     r.first_seen = datetime(),
@@ -3118,6 +3738,13 @@ def flush_neo4j_rows_batch(rows: List[Dict[str, Any]]) -> bool:
                     r.page_chunk_indices = [],
                     r.source_refs = []
                 SET r += coalesce(e.props, {{}}),
+                    r.tenant_key = e.tenant_key,
+                    r.scope = e.scope,
+                    r.organization_id = e.organization_id,
+                    r.status = e.status,
+                    r.ingestion_run_id = e.ingestion_run_id,
+                    r.corpus_version = e.corpus_version,
+                    r.classification = e.classification,
                     r.last_seen = datetime()
                 SET r.source_files = reduce(
                     acc = coalesce(r.source_files, []),
@@ -3215,12 +3842,13 @@ def validate_neo4j_graph_model(doc_id: str) -> None:
 
 def flush_neo4j_formulas_batch(rows: List[Dict[str, Any]]):
     if not NEO4J_ENABLED or not rows:
-        return
+        return True
     try:
         with neo4j_driver.session() as session:
-            session.run(NEO4J_FORMULA_QUERY, rows=rows)
-    except Exception as e:
-        print(f"   ⚠️ Neo4j Formula Batch Error: {e}")
+            session.run(NEO4J_FORMULA_QUERY, rows=rows).consume()
+        return True
+    except Exception:
+        raise
 
 
 # =========================
@@ -3488,10 +4116,15 @@ def render_full_page_jpeg(page: fitz.Page, dpi: int = VISION_DPI) -> bytes:
 _vision_cache: Dict[str, Dict[str, Any]] = {}
 _vision_cache_order: List[str] = []
 
+def _tenant_cache_key(key: str) -> str:
+    return f"ORG:{ORGANIZATION_ID}|{CORPUS_VERSION}|{VISION_MODEL_NAME}|{key}"
+
+
 def _vision_cache_get(key: str) -> Optional[Dict[str, Any]]:
-    return _vision_cache.get(key)
+    return _vision_cache.get(_tenant_cache_key(key))
 
 def _vision_cache_put(key: str, val: Dict[str, Any]):
+    key = _tenant_cache_key(key)
     if key in _vision_cache:
         return
     _vision_cache[key] = val
@@ -4559,7 +5192,11 @@ MATH_BROAD_PAT = re.compile(
     r")"
 )
 
-def extract_file_chunks(file_path: str, log_id: int) -> List[Dict[str, Any]]:
+def extract_file_chunks(
+    file_path: str,
+    log_id: int,
+    doc_meta: Optional[dict] = None,
+) -> List[Dict[str, Any]]:
     """
     Estrazione Universale (PDF) v3.0:
     1. SINGOLO PASSAGGIO CON FITZ. Nessun doppio caricamento.
@@ -4591,7 +5228,10 @@ def extract_file_chunks(file_path: str, log_id: int) -> List[Dict[str, Any]]:
     try:
         doc = fitz.open(file_path)
         # Calcolo ID univoco documento (hash)
-        doc_id = sha256_file(file_path)[:32]
+        doc_id = tenant_scoped_doc_id(
+            file_path,
+            doc_meta or {"scope": "ACCOUNT", "organization_id": ORGANIZATION_ID},
+        )
 
         # ==============================================================
         # CICLO UNICO: SCORRIAMO LE PAGINE UNA SOLA VOLTA
@@ -4772,7 +5412,11 @@ def extract_file_chunks(file_path: str, log_id: int) -> List[Dict[str, Any]]:
 
 
 
-def extract_pdf_as_markdown_assets(file_path: str, log_id: int) -> List[Dict[str, Any]]:
+def extract_pdf_as_markdown_assets(
+    file_path: str,
+    log_id: int,
+    doc_meta: Optional[dict] = None,
+) -> List[Dict[str, Any]]:
     """
     Estrae testo e asset da PDF.
     FIX:
@@ -4789,7 +5433,10 @@ def extract_pdf_as_markdown_assets(file_path: str, log_id: int) -> List[Dict[str
 
     filename = os.path.basename(file_path)
     total_pages = len(doc)
-    doc_id = sha256_file(file_path)[:32]
+    doc_id = tenant_scoped_doc_id(
+        file_path,
+        doc_meta or {"scope": "ACCOUNT", "organization_id": ORGANIZATION_ID},
+    )
 
     print(f"   🚀 Ingestion: {total_pages} pagine | Vision: {VISION_MODEL_NAME} | Brain: {LLM_MODEL_NAME}")
 
@@ -5372,6 +6019,77 @@ def enrich_synonyms_from_local_text(nodes: list[dict], text: str) -> list[dict]:
 # =========================
 # FILE DISPATCH (PDF only here)
 # =========================
+
+def mark_ingestion_run_partial_failure(
+    *,
+    log_id: int,
+    ingestion_run_id: str,
+    doc_id: str,
+    point_ids: List[str],
+    error: Exception,
+) -> None:
+    """Compensazione best-effort: rende invisibili tutti gli artefatti parziali."""
+    message = str(error)[:2000]
+    try:
+        conn = pg_get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE public.document_chunks SET status='failed' WHERE ingestion_run_id=%s::uuid",
+                    (ingestion_run_id,),
+                )
+                cur.execute(
+                    "UPDATE public.ingestion_images SET status='failed' WHERE ingestion_run_id=%s::uuid",
+                    (ingestion_run_id,),
+                )
+            conn.commit()
+        finally:
+            pg_put_conn(conn)
+    except Exception as exc:
+        print(f"   ⚠️ Compensazione PostgreSQL fallita: {exc}")
+
+    try:
+        if qdrant_client and point_ids:
+            qdrant_client.set_payload(
+                collection_name=QDRANT_COLLECTION,
+                payload={"status": "failed", "failure_reason": message},
+                points=list(dict.fromkeys(point_ids)),
+                wait=True,
+            )
+    except Exception as exc:
+        print(f"   ⚠️ Compensazione Qdrant fallita: {exc}")
+
+    try:
+        if NEO4J_ENABLED and neo4j_driver:
+            with neo4j_driver.session() as session:
+                session.run(
+                    """
+                    MATCH (n)
+                    WHERE n.ingestion_run_id = $run_id
+                      AND (n:Document OR n:Page OR n:Chunk OR n:Formula)
+                    SET n.status = 'failed', n.failure_reason = $reason
+                    """,
+                    run_id=ingestion_run_id,
+                    reason=message,
+                ).consume()
+                session.run(
+                    """
+                    MATCH ()-[r]->()
+                    WHERE r.ingestion_run_id = $run_id
+                    SET r.status = 'failed', r.failure_reason = $reason
+                    """,
+                    run_id=ingestion_run_id,
+                    reason=message,
+                ).consume()
+    except Exception as exc:
+        print(f"   ⚠️ Compensazione Neo4j fallita: {exc}")
+
+    try:
+        pg_close_log(log_id, "PARTIAL_FAILED", 0, 0, message)
+    except Exception as exc:
+        print(f"   ⚠️ Chiusura log PARTIAL_FAILED fallita: {exc}")
+
+
 def process_ai_and_db(
     file_path: str,
     source_type: str,
@@ -5396,10 +6114,28 @@ def process_ai_and_db(
     os.makedirs(PROCESSED_DIR, exist_ok=True)
     os.makedirs(FAILED_DIR, exist_ok=True)
 
-    tier = (doc_meta or {}).get("tier", "B")
-    scope = (doc_meta or {}).get("scope", "ACCOUNT")
+    tier = str((doc_meta or {}).get("tier", "B")).strip().upper()
+    scope = str((doc_meta or {}).get("scope", "ACCOUNT")).strip().upper()
     org_id = (doc_meta or {}).get("organization_id")
     ontology = (doc_meta or {}).get("ontology", DEFAULT_ONTOLOGY)
+    ingestion_run_id = str((doc_meta or {}).get("ingestion_run_id") or uuid.uuid4())
+    (doc_meta or {})["ingestion_run_id"] = ingestion_run_id
+    classification = str((doc_meta or {}).get("classification") or DEFAULT_CLASSIFICATION).lower()
+    corpus_version = str((doc_meta or {}).get("corpus_version") or CORPUS_VERSION)
+    embedding_model = str((doc_meta or {}).get("embedding_model") or EMBEDDING_MODEL_NAME)
+    document_status = DOCUMENT_ACTIVE_STATUS
+
+    if scope == "GLOBAL":
+        if tier != "A" or org_id is not None:
+            raise ValueError("Invariante non valida: GLOBAL richiede Tier A e organization_id NULL")
+    elif scope == "ACCOUNT":
+        if tier not in {"B", "C"} or org_id is None:
+            raise ValueError("Invariante non valida: ACCOUNT richiede Tier B/C e organization_id")
+        org_id = int(org_id)
+    else:
+        raise ValueError(f"Scope documento non valido: {scope!r}")
+
+    tenant_key = build_tenant_key(scope, org_id)
 
     print(
         f"   ⚙️ Engine Start: {filename} | tier={tier} | scope={scope} | org_id={org_id} | "
@@ -5411,8 +6147,15 @@ def process_ai_and_db(
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE ingestion_images SET organization_id = %s, tier = %s, scope = %s WHERE log_id = %s",
-                (org_id, tier, scope, log_id)
+                """
+                UPDATE ingestion_images
+                SET organization_id = %s, tier = %s, scope = %s, status = %s,
+                    ingestion_run_id = %s::uuid, tenant_key = %s, corpus_version = %s,
+                    classification = %s
+                WHERE log_id = %s
+                """,
+                (org_id, tier, scope, document_status, ingestion_run_id, tenant_key,
+                 corpus_version, classification, log_id)
             )
         conn.commit()
     except Exception as e:
@@ -5420,8 +6163,13 @@ def process_ai_and_db(
     finally:
         pg_put_conn(conn)
 
-    doc_id = sha256_file(file_path)[:32]
-    
+    doc_id = tenant_scoped_doc_id(
+        file_path,
+        {
+            "scope": scope,
+            "organization_id": org_id,
+        },
+    )
 
     global embedder, qdrant_client
     embedder = get_embedder()
@@ -5509,8 +6257,7 @@ def process_ai_and_db(
                 show_progress_bar=True,
             )
         except Exception as e:
-            print(f"   ⚠️ Errore Embeddings: {e}")
-            break
+            raise RuntimeError(f"Errore embeddings: {e}") from e
 
         # ------------------------------------------------------------
         # KG PER CHUNK: nessuna aggregazione a livello Page.
@@ -5804,6 +6551,7 @@ def process_ai_and_db(
                 "tier": tier,
                 "scope": scope,
                 "organization_id": org_id,
+                "tenant_key": tenant_key,
                 "ontology": ontology,
                 "source_name": filename,
                 "source_type": source_type,
@@ -5812,6 +6560,11 @@ def process_ai_and_db(
                 "page_chunk_index": page_chunk_index,
                 "chunk_id": chunk_id,
                 "source_ref": source_ref,
+                "status": document_status,
+                "ingestion_run_id": ingestion_run_id,
+                "embedding_model": embedding_model,
+                "corpus_version": corpus_version,
+                "classification": classification,
             })
 
             if ch.get("image_id") is not None:
@@ -5841,7 +6594,13 @@ def process_ai_and_db(
                 chunk_id,
                 doc_meta.get("organization_id"),
                 doc_meta.get("tier"),
-                doc_meta.get("scope")
+                doc_meta.get("scope"),
+                document_status,
+                ingestion_run_id,
+                tenant_key,
+                corpus_version,
+                classification,
+                embedding_model
             ))
 
             chunk_nodes, chunk_edges = chunk_kg_results.get(
@@ -5919,6 +6678,11 @@ def process_ai_and_db(
                 props.setdefault("tier", tier)
                 props.setdefault("scope", scope)
                 props.setdefault("organization_id", org_id)
+                props.setdefault("tenant_key", tenant_key)
+                props.setdefault("status", document_status)
+                props.setdefault("ingestion_run_id", ingestion_run_id)
+                props.setdefault("corpus_version", corpus_version)
+                props.setdefault("classification", classification)
 
                 final_edges.append({
                     "source": source,
@@ -5936,8 +6700,14 @@ def process_ai_and_db(
                 "tier": tier,
                 "scope": scope,
                 "organization_id": org_id,
+                "tenant_key": tenant_key,
                 "ontology": ontology,
                 "log_id": log_id,
+                "status": document_status,
+                "ingestion_run_id": ingestion_run_id,
+                "corpus_version": corpus_version,
+                "classification": classification,
+                "embedding_model": embedding_model,
                 "chunk_id": chunk_id,
                 "chunk_index": global_idx,
                 "page_chunk_index": page_chunk_index,
@@ -5958,9 +6728,10 @@ def process_ai_and_db(
         )
 
         if must_flush:
-            flush_postgres_chunks_batch(pg_rows)
-
+            current_point_ids = [str(point["id"]) for point in qdrant_points]
             try:
+                flush_postgres_chunks_batch(pg_rows)
+
                 points = [
                     models.PointStruct(
                         id=point["id"],
@@ -5969,15 +6740,25 @@ def process_ai_and_db(
                     )
                     for point in qdrant_points
                 ]
-                qdrant_client.upsert(
-                    collection_name=QDRANT_COLLECTION,
-                    points=points,
-                    wait=True,
-                )
-            except Exception as e:
-                print(f"   ⚠️ Qdrant Error: {e}")
+                if points:
+                    qdrant_client.upsert(
+                        collection_name=QDRANT_COLLECTION,
+                        points=points,
+                        wait=True,
+                    )
 
-            flush_neo4j_rows_batch(neo4j_rows)
+                if not flush_neo4j_rows_batch(neo4j_rows):
+                    raise RuntimeError("Scrittura Neo4j incompleta")
+            except Exception as exc:
+                mark_ingestion_run_partial_failure(
+                    log_id=log_id,
+                    ingestion_run_id=ingestion_run_id,
+                    doc_id=doc_id,
+                    point_ids=current_point_ids,
+                    error=exc,
+                )
+                move_file_preserving_structure(file_path, FAILED_DIR)
+                raise
 
             pg_rows.clear()
             qdrant_points.clear()
@@ -6023,8 +6804,14 @@ def main():
     - Consumer: fa embeddings, KG, Qdrant, Postgres, Neo4j
     """
     total_t0 = time.time()
-    
-    
+
+    ensure_postgres_security_schema()
+    ensure_neo4j_security_schema()
+
+    if PG_SCHEMA_MIGRATION_ONLY:
+        print("✅ Bootstrap sicurezza PostgreSQL/Neo4j completato. Nessuna ingestion eseguita.")
+        return
+
     USE_PRODUCER_CONSUMER = os.getenv("USE_PRODUCER_CONSUMER", "1") == "1"
     os.environ["PRODUCER_CONSUMER_MODE"] = "1" if USE_PRODUCER_CONSUMER else "0"
     
@@ -6086,6 +6873,7 @@ def main():
 
             try:
                 doc_meta = dispatch_document(file_path, root_folder)
+                doc_meta["ingestion_run_id"] = str(uuid.uuid4())
                 log_id = pg_start_log(filename, "document", doc_meta)
 
                 print(f"   ⚙️ Extracting: {filename}...")
@@ -6097,7 +6885,7 @@ def main():
                 if file_path.lower().endswith(".md"):
                     chunks = extract_markdown_chunks(file_path, log_id)
                 else:
-                    chunks = extract_file_chunks(file_path, log_id)
+                    chunks = extract_file_chunks(file_path, log_id, doc_meta)
 
                 if not chunks:
                     pg_close_log(log_id, "FAILED", 0, 0, "No chunks extracted")
@@ -6197,6 +6985,7 @@ def main():
 
         try:
             doc_meta = dispatch_document(file_path, root_folder)
+            doc_meta["ingestion_run_id"] = str(uuid.uuid4())
             log_id = pg_start_log(filename, "document", doc_meta)
 
             print(f"   ⚙️ Producer Extracting: {filename}...")
@@ -6205,7 +6994,7 @@ def main():
             if file_path.lower().endswith(".md"):
                 chunks = extract_markdown_chunks(file_path, log_id)
             else:
-                chunks = extract_file_chunks(file_path, log_id)
+                chunks = extract_file_chunks(file_path, log_id, doc_meta)
 
             if not chunks:
                 pg_close_log(log_id, "FAILED", 0, 0, "No chunks extracted")
