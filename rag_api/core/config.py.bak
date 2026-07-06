@@ -1,10 +1,13 @@
-"""Configurazione centralizzata del servizio RAG.
+"""
+Configurazione centralizzata del servizio RAG.
 
 Questo modulo contiene esclusivamente configurazione statica e lettura delle
-variabili ambiente. Non apre connessioni, non carica modelli e non contiene
+variabili ambiente. 
+Non apre connessioni, non carica modelli e non contiene
 logica di retrieval o dipendenze da Reflex.
 
 Derivato dalla configurazione presente nell'ultimo ``gui_reflex.py`` del PoC.
+
 """
 
 from __future__ import annotations
@@ -92,7 +95,6 @@ def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
 
 # Whitelist di sicurezza usata dalle query Neo4j.
 DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS: Final[tuple[str, ...]] = (
-    # Structure / classification
     "IS_A",
     "PART_OF",
     "HAS_COMPONENT",
@@ -102,8 +104,6 @@ DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS: Final[tuple[str, ...]] = (
     "MAPS_TO",
     "DEFINES",
     "CLASSIFIES",
-
-    # Governance / compliance
     "COMPLIES_WITH",
     "NON_COMPLIANT_WITH",
     "HAS_COMPLIANCE_STATUS",
@@ -116,8 +116,6 @@ DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS: Final[tuple[str, ...]] = (
     "APPROVES",
     "REVIEWS",
     "ASSIGNS_RESPONSIBILITY_TO",
-
-    # Incident / process
     "TRIGGERS",
     "ACTIVATES",
     "STARTS",
@@ -127,22 +125,9 @@ DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS: Final[tuple[str, ...]] = (
     "ESCALATES_TO",
     "MANAGES",
     "HANDLES",
-    "CONTAINS_INCIDENT",
-    "ERADICATES",
-    "RECOVERS",
-    "CLOSES",
-    "IMPROVES",
-
-    # Notification / authority
     "NOTIFIES",
     "REPORTS_TO",
-    "RECEIVES_NOTIFICATION",
-    "REQUIRES_NOTIFICATION_TO",
     "HAS_DEADLINE",
-    "HAS_RECIPIENT",
-    "COMMUNICATES_TO",
-
-    # Framework / implementation
     "SUPPORTS",
     "ENABLES",
     "IMPLEMENTS",
@@ -151,20 +136,14 @@ DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS: Final[tuple[str, ...]] = (
     "CONTRIBUTES_TO",
     "MEASURES",
     "MONITORS",
-
-    # Risk / security
     "MITIGATES",
     "REDUCES",
     "THREATENS",
     "EXPLOITS",
     "PROTECTS",
     "VULNERABLE_TO",
-    "COMPROMISES",
     "IMPACTS",
     "AFFECTS",
-    "EXPOSES",
-
-    # Audit / evidence
     "GENERATES",
     "VERIFIES",
     "TESTS",
@@ -174,59 +153,8 @@ DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS: Final[tuple[str, ...]] = (
     "EVIDENCES",
     "SATISFIES",
     "REFERENCES_REQUIREMENT",
-
-    # Formula graph
     "HAS_FORMULA",
-    "HAS_VARIABLE",
 )
-
-
-# Alias deterministici condivisi con l'ingestion. Sono ammessi soltanto mapping
-# che non cambiano polarità o significato della relazione.
-DEFAULT_NEO4J_RELATIONSHIP_ALIASES: Final[dict[str, str]] = {
-    "IMPLEMENT": "IMPLEMENTS",
-    "IMPLEMENTED": "IMPLEMENTS",
-    "IMPLEMENTING": "IMPLEMENTS",
-    "IMPLEMENTES": "IMPLEMENTS",
-    "COMPLIANT": "COMPLIES_WITH",
-    "COMPLIES": "COMPLIES_WITH",
-    "COMPLY": "COMPLIES_WITH",
-    "CONFORME_A": "COMPLIES_WITH",
-    "CONFORMITY_WITH": "COMPLIES_WITH",
-    "NON_COMPLIANT": "NON_COMPLIANT_WITH",
-    "NON_COMPLIANCE": "NON_COMPLIANT_WITH",
-    "NON_CONFORMITY": "NON_COMPLIANT_WITH",
-    "NOT_COMPLIANT": "NON_COMPLIANT_WITH",
-    "GAP_WITH": "NON_COMPLIANT_WITH",
-    "VIOLATES": "NON_COMPLIANT_WITH",
-    "STATUS": "HAS_COMPLIANCE_STATUS",
-    "COMPLIANCE_STATUS": "HAS_COMPLIANCE_STATUS",
-    "IMPLEMENTATION_STATUS": "HAS_COMPLIANCE_STATUS",
-    "MATURITY_STATUS": "HAS_COMPLIANCE_STATUS",
-    "GAP": "HAS_GAP",
-    "HAS_FINDING": "HAS_GAP",
-    "HAS_DEFICIENCY": "HAS_GAP",
-    "HAS_WEAKNESS": "HAS_GAP",
-    "REMEDIATION_REQUIRED": "REQUIRES_REMEDIATION",
-    "NEEDS_REMEDIATION": "REQUIRES_REMEDIATION",
-    "REQUIRES_CORRECTIVE_ACTION": "REQUIRES_REMEDIATION",
-    "CORRECTS": "REMEDIATES",
-    "CLOSES_GAP": "REMEDIATES",
-    "NOTIFICATION_TO": "NOTIFIES",
-    "SENDS_NOTIFICATION_TO": "NOTIFIES",
-    "MUST_NOTIFY": "NOTIFIES",
-    "REPORT_TO": "REPORTS_TO",
-    "REPORTS": "REPORTS_TO",
-    "ESCALATES_REPORT_TO": "REPORTS_TO",
-    "DEADLINE": "HAS_DEADLINE",
-    "TIME_LIMIT": "HAS_DEADLINE",
-    "WITHIN_HOURS": "HAS_DEADLINE",
-    "WITHIN_DAYS": "HAS_DEADLINE",
-    "RESPONSIBLE": "ASSIGNS_RESPONSIBILITY_TO",
-    "ACCOUNTABLE": "ASSIGNS_RESPONSIBILITY_TO",
-    "OWNER": "ASSIGNS_RESPONSIBILITY_TO",
-    "ASSIGNED_TO": "ASSIGNS_RESPONSIBILITY_TO",
-}
 
 
 class RagSettings(BaseModel):

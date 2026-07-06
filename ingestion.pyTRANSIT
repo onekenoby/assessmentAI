@@ -1,4 +1,5 @@
-# FINAL MULTI-TENANT HARDENED VERSION - aligned with Architecture v1.1
+# FINAL MULTI-TENANT HARDENED VERSION - aligned with Architecture 
+# v1.1
 
 """
 set EMBED_BATCH_SIZE=16
@@ -536,7 +537,7 @@ KG_WINDOW_OVERLAP_CHARS = int(os.getenv("KG_WINDOW_OVERLAP_CHARS", "300"))
 # 0 = nessun limite. Ogni pagina lunga viene coperta da tutte le finestre necessarie.
 KG_MAX_WINDOWS_PER_PAGE = int(os.getenv("KG_MAX_WINDOWS_PER_PAGE", "0"))
 KG_MAX_TRIPLES = int(os.getenv("KG_MAX_TRIPLES", "50"))           # 10 soft cap (sanitize already caps)
-KG_TIMEOUT = int(os.getenv("KG_TIMEOUT", "360"))                   # seconds per KG task/page
+KG_TIMEOUT = int(os.getenv("KG_TIMEOUT", "180"))                   # seconds per KG task/page
 
 # Backward-compat aliases (do NOT use in new code)
 KG_CHARS_LIMIT = KG_TEXT_MAX_CHARS
@@ -548,7 +549,12 @@ KG_TASK_TIMEOUT_PER_PAGE = KG_TIMEOUT
 KG_TIMEOUT_PER_PAGE = KG_TIMEOUT
 
 
-
+# Timeout separati: devono restare INTERI, non stringhe.
+# I valori reali si configurano da docker-compose / variabili ambiente.
+OLLAMA_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT_S", "240"))
+OLLAMA_KG_TIMEOUT_S = int(os.getenv("OLLAMA_KG_TIMEOUT_S", "300"))
+OLLAMA_VISION_TIMEOUT_S = int(os.getenv("OLLAMA_VISION_TIMEOUT_S", str(OLLAMA_TIMEOUT_S)))
+OLLAMA_RETRIES = int(os.getenv("OLLAMA_RETRIES", "0"))
 
 
 BASE_DATA_DIR = os.getenv("BASE_DIR", "./data/assessment")
@@ -836,7 +842,7 @@ LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama3.1:8b")
 VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "ministral-3:8b")
 
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama_assessment:11434").rstrip("/")
 
 OLLAMA_API_GENERATE = os.getenv(
     "OLLAMA_API_GENERATE",
@@ -2384,7 +2390,7 @@ def generate_chart_analysis_it(chart_json: dict, page_text: str = "") -> str:
             ],
             # AGGIUNTO format='json' per evitare testo extra
             format='json', 
-            options={"temperature": 0.1, "num_predict": 600, "num_ctx": 4096},
+            options={"temperature": 0.1, "num_predict": 600, "num_ctx": 3072},
         )
         return (resp.get("message", {}).get("content", "") or "").strip()
     except Exception as e:
@@ -3357,7 +3363,7 @@ def _normalize_graph_schema(js: Any) -> Optional[Dict[str, Any]]:
 
         src = e.get("source") or e.get("from")
         tgt = e.get("target") or e.get("to")
-        rel = e.get("relation") or e.get("type") or "RELATED_TO"
+        rel = e.get("relation") or e.get("type") or e.get("label") or "RELATED_TO"
 
         if not src or not tgt:
             continue
@@ -3800,12 +3806,12 @@ def validate_neo4j_graph_model(doc_id: str) -> None:
                 MATCH (d:Document {doc_id: $doc_id})
                 OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
                 OPTIONAL MATCH (p)-[:HAS_CHUNK]->(c:Chunk)
-                OPTIONAL MATCH (c)-[:MENTIONS]->(e:Entity)
+                OPTIONAL MATCH (c)-[m:MENTIONS]->(e:Entity)
                 RETURN
                     count(DISTINCT p) AS pages,
                     count(DISTINCT c) AS chunks,
                     count(DISTINCT e) AS entities,
-                    count(DISTINCT [c.id, e.id]) AS mentions
+                    count(DISTINCT m) AS mentions
                 """,
                 doc_id=doc_id,
             ).single()
@@ -3895,27 +3901,6 @@ def llm_chat(prompt: str, text: str, model: str, max_tokens: int = LLM_MAX_TOKEN
 # producer e consumer non devono chiamare Ollama contemporaneamente.
 OLLAMA_CALL_LOCK = Lock()
 
-'''
-OLLAMA_API_GENERATE = os.getenv(
-    "OLLAMA_API_GENERATE",
-    "http://127.0.0.1:11434/api/generate"
-)
-
-OLLAMA_API_CHAT = os.getenv(
-    "OLLAMA_API_CHAT",
-    "http://127.0.0.1:11434/api/chat"
-)
-'''
-
-OLLAMA_API_CHAT="http://ollama_assessment:11434/api/chat"
-OLLAMA_API_GENERATE="http://ollama_assessment:11434/api/generate"
-
-
-# Timeout separati: evitano che una singola chiamata Ollama sembri bloccare tutta l'ingestion.
-OLLAMA_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT_S", "240"))
-OLLAMA_VISION_TIMEOUT_S = int(os.getenv("OLLAMA_VISION_TIMEOUT_S", str(OLLAMA_TIMEOUT_S)))
-OLLAMA_KG_TIMEOUT_S = int(os.getenv("OLLAMA_KG_TIMEOUT_S", "180"))
-OLLAMA_RETRIES = int(os.getenv("OLLAMA_RETRIES", "1"))
 
 
 def ollama_chat_http(
@@ -3948,7 +3933,7 @@ def ollama_chat_http(
     last_err = None
 
     with OLLAMA_CALL_LOCK:
-        for attempt in range(OLLAMA_RETRIES + 1):
+        for attempt in range(int(OLLAMA_RETRIES) + 1):
             try:
                 r = requests.post(
                     OLLAMA_API_CHAT,
@@ -3965,7 +3950,7 @@ def ollama_chat_http(
                 last_err = e
                 sleep_s = min(3.0, 0.75 * (attempt + 1))
                 print(
-                    f"   ⚠️ Ollama chat retry {attempt + 1}/{OLLAMA_RETRIES + 1} "
+                    f"   ⚠️ Ollama chat retry {attempt + 1}/{int(OLLAMA_RETRIES) + 1} "
                     f"| model={model} | err={e}"
                 )
                 time.sleep(sleep_s)
@@ -3979,7 +3964,7 @@ def llm_chat_multimodal(
     image_bytes: bytes,
     model: str,
     max_tokens: int = 4000,
-    num_ctx: int = 4096,
+    num_ctx: int = 3072,
     response_format_json: bool = False,  # ✅ usa format="json"
     force_json: Optional[bool] = None,   # ✅ ALIAS retro-compat (fix definitivo)
 ) -> str:
@@ -4023,7 +4008,7 @@ def llm_chat_multimodal(
     with OLLAMA_CALL_LOCK:
         last_err = None
 
-        for attempt in range(OLLAMA_RETRIES + 1):
+        for attempt in range(int(OLLAMA_RETRIES) + 1):
             try:
                 r = requests.post(
                     OLLAMA_API_GENERATE,
@@ -4759,39 +4744,51 @@ Return ONLY valid JSON. Example of EXACT expected format:
     
     try:
         # TENTATIVO 1: JSON MODE
+        
+        
+        
         raw_content = ollama_chat_http(
             model=model_name,
             messages=[
-                {"role": "system", "content": FLAT_KG_PROMPT},
-                {"role": "user", "content": f"Extract entities and relations in JSON format from this text:\n\n{text[:3500]}"},
+                {
+                    "role": "system",
+                    "content": FLAT_KG_PROMPT + "\n\nIMPORTANT: Return ONLY raw JSON. No markdown. No explanation."
+                },
+                {
+                    "role": "user",
+                    "content": f"Extract entities and relations from this text:\n\n{text[:1800]}"
+                },
             ],
             options={
                 "temperature": 0.0,
-                "num_predict": 1800,
-                "num_ctx": 4096,
+                "num_predict": 600,
+                "num_ctx": 3072,
             },
-            response_format_json=True,
+            response_format_json=False,
             timeout_s=OLLAMA_KG_TIMEOUT_S,
         )
+                
+        
+        
         js = safe_json_extract(raw_content)
 
-        if not js or not isinstance(js, dict) or not js.get("nodes"):
-            raise ValueError("JSON incompleto o senza nodi")
+        if not js or not isinstance(js, dict) or not (js.get("nodes") or js.get("entities")):
+            raise ValueError("JSON incompleto o senza nodi/entities")
 
     except Exception as e:
-        print(f"   ⚠️ [KG-RETRY] Pag {page_no}: Fallito JSON mode. Riprovo in RAW mode...")
+        print(f"   ⚠️ [KG-RETRY] Pag {page_no}: tentativo KG compatto fallito ({e}). Riprovo in RAW mode...")
         try:
             # TENTATIVO 2: RAW MODE (Fallback robusto)
             raw_content = ollama_chat_http(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": FLAT_KG_PROMPT + "\nIMPORTANT: Return ONLY raw JSON. No markdown blocks."},
-                    {"role": "user", "content": f"Extract entities and relations from this text:\n\n{text[:3000]}"},
+                    {"role": "user", "content": f"Extract entities and relations from this text:\n\n{text[:1800]}"},
                 ],
                 options={
-                    "temperature": 0.1,
-                    "num_predict": 1600,
-                    "num_ctx": 4096,
+                    "temperature": 0.0,
+                    "num_predict": 600,
+                    "num_ctx": 3072,
                 },
                 response_format_json=False,
                 timeout_s=OLLAMA_KG_TIMEOUT_S,
@@ -6350,7 +6347,8 @@ def process_ai_and_db(
                 page_chunk_index = int(ch.get("page_chunk_index") or 0)
 
                 try:
-                    result = future.result(timeout=KG_TIMEOUT)
+                    # result = future.result(timeout=KG_TIMEOUT) - provvisorio
+                    result = future.result()
                     if (
                         not result
                         or not isinstance(result, (list, tuple))
@@ -6812,10 +6810,8 @@ def main():
         print("✅ Bootstrap sicurezza PostgreSQL/Neo4j completato. Nessuna ingestion eseguita.")
         return
 
-    USE_PRODUCER_CONSUMER = os.getenv("USE_PRODUCER_CONSUMER", "1") == "1"
+    USE_PRODUCER_CONSUMER = os.getenv("USE_PRODUCER_CONSUMER", "0").strip() == "1"
     os.environ["PRODUCER_CONSUMER_MODE"] = "1" if USE_PRODUCER_CONSUMER else "0"
-    
-    #USE_PRODUCER_CONSUMER = os.getenv("USE_PRODUCER_CONSUMER", "1") == "1"
 
 
 
@@ -6836,7 +6832,8 @@ def main():
         print("   ☁️ Ollama remoto/containerizzato: skip restart locale.")
 
     print("\n" + "=" * 60)
-    print("=== Ingestion Engine v2.5 (Producer/Consumer Edition) ===")
+    mode_label = "Producer/Consumer Edition" if USE_PRODUCER_CONSUMER else "Sequential Edition"
+    print(f"=== Ingestion Engine v2.5 ({mode_label}) ===")
     print("=" * 60 + "\n")
 
     supported = {".pdf", ".md"}

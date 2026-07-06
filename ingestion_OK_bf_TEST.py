@@ -536,7 +536,7 @@ KG_WINDOW_OVERLAP_CHARS = int(os.getenv("KG_WINDOW_OVERLAP_CHARS", "300"))
 # 0 = nessun limite. Ogni pagina lunga viene coperta da tutte le finestre necessarie.
 KG_MAX_WINDOWS_PER_PAGE = int(os.getenv("KG_MAX_WINDOWS_PER_PAGE", "0"))
 KG_MAX_TRIPLES = int(os.getenv("KG_MAX_TRIPLES", "50"))           # 10 soft cap (sanitize already caps)
-KG_TIMEOUT = int(os.getenv("KG_TIMEOUT", "360"))                   # seconds per KG task/page
+KG_TIMEOUT = int(os.getenv("KG_TIMEOUT", "180"))                   # seconds per KG task/page
 
 # Backward-compat aliases (do NOT use in new code)
 KG_CHARS_LIMIT = KG_TEXT_MAX_CHARS

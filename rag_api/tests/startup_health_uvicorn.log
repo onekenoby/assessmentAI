@@ -1,0 +1,13 @@
+INFO:     Started server process [23612]
+INFO:     Waiting for application startup.
+POC_MODE: ruolo PostgreSQL privilegiato consentito (user=admin, superuser=True, bypassrls=True)
+Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]Loading weights: 100%|##########| 391/391 [00:00<00:00, 13869.87it/s]
+Loading weights:   0%|          | 0/105 [00:00<?, ?it/s]Loading weights:  60%|######    | 63/105 [00:00<00:00, 579.87it/s]Loading weights: 100%|##########| 105/105 [00:00<00:00, 744.22it/s]
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:60876 - "WebSocket /_event/?token=9698e9b0-c38b-408d-bb73-3055296dfe5f&EIO=4&transport=websocket" 403
+INFO:     connection rejected (403 Forbidden)
+INFO:     connection closed
+INFO:     127.0.0.1:60877 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60878 - "GET /health/ready HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60879 - "GET /health/ready?deep=true HTTP/1.1" 200 OK

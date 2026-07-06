@@ -1,0 +1,188 @@
+{
+  "python": "3.11.9",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "project_root": "E:\\Dev\\assessmentAI\\rag_api",
+  "results": [
+    {
+      "name": "python",
+      "status": "OK",
+      "detail": "CPython 3.11.9",
+      "version": ""
+    },
+    {
+      "name": "fastapi",
+      "status": "OK",
+      "detail": "import 'fastapi' riuscito",
+      "version": "0.138.2"
+    },
+    {
+      "name": "pydantic",
+      "status": "OK",
+      "detail": "import 'pydantic' riuscito",
+      "version": "2.13.4"
+    },
+    {
+      "name": "uvicorn",
+      "status": "OK",
+      "detail": "import 'uvicorn' riuscito",
+      "version": "0.46.0"
+    },
+    {
+      "name": "requests",
+      "status": "OK",
+      "detail": "import 'requests' riuscito",
+      "version": "2.33.1"
+    },
+    {
+      "name": "psycopg2-binary",
+      "status": "OK",
+      "detail": "import 'psycopg2' riuscito",
+      "version": "2.9.12"
+    },
+    {
+      "name": "qdrant-client",
+      "status": "OK",
+      "detail": "import 'qdrant_client' riuscito",
+      "version": "1.17.1"
+    },
+    {
+      "name": "neo4j",
+      "status": "OK",
+      "detail": "import 'neo4j' riuscito",
+      "version": "6.2.0"
+    },
+    {
+      "name": "openai",
+      "status": "OK",
+      "detail": "import 'openai' riuscito",
+      "version": "2.35.1"
+    },
+    {
+      "name": "sentence-transformers",
+      "status": "OK",
+      "detail": "import 'sentence_transformers' riuscito",
+      "version": "5.4.1"
+    },
+    {
+      "name": "torch",
+      "status": "OK",
+      "detail": "import 'torch' riuscito",
+      "version": "2.11.0"
+    },
+    {
+      "name": "httpx",
+      "status": "OK",
+      "detail": "import 'httpx' riuscito",
+      "version": "0.28.1"
+    },
+    {
+      "name": "pytest",
+      "status": "OK",
+      "detail": "import 'pytest' riuscito",
+      "version": "9.1.1"
+    },
+    {
+      "name": "core.config",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "api.schemas",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.tenant",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.models",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.solvers",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.reranking",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.prompting",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.generation",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.validation",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.audit",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.resources",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.retrieval",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "core.rag_service",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "api.routes_rag",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "main",
+      "status": "OK",
+      "detail": "import riuscito",
+      "version": ""
+    },
+    {
+      "name": "resource-import-side-effect",
+      "status": "OK",
+      "detail": "nessun modello o client inizializzato durante l'import",
+      "version": ""
+    },
+    {
+      "name": "fastapi-smoke",
+      "status": "OK",
+      "detail": "liveness=200, readiness=503, openapi=200",
+      "version": ""
+    }
+  ],
+  "ok": true
+}

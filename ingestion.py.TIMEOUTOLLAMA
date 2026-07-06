@@ -536,7 +536,7 @@ KG_WINDOW_OVERLAP_CHARS = int(os.getenv("KG_WINDOW_OVERLAP_CHARS", "300"))
 # 0 = nessun limite. Ogni pagina lunga viene coperta da tutte le finestre necessarie.
 KG_MAX_WINDOWS_PER_PAGE = int(os.getenv("KG_MAX_WINDOWS_PER_PAGE", "0"))
 KG_MAX_TRIPLES = int(os.getenv("KG_MAX_TRIPLES", "50"))           # 10 soft cap (sanitize already caps)
-KG_TIMEOUT = int(os.getenv("KG_TIMEOUT", "360"))                   # seconds per KG task/page
+KG_TIMEOUT = int(os.getenv("KG_TIMEOUT", "180"))                   # seconds per KG task/page
 
 # Backward-compat aliases (do NOT use in new code)
 KG_CHARS_LIMIT = KG_TEXT_MAX_CHARS
@@ -625,6 +625,144 @@ REL_CANON_CACHE_PATH = os.getenv("REL_CANON_CACHE_PATH", "relation_canon_cache.j
 REL_CANON_MAX_TOKENS = int(os.getenv("REL_CANON_MAX_TOKENS", "700"))
 
 RELTYPE_OK = re.compile(r"^[A-Z][A-Z_]{2,60}$")
+
+
+# =============================================================================
+# NEO4J RELATIONSHIP GOVERNANCE - MINIMAL WRITE-TIME GUARD
+# =============================================================================
+# IMPORTANT:
+# - This block does NOT alter KG extraction, entity generation, node
+#   normalization, Chunk->Entity MENTIONS, or the upstream edge pipeline.
+# - It is applied only when semantic Entity->Entity edges are written.
+# - Unknown or ambiguous relation types are skipped; entities are still
+#   persisted normally by NEO4J_ENTITY_QUERY.
+#
+# Keep this vocabulary aligned with rag_api/core/config.py.
+NEO4J_ALLOWED_RELATIONSHIPS = frozenset({
+    # Structure / classification
+    "IS_A", "PART_OF", "HAS_COMPONENT", "CONTAINS", "BELONGS_TO",
+    "APPLIES_TO", "MAPS_TO", "DEFINES", "CLASSIFIES",
+
+    # Governance / compliance
+    "COMPLIES_WITH", "NON_COMPLIANT_WITH", "HAS_COMPLIANCE_STATUS",
+    "HAS_GAP", "REQUIRES_REMEDIATION", "REMEDIATES", "MANDATES",
+    "REQUIRES", "GOVERNS", "APPROVES", "REVIEWS",
+    "ASSIGNS_RESPONSIBILITY_TO",
+
+    # Incident / process
+    "TRIGGERS", "ACTIVATES", "STARTS", "FOLLOWS", "PRECEDES",
+    "LEADS_TO", "ESCALATES_TO", "MANAGES", "HANDLES",
+    "CONTAINS_INCIDENT", "ERADICATES", "RECOVERS", "CLOSES",
+    "IMPROVES",
+
+    # Notification / authority
+    "NOTIFIES", "REPORTS_TO", "RECEIVES_NOTIFICATION",
+    "REQUIRES_NOTIFICATION_TO", "HAS_DEADLINE", "HAS_RECIPIENT",
+    "COMMUNICATES_TO",
+
+    # Framework / implementation
+    "SUPPORTS", "ENABLES", "IMPLEMENTS", "DEPENDS_ON", "ALIGNS_WITH",
+    "CONTRIBUTES_TO", "MEASURES", "MONITORS",
+
+    # Risk / security
+    "MITIGATES", "REDUCES", "THREATENS", "EXPLOITS", "PROTECTS",
+    "VULNERABLE_TO", "COMPROMISES", "IMPACTS", "AFFECTS", "EXPOSES",
+
+    # Audit / evidence
+    "GENERATES", "VERIFIES", "TESTS", "DEMONSTRATES", "DOCUMENTS",
+    "SUPPORTS_EVIDENCE_FOR", "EVIDENCES", "SATISFIES",
+    "REFERENCES_REQUIREMENT",
+
+    # Formula graph
+    "HAS_FORMULA", "HAS_VARIABLE",
+})
+
+
+# Only deterministic aliases are allowed here. Ambiguous mappings must not be
+# introduced because they could change the meaning or polarity of an edge.
+NEO4J_RELATIONSHIP_ALIASES = {
+    "IMPLEMENT": "IMPLEMENTS",
+    "IMPLEMENTED": "IMPLEMENTS",
+    "IMPLEMENTING": "IMPLEMENTS",
+    "IMPLEMENTES": "IMPLEMENTS",  # common LLM typo
+
+    "COMPLIANT": "COMPLIES_WITH",
+    "COMPLIES": "COMPLIES_WITH",
+    "COMPLY": "COMPLIES_WITH",
+    "CONFORME_A": "COMPLIES_WITH",
+    "CONFORMITY_WITH": "COMPLIES_WITH",
+
+    "NON_COMPLIANT": "NON_COMPLIANT_WITH",
+    "NON_COMPLIANCE": "NON_COMPLIANT_WITH",
+    "NON_CONFORMITY": "NON_COMPLIANT_WITH",
+    "NOT_COMPLIANT": "NON_COMPLIANT_WITH",
+    "GAP_WITH": "NON_COMPLIANT_WITH",
+    "VIOLATES": "NON_COMPLIANT_WITH",
+
+    "STATUS": "HAS_COMPLIANCE_STATUS",
+    "COMPLIANCE_STATUS": "HAS_COMPLIANCE_STATUS",
+    "IMPLEMENTATION_STATUS": "HAS_COMPLIANCE_STATUS",
+    "MATURITY_STATUS": "HAS_COMPLIANCE_STATUS",
+
+    "GAP": "HAS_GAP",
+    "HAS_FINDING": "HAS_GAP",
+    "HAS_DEFICIENCY": "HAS_GAP",
+    "HAS_WEAKNESS": "HAS_GAP",
+
+    "REMEDIATION_REQUIRED": "REQUIRES_REMEDIATION",
+    "NEEDS_REMEDIATION": "REQUIRES_REMEDIATION",
+    "REQUIRES_CORRECTIVE_ACTION": "REQUIRES_REMEDIATION",
+    "CORRECTS": "REMEDIATES",
+    "CLOSES_GAP": "REMEDIATES",
+
+    "NOTIFICATION_TO": "NOTIFIES",
+    "SENDS_NOTIFICATION_TO": "NOTIFIES",
+    "MUST_NOTIFY": "NOTIFIES",
+    "REPORT_TO": "REPORTS_TO",
+    "REPORTS": "REPORTS_TO",
+    "ESCALATES_REPORT_TO": "REPORTS_TO",
+
+    "DEADLINE": "HAS_DEADLINE",
+    "TIME_LIMIT": "HAS_DEADLINE",
+    "WITHIN_HOURS": "HAS_DEADLINE",
+    "WITHIN_DAYS": "HAS_DEADLINE",
+
+    "RESPONSIBLE": "ASSIGNS_RESPONSIBILITY_TO",
+    "ACCOUNTABLE": "ASSIGNS_RESPONSIBILITY_TO",
+    "OWNER": "ASSIGNS_RESPONSIBILITY_TO",
+    "ASSIGNED_TO": "ASSIGNS_RESPONSIBILITY_TO",
+}
+
+
+def normalize_neo4j_relationship_type(value: Any) -> str:
+    """Normalize a candidate Neo4j relationship type without changing meaning."""
+    relation = str(value or "").strip().upper()
+    relation = re.sub(r"[^A-Z0-9_]+", "_", relation)
+    relation = re.sub(r"_+", "_", relation).strip("_")
+    return relation[:60]
+
+
+def resolve_allowed_neo4j_relationship_type(value: Any) -> Optional[str]:
+    """
+    Resolve deterministic aliases and enforce the semantic whitelist.
+
+    Returns:
+        Canonical relationship type when allowed; otherwise ``None``.
+
+    This function is deliberately fail-closed. It never converts an unknown
+    relation to RELATES_TO, because doing so would hide ontology errors.
+    """
+    relation = normalize_neo4j_relationship_type(value)
+
+    if not relation or not RELTYPE_OK.fullmatch(relation):
+        return None
+
+    relation = NEO4J_RELATIONSHIP_ALIASES.get(relation, relation)
+
+    if relation not in NEO4J_ALLOWED_RELATIONSHIPS:
+        return None
+
+    return relation
 
 
 KG_KEYWORDS = [
@@ -3602,13 +3740,21 @@ def flush_neo4j_rows_batch(rows: List[Dict[str, Any]]) -> bool:
 
                     source = normalize_entity_id(str(edge.get("source") or ""))
                     target = normalize_entity_id(str(edge.get("target") or ""))
-                    rel_type = str(
-                        edge.get("relation") or "RELATES_TO"
-                    ).upper().replace(" ", "_")
-                    rel_type = "".join(
-                        char for char in rel_type
-                        if char.isalnum() or char == "_"
-                    ) or "RELATES_TO"
+                    # Final write-time guard. This affects semantic edges only:
+                    # NEO4J_ENTITY_QUERY has already persisted Entity nodes and
+                    # Chunk-[:MENTIONS]->Entity provenance above.
+                    raw_rel_type = edge.get("relation") or ""
+                    rel_type = resolve_allowed_neo4j_relationship_type(
+                        raw_rel_type
+                    )
+
+                    if rel_type is None:
+                        print(
+                            "   ⚠️ Neo4j semantic edge skipped by whitelist | "
+                            f"relation={raw_rel_type!r} | "
+                            f"source={source!r} | target={target!r}"
+                        )
+                        continue
 
                     if not source or not target:
                         continue
