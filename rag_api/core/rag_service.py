@@ -44,12 +44,22 @@ from .audit import (
     format_retrieval_audit_markdown,
 )
 from .config import RagSettings, settings
+
 from .generation import (
     GenerationError,
     GenerationResult,
     OllamaNativeGenerator,
     generator,
 )
+
+from .generation import (
+    GenerationError,
+    GenerationResult,
+    OllamaNativeGenerator,
+    generator,
+)
+from .graph_relations import answer_graph_relations_strict
+
 from .models import (
     RagAnswerMode,
     RagEvalResult,
@@ -184,10 +194,19 @@ class RoutingDecision:
     wants_evidence: bool = False
     calculation_mode: bool = False
     analytics_mode: bool = False
+    
+   
     strict_checklist_mode: bool = False
     crosswalk_mode: bool = False
+
+    # La query richiede retrieval/supporto dal Knowledge Graph.
+    graph_search_mode: bool = False
+
+    # La query richiede una risposta deterministica su archi/path/relazioni.
     graph_relation_mode: bool = False
+
     formula_strict_mode: bool = False
+
     glossary_candidate: bool = False
     exhaustive_formula_lookup: bool = False
 
@@ -394,14 +413,16 @@ class RagQueryRouter:
             and solver_result is None
             and _is_user_data_analytics(query)
         )
-        graph_relation_mode = _is_graph_relation_query(query)
+        
+        graph_search_mode = _is_graph_relation_query(query)
+
+        graph_relation_mode = _should_use_graph_relation_strict_mode(query)
+                    
         formula_strict_mode = bool(
             not evidence_relevance
-            and (
-                intent == RagIntent.FORMULA
-                or _is_formula_strict_query(query)
-            )
-        )
+            and _is_formula_lookup_query(query)
+        )        
+
         strict_checklist_mode = _is_strict_checklist_query(query)
         crosswalk_mode = _is_crosswalk_query(query)
         glossary_candidate = self._is_pure_glossary(query)
@@ -423,7 +444,7 @@ class RagQueryRouter:
             query,
             evidence_relevance=evidence_relevance,
             math_needs_context=math_needs_context,
-            graph_relation_mode=graph_relation_mode,
+            graph_relation_mode=graph_search_mode,
             formula_mode=formula_strict_mode,
         )
 
@@ -435,9 +456,12 @@ class RagQueryRouter:
             calculation_mode=is_calculation_request(query),
             analytics_mode=analytics_mode,
             strict_checklist_mode=strict_checklist_mode,
+            
             crosswalk_mode=crosswalk_mode,
+            graph_search_mode=graph_search_mode,
             graph_relation_mode=graph_relation_mode,
             formula_strict_mode=formula_strict_mode,
+
             glossary_candidate=glossary_candidate,
             exhaustive_formula_lookup=exhaustive_formula_lookup,
             requested_document=requested_document,
@@ -446,34 +470,195 @@ class RagQueryRouter:
             math_needs_document_context=math_needs_context,
         )
 
-    def _detect_intent(self, query: str) -> RagIntent:
-        q = query.casefold()
 
-        if is_calculation_request(query) or any(term in q for term in self._FORMULA_TERMS):
+    @staticmethod
+    def _is_regulatory_classification_query(query_text: str) -> bool:
+        """
+        Riconosce domande normative e classificatorie che devono essere
+        tratt devono essere
+        trattate come audit, non come formula, glossario o testo generico.
+
+        La regola è framework-agnostic e non dipende da documenti o test.
+        """
+
+        q = str(query_text or "").lower().strip()
+
+        if not q:
+            return False
+
+        classification_starters = (
+            # Italiano
+            "chi sono",
+            "quali sono",
+            "qual è",
+            "quale è",
+
+            # Inglese
+            "what are",
+            "who are",
+            "which are",
+            "what is",
+        )
+
+        regulatory_terms = (
+            # Italiano
+            "soggetti",
+            "soggetto",
+            "categorie",
+            "categoria",
+            "tipologie",
+            "tipologia",
+            "regime",
+            "vigilanza",
+            "obblighi",
+            "obbligo",
+            "requisiti",
+            "requisito",
+            "normativa",
+            "regolamento",
+            "direttiva",
+            "legge",
+            "classificazione",
+            "classifica",
+            "autorità",
+            "responsabilità",
+            "categorie normative",
+
+            # Inglese
+            "subjects",
+            "entities",
+            "categories",
+            "category",
+            "types",
+            "classification",
+            "regime",
+            "supervision",
+            "oversight",
+            "obligations",
+            "requirements",
+            "regulation",
+            "directive",
+            "law",
+            "authority",
+            "responsibilities",
+        )
+
+        has_classification_starter = any(
+            term in q
+            for term in classification_starters
+        )
+
+        has_regulatory_term = any(
+            term in q
+            for term in regulatory_terms
+        )
+
+        if has_classification_starter and has_regulatory_term:
+            return True
+
+        classification_density = sum(
+            1
+            for term in regulatory_terms
+            if term in q
+        )
+
+        return classification_density >= 2
+
+
+
+
+    def _detect_intent(self, query: str) -> RagIntent:
+        q = str(query or "").casefold()
+
+        # Le domande su soggetti, categorie, obblighi, requisiti,
+        # classificazione e vigilanza sono query normative.
+        # Questo controllo deve precedere Formula Mode.
+        if self._is_regulatory_classification_query(query):
+            return RagIntent.AUDIT
+
+        if (
+            is_calculation_request(query)
+            or any(term in q for term in self._FORMULA_TERMS)
+        ):
             return RagIntent.FORMULA
+
         if any(term in q for term in self._GRAPH_TERMS):
             return RagIntent.CHART
+
         if any(term in q for term in self._TABLE_TERMS):
             return RagIntent.TABLE
+
         if any(term in q for term in self._AUDIT_TERMS):
             return RagIntent.AUDIT
+
         return RagIntent.TEXT
+
 
     def _detect_answer_mode(
         self,
         query: str,
         evidence_relevance: bool,
     ) -> RagAnswerMode:
+        """
+        Determina la modalità di risposta.
+
+        Priorità:
+        1. valutazione dell'attinenza di un'evidenza;
+        2. audit, conformità, evidenze, gap e verifiche;
+        3. risposta informativa generale.
+        """
+
         if evidence_relevance:
             return RagAnswerMode.EVIDENCE_RELEVANCE
-        q = query.casefold()
+
+        q = str(query or "").strip().casefold()
+
+        if not q:
+            return RagAnswerMode.KNOWLEDGE
+
         audit_eval_terms = (
-            "verifica conformità", "valutazione conformità", "non conformità",
-            "compliance check", "compliance assessment", "audit", "gap analysis",
-            "evidenze implementazione", "implementation evidence", "tier b", "tier c",
+            # Italiano
+            "verifica conformità",
+            "valutazione conformità",
+            "non conformità",
+            "non conforme",
+            "audit",
+            "evidenza",
+            "evidenze",
+            "evidenze implementazione",
+            "policy contro evidenza",
+            "tier b",
+            "tier c",
+            "gap tecnico",
+            "gap analysis",
+            "analisi dei gap",
+            "scostamento",
+            "discrepanza",
+            "ispezione",
+            "allineamento tecnico",
+            "deviazione",
+
+            # Inglese
+            "compliance check",
+            "compliance assessment",
+            "non-compliance",
+            "non-compliant",
+            "evidence",
+            "implementation evidence",
+            "policy vs evidence",
+            "technical gap",
+            "deviation",
+            "discrepancy",
+            "inspection",
+            "technical alignment",
         )
-        if any(term in q for term in audit_eval_terms):
+
+        if any(
+            re.search(rf"\b{re.escape(term)}\b", q)
+            for term in audit_eval_terms
+        ):
             return RagAnswerMode.AUDIT
+
         return RagAnswerMode.KNOWLEDGE
 
     def _is_pure_glossary(self, query: str) -> bool:
@@ -608,10 +793,73 @@ class RagService:
                     warnings.extend(rerank_warnings)
 
                 audit_sources = sources
-
+                
                 if not sources:
                     answer = _no_sources_fallback(route.requested_document)
                     warnings.append("Nessuna fonte tenant-visible recuperata.")
+
+                elif (
+                    route.solver_result is not None
+                    and route.math_needs_document_context
+                ):
+                    execution_mode = RagExecutionMode.MATH_DIRECT
+
+                    answer = _build_math_answer_with_document_context(
+                        route.solver_result.answer,
+                        sources,
+                    )
+
+                    direct_audit_markdown = (
+                        "### Math-First Mode\n"
+                        "- Calcolo deterministico eseguito prima della generazione LLM.\n"
+                        "- Il modello generativo è stato bypassato.\n"
+                        "- Le fonti recuperate sono state utilizzate esclusivamente "
+                        "per la contestualizzazione documentale."
+                    )
+
+                    warnings.append(
+                        "Math-First Mode: risultato deterministico preservato; "
+                        "generazione LLM non eseguita."
+                    )
+
+                elif route.graph_relation_mode:
+                    execution_mode = RagExecutionMode.GRAPH_RELATION_STRICT
+
+                    graph_answer = answer_graph_relations_strict(
+                        command.query,
+                        sources,
+                    )
+
+                    if graph_answer:
+                        answer = graph_answer
+                    else:
+                        answer = (
+                            "**A) Risposta**\n\n"
+                            "Non è stato possibile identificare almeno due concetti "
+                            "distinti da mettere in relazione.\n\n"
+                            "**B) Evidenze**\n\n"
+                            "- Il retrieval è stato eseguito, ma la richiesta non contiene "
+                            "un insieme sufficiente di entità confrontabili.\n\n"
+                            "**C) Limiti / Conflitti**\n\n"
+                            "- Non vengono inventati archi o relazioni non presenti nel "
+                            "Knowledge Graph o nelle fonti documentali.\n\n"
+                            "**D) Fonti**\n\n"
+                            "- Nessuna relazione deterministica costruibile."
+                        )
+
+                    direct_audit_markdown = (
+                        "### Graph Relation Strict Mode\n"
+                        "- Risposta costruita deterministicamente dalle fonti recuperate.\n"
+                        "- Gli archi Neo4j sono distinti dal semplice supporto testuale.\n"
+                        "- Le co-occorrenze non vengono trasformate in relazioni esplicite.\n"
+                        "- Il modello generativo è stato bypassato."
+                    )
+
+                    warnings.append(
+                        "Graph Relation Strict Mode: risposta deterministica; "
+                        "generazione LLM non eseguita."
+                    )
+
                 else:
                     prompt_bundle = self._prompt_builder.build(
                         query=command.query,
@@ -623,7 +871,7 @@ class RagService:
                             requested_document=route.requested_document,
                             strict_checklist_mode=route.strict_checklist_mode,
                             crosswalk_mode=route.crosswalk_mode,
-                            graph_relation_mode=route.graph_relation_mode,
+                            graph_relation_mode=route.graph_search_mode,
                             calculation_mode=route.calculation_mode,
                             analytics_mode=route.analytics_mode,
                             wants_evidence=route.wants_evidence,
@@ -843,7 +1091,7 @@ class RagService:
                 target_document=route.requested_document,
                 target_pages=command.target_pages,
                 wants_evidence=route.wants_evidence,
-                graph_relation_mode=route.graph_relation_mode,
+                graph_relation_mode=route.graph_search_mode,
                 formula_mode=route.formula_strict_mode,
                 exhaustive_formula_lookup=route.exhaustive_formula_lookup,
                 tenant_context=context,
@@ -1053,6 +1301,7 @@ class RagService:
             "analytics_mode": route.analytics_mode,
             "strict_checklist_mode": route.strict_checklist_mode,
             "crosswalk_mode": route.crosswalk_mode,
+            "graph_search_mode": route.graph_search_mode,
             "graph_relation_mode": route.graph_relation_mode,
             "formula_strict_mode": route.formula_strict_mode,
             "exhaustive_formula_lookup": route.exhaustive_formula_lookup,
@@ -1097,28 +1346,398 @@ def _extract_requested_document(query: str) -> str | None:
 
 
 def _is_evidence_relevance_query(query: str) -> bool:
-    q = (query or "").casefold()
-    evidence = (
-        "evidenza", "evidenze", "evidence", "documento", "document",
-        "file", "allegato", "attachment", "pdf", "policy", "procedura",
-        "procedure", "report", "log", "record",
+    """
+    Rileva richieste di valutazione dell'attinenza o della sufficienza
+    di un documento/evidenza rispetto a una domanda, requisito,
+    controllo o item di assessment.
+
+    La funzione non dipende da documenti, framework o test specifici.
+    """
+
+    q = str(query or "").casefold().strip()
+
+    if not q:
+        return False
+
+    evidence_terms = (
+        # Italiano
+        "evidenza",
+        "evidenze",
+        "prova",
+        "prove",
+        "documento",
+        "documenti",
+        "file",
+        "pdf",
+        "allegato",
+        "allegati",
+        "upload",
+        "caricato",
+        "caricati",
+        "documentazione",
+        "artefatto",
+        "artefatti",
+        "record",
+        "registrazione",
+        "registrazioni",
+        "log",
+        "screenshot",
+        "report",
+        "rapporto",
+        "procedura",
+        "policy",
+        "registro",
+
+        # Inglese
+        "evidence",
+        "evidences",
+        "proof",
+        "proofs",
+        "document",
+        "documents",
+        "file",
+        "pdf",
+        "attachment",
+        "attachments",
+        "upload",
+        "uploaded",
+        "documentation",
+        "artifact",
+        "artifacts",
+        "record",
+        "records",
+        "log",
+        "logs",
+        "screenshot",
+        "report",
+        "reports",
+        "procedure",
+        "policy",
+        "register",
     )
-    assessment = (
-        "domanda", "question", "assessment", "audit", "requisito",
-        "requirement", "controllo", "control", "checklist", "criterio",
-        "criterion", "obbligo", "obligation",
+
+    assessment_terms = (
+        # Italiano
+        "domanda",
+        "domande",
+        "questionario",
+        "questionari",
+        "assessment",
+        "audit",
+        "requisito",
+        "requisiti",
+        "controllo",
+        "controlli",
+        "checklist",
+        "item",
+        "punto",
+        "punti",
+        "criterio",
+        "criteri",
+        "misura",
+        "misure",
+        "obbligo",
+        "obblighi",
+        "clausola",
+        "clausole",
+        "capitolo",
+        "sezione",
+
+        # Inglese
+        "question",
+        "questions",
+        "questionnaire",
+        "questionnaires",
+        "assessment",
+        "audit",
+        "requirement",
+        "requirements",
+        "control",
+        "controls",
+        "checklist",
+        "item",
+        "items",
+        "criterion",
+        "criteria",
+        "measure",
+        "measures",
+        "obligation",
+        "obligations",
+        "clause",
+        "clauses",
+        "chapter",
+        "section",
     )
-    relevance = (
-        "attinente", "attinenza", "pertinente", "rilevante", "relevant",
-        "sufficiente", "sufficienza", "adequate", "adequacy", "supporta",
-        "supports", "dimostra", "demonstrates", "copre", "coverage",
-        "gap", "lacuna", "manca", "missing", "remediation", "correttiv",
-        "percentuale", "percentage", "livello", "level", "punteggio", "score",
+
+    relevance_terms = (
+        # Italiano
+        "attinente",
+        "attinenza",
+        "inerente",
+        "inerenza",
+        "pertinente",
+        "pertinenza",
+        "rilevante",
+        "rilevanza",
+        "correlato",
+        "correlata",
+        "correlazione",
+        "collegato",
+        "collegata",
+        "collegamento",
+        "coerente",
+        "coerenza",
+        "adeguato",
+        "adeguata",
+        "adeguatezza",
+        "sufficiente",
+        "sufficienza",
+        "idoneo",
+        "idonea",
+        "idoneità",
+        "applicabile",
+        "applicabilità",
+        "supporta",
+        "supportato",
+        "supportata",
+        "dimostra",
+        "dimostrato",
+        "dimostrata",
+        "comprova",
+        "comprovato",
+        "comprovata",
+        "giustifica",
+        "giustificato",
+        "giustificata",
+        "copre",
+        "copertura",
+        "risponde",
+        "risposta",
+        "valuta",
+        "valutare",
+        "verifica",
+        "verificare",
+
+        # Inglese
+        "relevant",
+        "relevance",
+        "pertinent",
+        "pertinence",
+        "related",
+        "relation",
+        "relationship",
+        "correlated",
+        "correlation",
+        "linked",
+        "link",
+        "connection",
+        "consistent",
+        "consistency",
+        "adequate",
+        "adequacy",
+        "sufficient",
+        "sufficiency",
+        "suitable",
+        "suitability",
+        "applicable",
+        "applicability",
+        "supports",
+        "supported",
+        "supporting",
+        "demonstrates",
+        "demonstrated",
+        "proves",
+        "proven",
+        "justifies",
+        "justified",
+        "covers",
+        "coverage",
+        "answers",
+        "answer",
+        "evaluate",
+        "assess",
+        "verify",
+        "check",
     )
+
+    gap_terms = (
+        # Italiano
+        "gap",
+        "lacuna",
+        "lacune",
+        "mancanza",
+        "mancanze",
+        "manca",
+        "mancano",
+        "carente",
+        "carenti",
+        "carenza",
+        "carenze",
+        "debole",
+        "debolezza",
+        "debolezze",
+        "incompleto",
+        "incompleta",
+        "parziale",
+        "non sufficiente",
+        "non adeguato",
+        "non adeguata",
+        "non attinente",
+        "poco attinente",
+        "scostamento",
+        "scostamenti",
+        "non conformità",
+        "non conforme",
+        "differenza",
+        "differenze",
+        "deviazione",
+        "deviazioni",
+
+        # Inglese
+        "gap",
+        "gaps",
+        "missing",
+        "absence",
+        "lack",
+        "lacks",
+        "weak",
+        "weakness",
+        "weaknesses",
+        "deficiency",
+        "deficiencies",
+        "incomplete",
+        "partial",
+        "not sufficient",
+        "insufficient",
+        "not adequate",
+        "inadequate",
+        "not relevant",
+        "poorly relevant",
+        "deviation",
+        "deviations",
+        "non-compliance",
+        "non-compliant",
+        "difference",
+        "differences",
+    )
+
+    remediation_terms = (
+        # Italiano
+        "remediation",
+        "piano di remediation",
+        "piano correttivo",
+        "azioni correttive",
+        "azione correttiva",
+        "correzione",
+        "correzioni",
+        "rimedio",
+        "rimedi",
+        "miglioramento",
+        "miglioramenti",
+        "integrazione",
+        "integrare",
+        "raccomandazione",
+        "raccomandazioni",
+        "cosa manca",
+        "cosa integrare",
+        "come migliorare",
+
+        # Inglese
+        "remediation",
+        "remediation plan",
+        "corrective action",
+        "corrective actions",
+        "correction",
+        "corrections",
+        "remedy",
+        "remedies",
+        "improvement",
+        "improvements",
+        "integration",
+        "integrate",
+        "recommendation",
+        "recommendations",
+        "what is missing",
+        "what to add",
+        "how to improve",
+    )
+
+    scoring_terms = (
+        # Italiano
+        "livello",
+        "livelli",
+        "percentuale",
+        "percentuali",
+        "score",
+        "punteggio",
+        "valutazione",
+        "grado",
+        "classifica",
+        "classificazione",
+        "basso",
+        "medio",
+        "alto",
+        "debole",
+        "parziale",
+        "forte",
+
+        # Inglese
+        "level",
+        "levels",
+        "percentage",
+        "percentages",
+        "score",
+        "scoring",
+        "rating",
+        "grade",
+        "classification",
+        "low",
+        "medium",
+        "high",
+        "weak",
+        "partial",
+        "strong",
+    )
+
+    has_evidence = any(
+        term in q
+        for term in evidence_terms
+    )
+
+    has_assessment = any(
+        term in q
+        for term in assessment_terms
+    )
+
+    has_relevance = any(
+        term in q
+        for term in relevance_terms
+    )
+
+    has_gap = any(
+        term in q
+        for term in gap_terms
+    )
+
+    has_remediation = any(
+        term in q
+        for term in remediation_terms
+    )
+
+    has_scoring = any(
+        term in q
+        for term in scoring_terms
+    )
+
     return (
-        any(term in q for term in evidence)
-        and any(term in q for term in assessment)
-        and any(term in q for term in relevance)
+        has_evidence
+        and has_assessment
+        and (
+            has_relevance
+            or has_gap
+            or has_remediation
+            or has_scoring
+        )
     )
 
 
@@ -1163,6 +1782,219 @@ def _is_graph_relation_query(query: str) -> bool:
         "tabella relazioni", "relationship table",
     )
     return any(term in q for term in explicit)
+
+
+
+
+def _should_use_graph_relation_strict_mode(query: str) -> bool:
+    """
+    Decide se una query sul Knowledge Graph richiede una risposta
+    deterministica e tabellare.
+
+    Le normali domande esplicative possono usare il grafo come supporto,
+    senza essere trasformate automaticamente in tabelle di archi.
+    """
+
+    q = str(query or "").casefold().strip()
+
+    if not q:
+        return False
+
+    explicit_graph_terms = (
+        # Italiano
+        "neo4j",
+        "cypher",
+        "interroga neo4j",
+        "usando neo4j",
+        "query neo4j",
+        "archi",
+        "arco",
+        "nodi",
+        "nodo",
+        "path",
+        "percorso",
+        "travers4j",
+        "archi",
+        "arco",
+        "nodi",
+        "nodo",
+        "path",
+        "percorso",
+        "traversamento",
+        "multi-hop",
+        "catena semantica",
+        "relazioni esplicite",
+        "relazioni nel grafo",
+        "tabella relazioni",
+
+        # Inglese
+        "graph query",
+        "query neo4j",
+        "using neo4j",
+        "cypher query",
+        "nodes",
+        "node",
+        "edges",
+        "edge",
+        "path",
+        "traversal",
+        "multi-hop",
+        "semantic chain",
+        "explicit relationships",
+        "relationship table",
+    )
+
+    if any(term in q for term in explicit_graph_terms):
+        return True
+
+    explanatory_terms = (
+        # Italiano
+        "qual è",
+        "quale è",
+        "quali sono",
+        "che cosa",
+        "cosa significa",
+        "ruolo",
+        "scopo",
+        "funzione",
+        "descrivi",
+        "spiega",
+        "analizza",
+        "valuta",
+        "giustifica",
+        "perché",
+        "perche",
+        "in che modo",
+        "come funziona",
+        "elabora",
+        "sintetizza",
+
+        # Inglese
+        "what is",
+        "what are",
+        "role",
+        "purpose",
+        "function",
+        "describe",
+        "explain",
+        "analyze",
+        "analyse",
+        "evaluate",
+        "justify",
+        "why",
+        "how does",
+        "how do",
+        "summarize",
+        "summarise",
+    )
+
+    if any(term in q for term in explanatory_terms):
+        return False
+
+    strong_relation_terms = (
+        # Italiano
+        "relazioni tra",
+        "collegamenti tra",
+        "mostra le relazioni",
+        "traccia la catena",
+        "connessioni",
+        "mappa",
+        "mappatura",
+        "rete semantica",
+        "triple",
+
+        # Inglese
+        "relations between",
+        "links between",
+        "show relationships",
+        "trace the chain",
+        "connections",
+        "mapping",
+        "semantic network",
+        "triples",
+    )
+    return any(term in q for term in strong_relation_terms)
+
+
+
+def _is_formula_lookup_query(query: str) -> bool:
+    """
+    Riconosce richieste documentali di recupero di formule, equazioni,
+    metriche, indicatori o regole di scoring.
+
+    Non intercetta i calcoli operativi, che devono essere gestiti dai
+    solver deterministici o dal normale Calculation Mode.
+    """
+
+    q = str(query or "").casefold().strip()
+
+    if not q:
+        return False
+
+    # Un calcolo richiesto dall'utente non è automaticamente una ricerca
+    # documentale di formule.
+    if is_calculation_request(query):
+        return False
+
+    has_formula_object = bool(
+        re.search(
+            r"\b(?:"
+            r"formula|formule|"
+            r"equazione|equazioni|"
+            r"metrica|metriche|"
+            r"indicatore|indicatori|"
+            r"modello\s+matematico|modelli\s+matematici|"
+            r"regola\s+di\s+scoring|regole\s+di\s+scoring|"
+            r"formulas?|"
+            r"equations?|"
+            r"metrics?|"
+            r"indicators?|"
+            r"mathematical\s+models?|"
+            r"scoring\s+rules?"
+            r")\b",
+            q,
+        )
+    )
+
+    has_lookup_action = bool(
+        re.search(
+            r"\b(?:"
+            r"elenca|estrai|mostra|riporta|fornisci|dammi|"
+            r"indica|trova|quale|quali|"
+            r"list|extract|show|report|provide|give|"
+            r"identify|find|which"
+            r")\b",
+            q,
+        )
+    )
+
+    has_source_or_collection_cue = bool(
+        re.search(
+            r"\b(?:"
+            r"documento|documenti|"
+            r"fonte|fonti|"
+            r"testo|corpus|"
+            r"presente|presenti|"
+            r"menzionata|menzionate|"
+            r"citata|citate|"
+            r"contenuta|contenute|"
+            r"definita|definite|"
+            r"tutte|tutti|"
+            r"document|documents|"
+            r"source|sources|"
+            r"text|corpus|"
+            r"present|mentioned|cited|contained|defined|all"
+            r")\b",
+            q,
+        )
+    )
+
+    return has_formula_object and (
+        has_lookup_action
+        or has_source_or_collection_cue
+    )
+
+
 
 
 def _is_formula_strict_query(query: str) -> bool:
@@ -1317,6 +2149,152 @@ def _coerce_direct_answer(value: Any) -> DirectAnswer | None:
     raise RagServiceConfigurationError(
         "lookup_glossary ha restituito un valore non compatibile con DirectAnswer"
     )
+
+
+def _build_math_answer_with_document_context(
+    math_answer: str,
+    sources: Sequence[SourceItem],
+    max_items: int = 3,
+) -> str:
+    """
+    Integra un risultato matematico deterministico con fonti documentali.
+
+    Il risultato del solver resta autoritativo.
+    Le fonti vengono usate esclusivamente per contestualizzare il risultato
+    e non possono modificarne valori, formule o conclusioni numeriche.
+    """
+
+    answer = str(math_answer or "").strip()
+
+    if not answer:
+        return ""
+
+    if not sources:
+        return answer
+
+    clean_sources: list[tuple[str, int, str]] = []
+    seen: set[tuple[str, int]] = set()
+
+    for source in sources:
+        tier = str(source.tier or "").strip().upper()
+        source_type = str(source.type or "").strip().casefold()
+
+        # Le righe sintetiche di grafo o formula non costituiscono
+        # contesto documentale concettuale principale.
+        if tier == "GRAPH":
+            continue
+
+        if source_type in {
+            "graph",
+            "graph_relations",
+            "formula",
+        }:
+            continue
+
+        filename = str(source.filename or "").strip() or "N/D"
+        page = int(source.page or 0)
+        content = re.sub(
+            r"\s+",
+            " ",
+            str(source.content or ""),
+        ).strip()
+
+        if not content:
+            continue
+
+        source_key = (
+            PurePath(filename).name.casefold(),
+            page,
+        )
+
+        if source_key in seen:
+            continue
+
+        seen.add(source_key)
+        clean_sources.append(
+            (
+                filename,
+                page,
+                content,
+            )
+        )
+
+        if len(clean_sources) >= max(1, int(max_items)):
+            break
+
+    if not clean_sources:
+        return answer
+
+    context_lines = [
+        "Collegamento documentale",
+        "",
+        "- Il risultato numerico è calcolato esclusivamente sui dati "
+        "forniti dall'utente.",
+        "- Le fonti recuperate vengono usate soltanto per contestualizzare "
+        "il risultato nel risk/evidence/control assessment; non modificano "
+        "il calcolo.",
+    ]
+
+    for filename, page, content in clean_sources:
+        snippet = content[:360].rstrip()
+
+        if len(content) > 360:
+            snippet += "..."
+
+        context_lines.append(
+            f"- `{filename}` (p.{page}): {snippet}"
+        )
+
+    context_block = "\n".join(context_lines)
+
+    used_files: list[str] = []
+
+    for filename, _, _ in clean_sources:
+        if filename not in used_files:
+            used_files.append(filename)
+
+    additional_sources = "\n".join(
+        f"- {filename}"
+        for filename in used_files
+    )
+
+    sources_marker = "**D) Fonti**"
+
+    if sources_marker in answer:
+        before_sources, existing_sources = answer.split(
+            sources_marker,
+            1,
+        )
+
+        existing_sources = existing_sources.strip()
+
+        if additional_sources:
+            existing_sources = (
+                existing_sources
+                + "\n"
+                + additional_sources
+            )
+
+        return (
+            before_sources.rstrip()
+            + "\n\n"
+            + context_block
+            + "\n\n"
+            + sources_marker
+            + "\n\n"
+            + existing_sources
+        )
+
+    return (
+        answer.rstrip()
+        + "\n\n"
+        + context_block
+        + "\n\n"
+        + sources_marker
+        + "\n\n"
+        + additional_sources
+    )
+
 
 
 def _dedupe_sources(sources: Sequence[SourceItem]) -> tuple[SourceItem, ...]:

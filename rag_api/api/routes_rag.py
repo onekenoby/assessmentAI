@@ -616,10 +616,13 @@ async def query_rag(
     try:
         _authorize_optional_features(payload, tenant)
         command = _request_to_command(payload)
+        
         result = await rag_service.query(
             command,
             tenant_context=tenant,
         )
+
+
         api_response = _result_to_response(result, payload)
     except Exception as exc:
         mapped = _map_service_exception(exc, request_id)

@@ -99,9 +99,12 @@ DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS: Final[tuple[str, ...]] = (
     "CONTAINS",
     "BELONGS_TO",
     "APPLIES_TO",
+    "IMPLEMENTS",
+    "USES",
     "MAPS_TO",
     "DEFINES",
     "CLASSIFIES",
+
 
     # Governance / compliance
     "COMPLIES_WITH",
@@ -116,6 +119,7 @@ DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS: Final[tuple[str, ...]] = (
     "APPROVES",
     "REVIEWS",
     "ASSIGNS_RESPONSIBILITY_TO",
+    
 
     # Incident / process
     "TRIGGERS",
@@ -145,7 +149,6 @@ DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS: Final[tuple[str, ...]] = (
     # Framework / implementation
     "SUPPORTS",
     "ENABLES",
-    "IMPLEMENTS",
     "DEPENDS_ON",
     "ALIGNS_WITH",
     "CONTRIBUTES_TO",

@@ -161,7 +161,7 @@ services:
   # ========================================================
 
   ollama_assessment:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.31.2
     container_name: ai_ollama_assessment
     profiles: ["assessment"]
     restart: always
@@ -179,7 +179,6 @@ services:
 
       # Pascal P5000: forzare CUDA 12, non CUDA generico e non CUDA 13.
       OLLAMA_LLM_LIBRARY: "cuda_v12"
-
       TZ: "Europe/Rome"
     volumes:
       - ./data/assessment/ollama:/root/.ollama
@@ -343,9 +342,6 @@ services:
       --backend-host 0.0.0.0
       --frontend-port 3000
       --backend-port 8000
-
-
-
 
     ports:
       - "127.0.0.1:3000:3000"

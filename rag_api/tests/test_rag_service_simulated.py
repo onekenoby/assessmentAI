@@ -114,6 +114,69 @@ async def test_math_direct_bypasses_retrieval_and_generation(tenant_context):
     assert "80.00%" in result.answer
 
 
+
+@pytest.mark.asyncio
+async def test_math_with_document_context_bypasses_generation(
+    tenant_context,
+    candidate_factory,
+):
+    candidate = candidate_factory(
+        "math-context-1",
+        filename="risk-assessment.pdf",
+        tier="A",
+        scope="GLOBAL",
+        organization_id=None,
+        score_vec=0.9,
+        content=(
+            "Il risk assessment collega i risultati quantitativi "
+            "alle decisioni di trattamento e ai controlli."
+        ),
+    )
+
+    retriever = FakeRetriever(
+        candidates=(candidate,),
+        debug=RetrievalDebug(
+            qdrant_hits=1,
+            kept_after_quality_filters=1,
+        ),
+    )
+
+    generator = FakeGenerator()
+
+    service = _service(
+        retriever=retriever,
+        generator=generator,
+    )
+
+    result = await service.query(
+        RagQueryCommand(
+            query=(
+                "Calcola la copertura di una checklist di 100 controlli: "
+                "70 implementati e 20 parziali che valgono al 50%. "
+                "Usa le fonti recuperate per contestualizzare il risultato."
+            ),
+        ),
+        tenant_context=tenant_context,
+    )
+
+    assert result.execution_mode == RagExecutionMode.MATH_DIRECT
+    assert result.deterministic is True
+
+    # Il retrieval è necessario per il contesto.
+    assert retriever.calls == 1
+
+    # Ollama non deve essere chiamato.
+    assert generator.calls == 0
+
+    assert "80.00%" in result.answer
+    assert "Collegamento documentale" in result.answer
+    assert "risk-assessment.pdf" in result.answer
+
+
+
+
+
+
 @pytest.mark.asyncio
 async def test_documental_query_runs_retrieval_generation_validation_and_audit(
     tenant_context, candidate_factory
@@ -196,3 +259,57 @@ async def test_foreign_candidate_is_rejected_by_service_guard(
         )
 
     assert "fuori dal perimetro tenant" in str(exc_info.value)
+
+@pytest.mark.asyncio
+async def test_graph_relation_strict_bypasses_generation(
+    tenant_context,
+    candidate_factory,
+):
+    graph_candidate = candidate_factory(
+        "graph-relation-1",
+        filename="knowledge-graph.md",
+        page=12,
+        tier="C",
+        score_graph=1.0,
+        source_type="graph_relations",
+        content=(
+            "| Entità sorgente | Relazione | Entità target | Documento | Pagina |\n"
+            "|---|---|---|---|---|\n"
+            "| GDPR | NOTIFIES | CSIRT | incident-response.pdf | 12 |"
+        ),
+    )
+
+    retriever = FakeRetriever(
+        candidates=(graph_candidate,),
+        debug=RetrievalDebug(
+            neo4j_direct_hits=1,
+            kept_after_quality_filters=1,
+        ),
+    )
+
+    generator = FakeGenerator()
+
+    service = _service(
+        retriever=retriever,
+        generator=generator,
+    )
+
+    result = await service.query(
+        RagQueryCommand(
+            query=(
+                "Usando Neo4j, traccia le relazioni tra "
+                "«GDPR» e «CSIRT»."
+            ),
+        ),
+        tenant_context=tenant_context,
+    )
+
+    assert result.execution_mode == RagExecutionMode.GRAPH_RELATION_STRICT
+    assert retriever.calls == 1
+    assert generator.calls == 0
+
+    assert "| Entità sorgente | Relazione | Entità target |" in result.answer
+    assert "GDPR" in result.answer
+    assert "CSIRT" in result.answer
+    assert "NOTIFIES" in result.answer
+    assert "esplicita nel grafo" in result.answer
