@@ -242,6 +242,41 @@ def _document_matches(source_filename: str, requested_document: str | None) -> b
     )
 
 
+def _candidate_matches_scope(
+    candidate: RetrievalCandidate,
+    *,
+    target_document: str | None = None,
+    target_pages: Sequence[int] = (),
+) -> bool:
+    """Deterministic document/page gate shared before graph expansion."""
+
+    if target_document and not _document_matches(candidate.filename, target_document):
+        return False
+    pages = {int(page) for page in target_pages or ()}
+    if pages and candidate.page not in pages:
+        return False
+    return True
+
+
+def _pg_page_condition(
+    target_pages: Sequence[int],
+    *,
+    metadata_expr: str = "metadata_json",
+) -> tuple[str, tuple[Any, ...]]:
+    """Build a safe PostgreSQL predicate for page/page_no JSON metadata."""
+
+    pages = tuple(sorted({int(page) for page in target_pages or () if int(page) > 0}))
+    if not pages:
+        return "", ()
+    page_text = (
+        f"coalesce({metadata_expr}->>'page', {metadata_expr}->>'page_no', '')"
+    )
+    return (
+        f" AND ({page_text} ~ '^[0-9]+$' AND ({page_text})::int = ANY(%s))",
+        (list(pages),),
+    )
+
+
 def _search_tokens(query: str) -> tuple[str, ...]:
     output: list[str] = []
     seen: set[str] = set()
@@ -260,6 +295,50 @@ def _search_tokens(query: str) -> tuple[str, ...]:
         seen.add(token)
         output.append(token)
     return tuple(output)
+
+
+def _threshold_metric_aliases(query: str) -> tuple[str, ...]:
+    """Espansione bilingue per soglie/condizioni normative in query metriche.
+
+    La funzione aumenta il recall senza produrre una risposta o assumere valori
+    normativi: aggiunge soltanto sinonimi generali quando la query contiene sia
+    un intento formula/metrica/scoring sia un riferimento a soglie, utenti
+    impattati o obblighi di notifica.
+    """
+
+    q = str(query or "").casefold()
+    formula_metric = any(
+        term in q
+        for term in (
+            "formula", "formule", "metrica", "metriche", "indicatore",
+            "indicatori", "scoring", "score", "calcolo", "equazione",
+            "formulas", "metrics", "indicators", "calculation", "equation",
+        )
+    )
+    if not formula_metric:
+        return ()
+
+    cues = (
+        "soglia", "soglie", "utenti impattati", "utenti coinvolti",
+        "utenti interessati", "obbligo di notifica", "obblighi di notifica",
+        "notifica incidenti", "notifica degli incidenti",
+        "incidente significativo", "incidenti significativi",
+        "threshold", "thresholds", "affected users", "impacted users",
+        "notification obligation", "notification obligations",
+        "incident notification", "significant incident", "significant incidents",
+    )
+    if not any(cue in q for cue in cues):
+        return ()
+
+    aliases = (
+        "soglia", "soglie", "utenti", "utenti impattati",
+        "obbligo di notifica", "notifica degli incidenti",
+        "incidente significativo", "incidenti significativi",
+        "threshold", "thresholds", "affected users", "impacted users",
+        "notification obligation", "incident notification",
+        "significant incident", "significant incidents",
+    )
+    return tuple(dict.fromkeys(aliases))
 
 
 def _exact_phrases(query: str) -> tuple[str, ...]:
@@ -284,6 +363,8 @@ def _exact_phrases(query: str) -> tuple[str, ...]:
             values.extend(("MTTD", "Mean Time to Detect", "tempo medio di rilevamento"))
         if any(term in q for term in ("tempo di risoluzione", "resolution time", "time to resolution", "tempo di riparazione", "repair time")):
             values.extend(("MTTR", "Mean Time to Resolution", "Mean Time to Repair"))
+
+    values.extend(_threshold_metric_aliases(query))
 
     output: list[str] = []
     seen: set[str] = set()
@@ -433,6 +514,112 @@ def _dedupe_graph_entities(values: Iterable[GraphEntity]) -> list[GraphEntity]:
     return output
 
 
+_GRAPH_FORMULA_CONTENTS_KEY = "graph_formula_contents"
+_GRAPH_FORMULA_KEYS_KEY = "graph_formula_keys"
+_GRAPH_FORMULA_MARKERS = (
+    "--- Formule collegate dal Knowledge Graph ---",
+    "--- Formula collegata dal Knowledge Graph ---",
+)
+
+
+def _metadata_string_list(metadata: Mapping[str, Any], key: str) -> list[str]:
+    """Return a stable list of non-empty strings from heterogeneous metadata."""
+
+    value = metadata.get(key)
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values: Iterable[Any] = (value,)
+    elif isinstance(value, Iterable) and not isinstance(value, Mapping):
+        values = value
+    else:
+        values = (value,)
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        clean = str(item or "").strip()
+        normalized = re.sub(r"\s+", " ", clean).casefold()
+        if clean and normalized not in seen:
+            seen.add(normalized)
+            output.append(clean)
+    return output
+
+
+def _candidate_formula_fragments(candidate: RetrievalCandidate) -> list[str]:
+    """Extract graph-formula payloads without confusing document text for a formula."""
+
+    metadata_fragments = _metadata_string_list(
+        candidate.metadata,
+        _GRAPH_FORMULA_CONTENTS_KEY,
+    )
+    if metadata_fragments:
+        return metadata_fragments
+
+    content = str(candidate.content or "").strip()
+    if not content or candidate.type != "formula":
+        return []
+
+    for marker in _GRAPH_FORMULA_MARKERS:
+        if marker in content:
+            return [
+                part.strip()
+                for part in content.split(marker)[1:]
+                if part.strip()
+            ]
+
+    # A direct Neo4j formula candidate contains only the formula payload.  A
+    # document-backed candidate marked as formula may also contain prose, so it
+    # is not safe to classify the complete content as a graph formula.
+    if str(candidate.tier) == "GRAPH" or "Neo4jFormula" in candidate.origin:
+        return [content]
+    return []
+
+
+def _candidate_formula_keys(candidate: RetrievalCandidate) -> list[str]:
+    keys = _metadata_string_list(candidate.metadata, _GRAPH_FORMULA_KEYS_KEY)
+    formula_key = str(candidate.metadata.get("formula_key") or "").strip()
+    if formula_key:
+        keys.append(formula_key)
+    return _metadata_string_list({_GRAPH_FORMULA_KEYS_KEY: keys}, _GRAPH_FORMULA_KEYS_KEY)
+
+
+def _merge_unique_strings(*collections: Iterable[str]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for collection in collections:
+        for item in collection:
+            clean = str(item or "").strip()
+            normalized = re.sub(r"\s+", " ", clean).casefold()
+            if clean and normalized not in seen:
+                seen.add(normalized)
+                output.append(clean)
+    return output
+
+
+def _append_graph_formula_fragments(base_content: str, fragments: Iterable[str]) -> str:
+    """Append only graph formulas not already represented in the base text."""
+
+    content = str(base_content or "").strip()
+    normalized_content = re.sub(r"\s+", " ", content).casefold()
+    pending: list[str] = []
+    for fragment in _merge_unique_strings(fragments):
+        normalized_fragment = re.sub(r"\s+", " ", fragment).casefold()
+        if normalized_fragment and normalized_fragment not in normalized_content:
+            pending.append(fragment)
+
+    if not pending:
+        return content
+
+    marker = _GRAPH_FORMULA_MARKERS[0]
+    appendix = "\n".join(pending)
+    if not content:
+        return appendix
+    if any(existing_marker in content for existing_marker in _GRAPH_FORMULA_MARKERS):
+        return f"{content.rstrip()}\n{appendix}".strip()
+    return f"{content.rstrip()}\n\n{marker}\n{appendix}".strip()
+
+
 def _merge_candidates(
     existing: RetrievalCandidate,
     incoming: RetrievalCandidate,
@@ -449,14 +636,16 @@ def _merge_candidates(
 
     content = canonical.content
     source_type = canonical.type
-    if incoming.type == "formula" or existing.type == "formula":
-        formula_content = incoming.content if incoming.type == "formula" else existing.content
-        if formula_content and formula_content not in content:
-            content = (
-                content.rstrip()
-                + "\n\n--- Formula collegata dal Knowledge Graph ---\n"
-                + formula_content.strip()
-            ).strip()
+    formula_fragments = _merge_unique_strings(
+        _candidate_formula_fragments(existing),
+        _candidate_formula_fragments(incoming),
+    )
+    formula_keys = _merge_unique_strings(
+        _candidate_formula_keys(existing),
+        _candidate_formula_keys(incoming),
+    )
+    if formula_fragments or incoming.type == "formula" or existing.type == "formula":
+        content = _append_graph_formula_fragments(content, formula_fragments)
         source_type = "formula"
     elif len(secondary.content.strip()) > len(content.strip()) and canonical.filename.casefold() in _UNKNOWN_FILENAMES:
         content = secondary.content
@@ -478,6 +667,10 @@ def _merge_candidates(
         metadata["score_doc_scope"] = canonical.metadata["score_doc_scope"]
     if secondary.metadata.get("exact_phrase") or canonical.metadata.get("exact_phrase"):
         metadata["exact_phrase"] = True
+    if formula_fragments:
+        metadata[_GRAPH_FORMULA_CONTENTS_KEY] = formula_fragments
+    if formula_keys:
+        metadata[_GRAPH_FORMULA_KEYS_KEY] = formula_keys
 
     return _replace_candidate(
         canonical,
@@ -487,6 +680,7 @@ def _merge_candidates(
         page_chunk_index=page_chunk_index,
         doc_id=doc_id,
         type=source_type,
+        source_tier=canonical.source_tier or secondary.source_tier,
         section_hint=section_hint,
         image_id=image_id,
         origin=_origin_join(existing.origin, incoming.origin),
@@ -528,6 +722,7 @@ class HybridRetrievalEngine:
         graph_relation_mode: bool,
         formula_mode: bool,
         exhaustive_formula_lookup: bool,
+        qdrant_limit: int | None = None,
         tenant_context: TenantContext,
     ) -> tuple[tuple[RetrievalCandidate, ...], RetrievalDebug]:
         """Execute blocking database/model work in a worker thread.
@@ -548,9 +743,10 @@ class HybridRetrievalEngine:
             graph_relation_mode=graph_relation_mode,
             formula_mode=formula_mode,
             exhaustive_formula_lookup=exhaustive_formula_lookup,
+            qdrant_limit=qdrant_limit,
             tenant_context=tenant_context,
         )
-
+        
     def _retrieve_sync(
         self,
         *,
@@ -563,6 +759,7 @@ class HybridRetrievalEngine:
         graph_relation_mode: bool,
         formula_mode: bool,
         exhaustive_formula_lookup: bool,
+        qdrant_limit: int | None = None,
         tenant_context: TenantContext,
     ) -> tuple[tuple[RetrievalCandidate, ...], RetrievalDebug]:
         query_text = str(query or "").strip()
@@ -573,17 +770,33 @@ class HybridRetrievalEngine:
         if any(page <= 0 for page in target_pages):
             raise ValueError("target_pages accetta soltanto pagine positive")
 
+        effective_qdrant_limit = (
+            int(qdrant_limit)
+            if qdrant_limit is not None
+            else int(
+                self._candidate_limit(
+                    query_text,
+                    graph_relation_mode,
+                )
+            )
+        )
+
+        if effective_qdrant_limit <= 0:
+            raise ValueError(
+                "qdrant_limit deve essere maggiore di zero"
+            )
+
         debug = RetrievalDebug(
             query=query_text,
             intent=intent,
             answer_mode=answer_mode,
             wants_evidence=wants_evidence,
             default_tiers=tuple(self._config.rag_default_tiers),
-            qdrant_candidates=int(self._candidate_limit(query_text, graph_relation_mode)),
+            qdrant_candidates=effective_qdrant_limit,
             target_document=target_document,
             target_pages=target_pages,
         )
-
+        
         warnings: list[str] = []
         backend_successes = 0
         backend_attempts = 0
@@ -602,6 +815,7 @@ class HybridRetrievalEngine:
                     expanded_query,
                     limit=debug.qdrant_candidates,
                     tenant_context=tenant_context,
+                    target_pages=target_pages,
                 )
                 backend_successes += 1
                 debug.qdrant_hits = len(vector_hits)
@@ -623,11 +837,13 @@ class HybridRetrievalEngine:
                         expanded_query,
                         limit=60,
                         tenant_context=tenant_context,
+                        target_pages=target_pages,
                     )
                     exact_hits = self._search_pg_exact_phrases(
                         query_text,
                         limit=40,
                         tenant_context=tenant_context,
+                        target_pages=target_pages,
                     )
                     doc_hits: list[RetrievalCandidate] = []
                     if target_document:
@@ -636,6 +852,7 @@ class HybridRetrievalEngine:
                             query_text,
                             limit=250 if exhaustive_formula_lookup else 100,
                             tenant_context=tenant_context,
+                            target_pages=target_pages,
                         )
 
                     # Generic acronym injection from glossary chunks.
@@ -664,6 +881,7 @@ class HybridRetrievalEngine:
                     backend_successes += 1
                     debug.postgres_bm25_hits = len(bm25_hits)
                     debug.postgres_exact_phrase_hits = len(exact_hits) + len(glossary_injected)
+                    debug.postgres_document_scope_hits = len(doc_hits)
                     for candidate in (*doc_hits, *exact_hits, *glossary_injected, *bm25_hits):
                         self._put_candidate(candidates, candidate)
                 except Exception as exc:
@@ -691,25 +909,37 @@ class HybridRetrievalEngine:
                         limit=30,
                         tenant_context=tenant_context,
                         driver=driver,
+                        target_document=target_document,
+                        target_pages=target_pages,
                     )
                     formula_hits = (
                         self._search_neo4j_formulas(
                             query_text,
                             limit=int(self._config.graph_max_formulas) * 4,
+                            target_document=target_document,
+                            target_pages=target_pages,
                             tenant_context=tenant_context,
                             driver=driver,
                         )
                         if formula_mode
                         else []
                     )
-                    if target_document:
+                    if target_document or target_pages:
                         entity_hits = [
                             item for item in entity_hits
-                            if _document_matches(item.filename, target_document)
+                            if _candidate_matches_scope(
+                                item,
+                                target_document=target_document,
+                                target_pages=target_pages,
+                            )
                         ]
                         formula_hits = [
                             item for item in formula_hits
-                            if _document_matches(item.filename, target_document)
+                            if _candidate_matches_scope(
+                                item,
+                                target_document=target_document,
+                                target_pages=target_pages,
+                            )
                         ]
 
                     if graph_relation_mode:
@@ -719,6 +949,7 @@ class HybridRetrievalEngine:
                             target_document=target_document,
                             tenant_context=tenant_context,
                             driver=driver,
+                            target_pages=target_pages,
                         )
 
                     backend_successes += 1
@@ -746,16 +977,25 @@ class HybridRetrievalEngine:
                         candidate.id
                         for candidate in sorted(candidates.values(), key=_candidate_sort_key)
                         if candidate.type != "graph_relations"
+                        and _candidate_matches_scope(
+                            candidate,
+                            target_document=target_document,
+                            target_pages=target_pages,
+                        )
                     ][:10]
                     neighbour_ids = self._get_neighbor_chunk_ids(
                         seed_ids,
                         limit=int(self._config.graph_max_neighbor_chunks),
                         tenant_context=tenant_context,
                         driver=driver,
+                        target_document=target_document,
+                        target_pages=target_pages,
                     )
                     expanded = self._retrieve_qdrant_points_by_ids(
                         neighbour_ids,
                         tenant_context=tenant_context,
+                        target_document=target_document,
+                        target_pages=target_pages,
                     )
                     for candidate in expanded:
                         candidate = _replace_candidate(
@@ -839,18 +1079,22 @@ class HybridRetrievalEngine:
                             current = candidates.get(candidate_id)
                             if current is None or not values:
                                 continue
-                            appendix = "\n".join(values)
-                            content = current.content
-                            if appendix not in content:
-                                content = (
-                                    content.rstrip()
-                                    + "\n\n--- Formule collegate dal Knowledge Graph ---\n"
-                                    + appendix
-                                ).strip()
+                            formula_fragments = _merge_unique_strings(
+                                _candidate_formula_fragments(current),
+                                values,
+                            )
+                            content = _append_graph_formula_fragments(
+                                current.content,
+                                formula_fragments,
+                            )
                             candidates[candidate_id] = _replace_candidate(
                                 current,
                                 content=content,
                                 type="formula",
+                                metadata={
+                                    **current.metadata,
+                                    _GRAPH_FORMULA_CONTENTS_KEY: formula_fragments,
+                                },
                                 origin=_origin_join(current.origin, "Neo4jFormulaLink"),
                             )
                 except Exception as exc:
@@ -910,8 +1154,10 @@ class HybridRetrievalEngine:
         # allowed a larger document-scoped cap but remains finite.
         cap = 500 if exhaustive_formula_lookup and target_document else max(
             200,
-            int(self._config.qdrant_candidates) + 120,
+            effective_qdrant_limit + 120,
         )
+        
+        
         if len(final_candidates) > cap:
             final_candidates = final_candidates[:cap]
             warnings.append(f"Candidate cap applicato: mantenuti i primi {cap} risultati.")
@@ -1063,7 +1309,12 @@ class HybridRetrievalEngine:
         ) >= 2
         return max(int(self._config.qdrant_candidates), 140) if (complex_query or graph_relation_mode) else int(self._config.qdrant_candidates)
 
-    def _build_qdrant_filter(self, context: TenantContext) -> Any:
+    def _build_qdrant_filter(
+        self,
+        context: TenantContext,
+        *,
+        target_pages: Sequence[int] = (),
+    ) -> Any:
         try:
             from qdrant_client import models
         except ImportError:
@@ -1089,10 +1340,18 @@ class HybridRetrievalEngine:
                         ]
                     }
                 )
-            return {
-                "must": [{"key": "status", "match": {"value": "active"}}],
-                "should": branches,
-            }
+            must: list[dict[str, Any]] = [
+                {"key": "status", "match": {"value": "active"}}
+            ]
+            pages = sorted({int(page) for page in target_pages or () if int(page) > 0})
+            if pages:
+                must.append({
+                    "should": [
+                        {"key": "page", "match": {"any": pages}},
+                        {"key": "page_no", "match": {"any": pages}},
+                    ]
+                })
+            return {"must": must, "should": branches}
 
         branches: list[Any] = []
         if "GLOBAL" in context.allowed_scopes:
@@ -1129,14 +1388,26 @@ class HybridRetrievalEngine:
             raise RetrievalConfigurationError(
                 "TenantContext senza scope autorizzati per Qdrant"
             )
-        return models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="status", match=models.MatchValue(value="active")
+        must_conditions: list[Any] = [
+            models.FieldCondition(
+                key="status", match=models.MatchValue(value="active")
+            )
+        ]
+        pages = sorted({int(page) for page in target_pages or () if int(page) > 0})
+        if pages:
+            must_conditions.append(
+                models.Filter(
+                    should=[
+                        models.FieldCondition(
+                            key="page", match=models.MatchAny(any=pages)
+                        ),
+                        models.FieldCondition(
+                            key="page_no", match=models.MatchAny(any=pages)
+                        ),
+                    ]
                 )
-            ],
-            should=branches,
-        )
+            )
+        return models.Filter(must=must_conditions, should=branches)
 
     def _search_qdrant(
         self,
@@ -1144,6 +1415,7 @@ class HybridRetrievalEngine:
         *,
         limit: int,
         tenant_context: TenantContext,
+        target_pages: Sequence[int] = (),
     ) -> list[RetrievalCandidate]:
         try:
             embedder = self._resources.get_embedder()
@@ -1160,7 +1432,9 @@ class HybridRetrievalEngine:
         if not vector or any(not math.isfinite(float(value)) for value in vector):
             raise RetrievalProtocolError("Embedding query non valido")
 
-        tenant_filter = self._build_qdrant_filter(tenant_context)
+        tenant_filter = self._build_qdrant_filter(
+            tenant_context, target_pages=target_pages
+        )
         if hasattr(client, "query_points"):
             response = client.query_points(
                 collection_name=self._config.qdrant_collection,
@@ -1207,6 +1481,8 @@ class HybridRetrievalEngine:
         ids: Sequence[str],
         *,
         tenant_context: TenantContext,
+        target_document: str | None = None,
+        target_pages: Sequence[int] = (),
     ) -> list[RetrievalCandidate]:
         unique_ids = list(dict.fromkeys(str(value) for value in ids if str(value).strip()))
         if not unique_ids:
@@ -1228,7 +1504,11 @@ class HybridRetrievalEngine:
                 origin="QdrantGraphExpansion",
                 score_graph=1.0,
             )
-            if candidate is not None:
+            if candidate is not None and _candidate_matches_scope(
+                candidate,
+                target_document=target_document,
+                target_pages=target_pages,
+            ):
                 output.append(candidate)
         return output
 
@@ -1282,11 +1562,15 @@ class HybridRetrievalEngine:
         *,
         limit: int,
         tenant_context: TenantContext,
+        target_pages: Sequence[int] = (),
     ) -> list[RetrievalCandidate]:
         tokens = _search_tokens(query)
         if not tokens:
             return []
         pg_query = " OR ".join(tokens)
+        page_sql, page_params = _pg_page_condition(
+            target_pages, metadata_expr="d.metadata_json"
+        )
         sql = """
             WITH q AS (SELECT websearch_to_tsquery('simple', %s) AS tsq)
             SELECT
@@ -1325,12 +1609,16 @@ class HybridRetrievalEngine:
                     OR
                     (d.scope = 'ACCOUNT' AND d.organization_id = %s AND d.tier IN ('B', 'C'))
                   )
+              {page_sql}
             ORDER BY rank DESC
             LIMIT %s
-        """
+        """.format(page_sql=page_sql)
         with self._resources.postgres_connection(context=tenant_context) as conn:
             with conn.cursor() as cursor:
-                cursor.execute(sql, (pg_query, tenant_context.organization_id, int(limit)))
+                cursor.execute(
+                    sql,
+                    (pg_query, tenant_context.organization_id, *page_params, int(limit)),
+                )
                 rows = cursor.fetchall()
         return [
             candidate
@@ -1345,6 +1633,7 @@ class HybridRetrievalEngine:
         *,
         limit: int,
         tenant_context: TenantContext,
+        target_pages: Sequence[int] = (),
     ) -> list[RetrievalCandidate]:
         phrases = _exact_phrases(query)[:12]
         if not phrases:
@@ -1352,6 +1641,7 @@ class HybridRetrievalEngine:
 
         per_phrase = max(3, int(limit) // len(phrases))
         found: dict[str, RetrievalCandidate] = {}
+        page_sql, page_params = _pg_page_condition(target_pages)
         sql_template = """
             SELECT
                 chunk_uuid::text,
@@ -1376,6 +1666,7 @@ class HybridRetrievalEngine:
                     OR
                     (scope = 'ACCOUNT' AND organization_id = %s AND tier IN ('B', 'C'))
                   )
+              {page_sql}
             ORDER BY ingestion_ts DESC
             LIMIT %s
         """
@@ -1385,8 +1676,13 @@ class HybridRetrievalEngine:
                 for phrase in phrases:
                     condition, parameters = self._pg_term_condition(phrase)
                     cursor.execute(
-                        sql_template.format(condition=condition),
-                        (*parameters, tenant_context.organization_id, per_phrase),
+                        sql_template.format(condition=condition, page_sql=page_sql),
+                        (
+                            *parameters,
+                            tenant_context.organization_id,
+                            *page_params,
+                            per_phrase,
+                        ),
                     )
                     for row in cursor.fetchall():
                         candidate = self._candidate_from_pg_row(
@@ -1413,10 +1709,12 @@ class HybridRetrievalEngine:
         *,
         limit: int,
         tenant_context: TenantContext,
+        target_pages: Sequence[int] = (),
     ) -> list[RetrievalCandidate]:
         wanted = _normalize_document_name(requested_document)
         if not wanted:
             return []
+        page_sql, page_params = _pg_page_condition(target_pages)
         sql = """
             WITH q AS (SELECT plainto_tsquery('simple', %s) AS tsq),
             visible AS (
@@ -1478,14 +1776,21 @@ class HybridRetrievalEngine:
             FROM ranked
             WHERE rn = 1
               AND filename_norm = %s
+              {page_sql}
             ORDER BY rank DESC, ingestion_ts DESC
             LIMIT %s
-        """
+        """.format(page_sql=page_sql)
         with self._resources.postgres_connection(context=tenant_context) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
                     sql,
-                    (query, tenant_context.organization_id, wanted, int(limit)),
+                    (
+                        query,
+                        tenant_context.organization_id,
+                        wanted,
+                        *page_params,
+                        int(limit),
+                    ),
                 )
                 rows = cursor.fetchall()
         output: list[RetrievalCandidate] = []
@@ -1777,6 +2082,10 @@ class HybridRetrievalEngine:
         else:
             content = semantic or raw or candidate.content
 
+        formula_fragments = _candidate_formula_fragments(candidate)
+        if formula_fragments:
+            content = _append_graph_formula_fragments(content, formula_fragments)
+
         filename = candidate.filename
         pg_filename = _payload_filename(metadata, filename)
         if filename.casefold() in _UNKNOWN_FILENAMES:
@@ -1792,6 +2101,8 @@ class HybridRetrievalEngine:
             **metadata,
             "pg_ingestion_ts": str(row.get("ingestion_ts") or ""),
         }
+        if formula_fragments:
+            merged_metadata[_GRAPH_FORMULA_CONTENTS_KEY] = formula_fragments
         return _replace_candidate(
             candidate,
             content=content,
@@ -1802,9 +2113,12 @@ class HybridRetrievalEngine:
                 or max(0, _safe_int(metadata.get("page_chunk_index"), 0))
             ),
             doc_id=candidate.doc_id or str(metadata.get("doc_id") or ""),
-            type=source_type,
+            type="formula" if formula_fragments else source_type,
             tier=str(row.get("tier") or metadata.get("tier") or candidate.tier),
-            source_tier=str(candidate.tier) if str(candidate.tier) == "GRAPH" else candidate.source_tier,
+            source_tier=(
+                candidate.source_tier
+                or (str(candidate.tier) if str(candidate.tier) == "GRAPH" else "")
+            ),
             scope=str(row.get("scope") or metadata.get("scope") or candidate.scope),
             organization_id=optional_positive_int(
                 row.get("organization_id")
@@ -1849,10 +2163,15 @@ class HybridRetrievalEngine:
         limit: int,
         tenant_context: TenantContext,
         driver: Any,
+        target_document: str | None = None,
+        target_pages: Sequence[int] = (),
     ) -> list[RetrievalCandidate]:
         tokens = _search_tokens(query)
         if not tokens:
             return []
+        requested_doc_norm = _normalize_document_name(target_document or "")
+        requested_doc_lower = PurePath(str(target_document or "").strip()).name.casefold()
+        requested_pages = sorted({int(page) for page in target_pages or () if int(page) > 0})
         cypher = """
             MATCH (c:Chunk)-[m:MENTIONS|PRESENT_IN|MENTIONED_IN]-(e:Entity)
             WHERE c.status = 'active' AND e.status = 'active' AND m.status = 'active'
@@ -1861,6 +2180,14 @@ class HybridRetrievalEngine:
                     OR
                     (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN ['B', 'C'])
                   )
+              AND (
+                    $requested_doc_norm = ''
+                    OR toLower(coalesce(c.filename, '')) = $requested_doc_lower
+                    OR replace(replace(replace(replace(replace(replace(
+                           toLower(coalesce(c.filename, '')), '.pdf', ''), '.md', ''),
+                           '.txt', ''), '_', ''), '-', ''), ' ', '') = $requested_doc_norm
+                  )
+              AND (size($requested_pages) = 0 OR coalesce(c.page, 0) IN $requested_pages)
               AND any(tok IN $tokens WHERE
                     toLower(coalesce(e.name, e.canonical_id, e.id, '')) CONTAINS tok OR
                     toLower(coalesce(e.description, '')) CONTAINS tok OR
@@ -1897,6 +2224,9 @@ class HybridRetrievalEngine:
                 cypher,
                 tokens=list(tokens),
                 org_id=tenant_context.organization_id,
+                requested_doc_norm=requested_doc_norm,
+                requested_doc_lower=requested_doc_lower,
+                requested_pages=requested_pages,
                 limit=int(limit),
             )
             for row in rows:
@@ -1936,10 +2266,15 @@ class HybridRetrievalEngine:
         query: str,
         *,
         limit: int,
+        target_document: str | None = None,
+        target_pages: Sequence[int] = (),
         tenant_context: TenantContext,
         driver: Any,
     ) -> list[RetrievalCandidate]:
         tokens = _search_tokens(query)
+        requested_doc_norm = _normalize_document_name(target_document or "")
+        requested_doc_lower = PurePath(str(target_document or "").strip()).name.casefold()
+        requested_pages = sorted({int(page) for page in target_pages or () if int(page) > 0})
         cypher = """
             MATCH (c:Chunk)
             WHERE c.status = 'active'
@@ -1948,6 +2283,14 @@ class HybridRetrievalEngine:
                     OR
                     (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN ['B', 'C'])
                   )
+              AND (
+                    $requested_doc_norm = ''
+                    OR toLower(coalesce(c.filename, '')) = $requested_doc_lower
+                    OR replace(replace(replace(replace(replace(replace(
+                           toLower(coalesce(c.filename, '')), '.pdf', ''), '.md', ''),
+                           '.txt', ''), '_', ''), '-', ''), ' ', '') = $requested_doc_norm
+                  )
+              AND (size($requested_pages) = 0 OR coalesce(c.page, 0) IN $requested_pages)
             CALL (c) {
                 MATCH (c)-[rf:HAS_FORMULA|MENTIONS|MENTIONED_IN|PRESENT_IN]-(f)
                 WHERE rf.status = 'active' AND f.status = 'active'
@@ -2009,6 +2352,9 @@ class HybridRetrievalEngine:
                 cypher,
                 tokens=list(tokens),
                 org_id=tenant_context.organization_id,
+                requested_doc_norm=requested_doc_norm,
+                requested_doc_lower=requested_doc_lower,
+                requested_pages=requested_pages,
                 limit=int(limit),
             )
             for row in rows:
@@ -2065,10 +2411,14 @@ class HybridRetrievalEngine:
         target_document: str | None,
         tenant_context: TenantContext,
         driver: Any,
+        target_pages: Sequence[int] = (),
     ) -> list[RetrievalCandidate]:
         tokens = _graph_tokens(query) or _search_tokens(query)
         if not tokens:
             return []
+        requested_doc_lower = PurePath(str(target_document or "").strip()).name.casefold()
+        requested_doc_norm = _normalize_document_name(target_document or "")
+        requested_pages = sorted({int(page) for page in target_pages or () if int(page) > 0})
         cypher = """
             MATCH (e1:Entity)-[rel]->(e2:Entity)
             WHERE rel.status = 'active'
@@ -2091,6 +2441,17 @@ class HybridRetrievalEngine:
                             (e2.scope = 'GLOBAL' AND e2.organization_id IS NULL AND e2.tier = 'A')
                         )
                     )
+                  )
+              AND (
+                    $requested_doc_norm = ''
+                    OR toLower(coalesce(rel.source_file, head(coalesce(rel.source_files, [])), '')) = $requested_doc_lower
+                    OR replace(replace(replace(replace(replace(replace(
+                           toLower(coalesce(rel.source_file, head(coalesce(rel.source_files, [])), '')),
+                           '.pdf', ''), '.md', ''), '.txt', ''), '_', ''), '-', ''), ' ', '') = $requested_doc_norm
+                  )
+              AND (
+                    size($requested_pages) = 0
+                    OR coalesce(rel.page_no, head(coalesce(rel.page_nos, [])), 0) IN $requested_pages
                   )
               AND any(tok IN $tokens WHERE
                     toLower(coalesce(e1.name, e1.canonical_id, e1.id, '')) CONTAINS tok OR
@@ -2121,6 +2482,9 @@ class HybridRetrievalEngine:
                 tokens=list(tokens),
                 org_id=tenant_context.organization_id,
                 allowed_rels=list(self._config.neo4j_allowed_relationships),
+                requested_doc_norm=requested_doc_norm,
+                requested_doc_lower=requested_doc_lower,
+                requested_pages=requested_pages,
                 limit=max(int(limit) * 4, int(limit)),
             )
             for row in rows:
@@ -2197,10 +2561,15 @@ class HybridRetrievalEngine:
         limit: int,
         tenant_context: TenantContext,
         driver: Any,
+        target_document: str | None = None,
+        target_pages: Sequence[int] = (),
     ) -> list[str]:
         unique_ids = list(dict.fromkeys(str(value) for value in seed_ids if str(value).strip()))
         if not unique_ids:
             return []
+        requested_doc_norm = _normalize_document_name(target_document or "")
+        requested_doc_lower = PurePath(str(target_document or "").strip()).name.casefold()
+        requested_pages = sorted({int(page) for page in target_pages or () if int(page) > 0})
         cypher = """
             MATCH
                 (c1:Chunk)-[r1:MENTIONS|PRESENT_IN|MENTIONED_IN]-(e:Entity)
@@ -2225,6 +2594,14 @@ class HybridRetrievalEngine:
                     (e.scope = 'ACCOUNT' AND e.organization_id = $org_id AND e.tier IN ['B', 'C'])
                   )
               AND NOT toUpper(coalesce(e.type, e.category, labels(e)[0], '')) IN ['GENERIC', 'YEAR', 'DATE']
+              AND (
+                    $requested_doc_norm = ''
+                    OR toLower(coalesce(c2.filename, '')) = $requested_doc_lower
+                    OR replace(replace(replace(replace(replace(replace(
+                           toLower(coalesce(c2.filename, '')), '.pdf', ''), '.md', ''),
+                           '.txt', ''), '_', ''), '-', ''), ' ', '') = $requested_doc_norm
+                  )
+              AND (size($requested_pages) = 0 OR coalesce(c2.page, 0) IN $requested_pages)
             WITH c2, count(DISTINCT e) AS entity_count
             WHERE entity_count >= 2
             RETURN coalesce(c2.chunk_id, c2.id) AS chunk_id
@@ -2238,6 +2615,9 @@ class HybridRetrievalEngine:
                 cypher,
                 ids=unique_ids,
                 org_id=tenant_context.organization_id,
+                requested_doc_norm=requested_doc_norm,
+                requested_doc_lower=requested_doc_lower,
+                requested_pages=requested_pages,
                 limit=int(limit),
             )
             return [

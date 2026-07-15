@@ -115,6 +115,7 @@ class ApiErrorCode(StrEnum):
     AUTHORIZATION_ERROR = "authorization_error"
     TENANT_CONTEXT_ERROR = "tenant_context_error"
     RESOURCE_NOT_READY = "resource_not_ready"
+    SERVICE_BUSY = "service_busy"
     RETRIEVAL_ERROR = "retrieval_error"
     GENERATION_ERROR = "generation_error"
     EVALUATION_ERROR = "evaluation_error"
@@ -267,16 +268,10 @@ class RagQueryRequest(ApiSchema):
 
     @model_validator(mode="after")
     def validate_history_sequence(self) -> "RagQueryRequest":
-        # Non rendiamo obbligatoria l'alternanza perfetta: il RagService potrà
-        # normalizzare messaggi consecutivi dello stesso ruolo come fa il PoC.
-        # Vietiamo però che l'ultimo messaggio storico replichi la query corrente
-        # come messaggio user, per evitare duplicazioni accidentali nel prompt.
-        if self.history:
-            last = self.history[-1]
-            if last.role == ChatRole.USER and last.content.strip() == self.query.strip():
-                raise ValueError(
-                    "l'ultimo messaggio history non deve duplicare la query corrente"
-                )
+        # L'alternanza e l'eventuale duplicazione della query corrente vengono
+        # normalizzate dal PromptBuilder. Accettare il duplicato mantiene la
+        # compatibilità con client chat che inviano l'intera conversazione,
+        # incluso l'ultimo messaggio user già presente nel campo ``query``.
         return self
 
     model_config = ConfigDict(
@@ -368,6 +363,10 @@ class RetrievalMetricsResponse(ApiSchema):
     kept_after_quality_filters: int = Field(default=0, ge=0)
     rerank_candidates: int = Field(default=0, ge=0)
     final_sources: int = Field(default=0, ge=0)
+    history_messages: int = Field(default=0, ge=0)
+    history_chars: int = Field(default=0, ge=0)
+    history_dropped_messages: int = Field(default=0, ge=0)
+    history_truncated_messages: int = Field(default=0, ge=0)
 
     tier_counts: dict[str, int] = Field(default_factory=dict)
     score: ScoreSummary = Field(default_factory=ScoreSummary)

@@ -237,7 +237,9 @@ class OllamaNativeGenerator:
         ``generate_async()`` oppure spostarlo esplicitamente su un worker thread.
         """
 
-        resolved = self._resolve_options(options or GenerationOptions())
+        resolved = self._resolve_options(
+            options or GenerationOptions(max_attempts=self._config.llm_max_attempts)
+        )
         messages = self._normalize_messages(prompt)
         request_id = self._request_id_for_logging()
         session = self._resources.get_ollama_session()

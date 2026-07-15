@@ -354,7 +354,7 @@ def solve_control_coverage(query_text: str) -> str | None:
         )
 
     implemented_match = re.search(
-        r"(\d+)\s+(?:risultano\s+)?(?:implementati|implemented|completi|complete)",
+        r"(\d+)\s+(?:(?:controlli|controls)\s+)?(?:risultano\s+|are\s+)?(?:implementati|implemented|completi|complete)",
         normalized,
         flags=re.IGNORECASE,
     )
@@ -364,7 +364,7 @@ def solve_control_coverage(query_text: str) -> str | None:
         flags=re.IGNORECASE,
     )
     weight_match = re.search(
-        r"(?:valgono|valgano|worth|weighted\s+at|peso|pesati|pesate)\s+(?:al\s+|del\s+)?(\d+(?:[.,]\d+)?)\s*%",
+        r"(?:valgono|valgano|worth|weighted\s+at|peso|pesati|pesate)\s+(?:(?:al|del|il|lo|la|the)\s+)?(\d+(?:[.,]\d+)?)\s*%",
         normalized,
         flags=re.IGNORECASE,
     )

@@ -48,7 +48,11 @@ from core.models import (
     RagIntent,
     SourceItem,
 )
-from core.prompting import PromptMessage, document_matches
+from core.prompting import (
+    PromptMessage,
+    document_matches,
+    truncate_structured_content,
+)
 from core.tenant import (
     TenantContext,
     TenantContextError,
@@ -89,6 +93,19 @@ _UUID_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
     flags=re.IGNORECASE,
 )
+
+_FILE_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?P<quoted>[`\"'“‘«][^`\"'”’»\n]{1,240}?\.(?:pdf|md|txt|docx|html|csv|xlsx|log|json|ya?ml|xml)[`\"'”’»])"
+    r"|(?P<bare>\b[A-Za-z0-9À-ÿ_()\-]+(?:\.[A-Za-z0-9À-ÿ_()\-]+)*\.(?:pdf|md|txt|docx|html|csv|xlsx|log|json|ya?ml|xml)\b)",
+    flags=re.IGNORECASE,
+)
+
+_UNRETRIEVED_SOURCE_MARKER: Final[str] = "[riferimento a fonte non recuperata rimosso]"
+_SYNTHETIC_GRAPH_FILENAMES: Final[frozenset[str]] = frozenset({
+    "kg",
+    "neo4j knowledge graph",
+})
+_FINAL_TRUNCATION_MARKER: Final[str] = "...[contenuto troncato dal quality gate]"
 
 _EVIDENCE_TABLE_HEADER: Final[str] = (
     "| Livello di attinenza | Percentuale stimata | Esito sintetico |"
@@ -131,6 +148,7 @@ class ValidationCode(StrEnum):
     SOURCES_SECTION_REBUILT = "SOURCES_SECTION_REBUILT"
     MISSING_RETRIEVED_SOURCES = "MISSING_RETRIEVED_SOURCES"
     SOURCE_CITATION_MISSING = "SOURCE_CITATION_MISSING"
+    UNRETRIEVED_SOURCE_REFERENCE_REMOVED = "UNRETRIEVED_SOURCE_REFERENCE_REMOVED"
     TENANT_SOURCE_VIOLATION = "TENANT_SOURCE_VIOLATION"
     TENANT_CONTEXT_MISSING = "TENANT_CONTEXT_MISSING"
     REQUESTED_DOCUMENT_SCOPE_VIOLATION = "REQUESTED_DOCUMENT_SCOPE_VIOLATION"
@@ -468,14 +486,45 @@ def _document_not_found_fallback(requested_document: str) -> AnswerSections:
     )
 
 
+def _normalized_source_filename(value: str) -> str:
+    """Return a single-line Markdown-safe source label."""
+
+    filename = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+    filename = re.sub(r"\s{2,}", " ", filename)
+    filename = filename.replace("`", "'")
+    for character in ("|", "*", "#", ">"):
+        filename = filename.replace(character, f"\\{character}")
+    return filename
+
+
+def _is_synthetic_graph_filename(value: str) -> bool:
+    return _normalized_source_filename(value).casefold() in _SYNTHETIC_GRAPH_FILENAMES
+
+
+def _citable_source_filenames(sources: Sequence[SourceItem]) -> tuple[str, ...]:
+    filenames: list[str] = []
+    for source in sources:
+        filename = _normalized_source_filename(source.filename)
+        if not filename or _is_synthetic_graph_filename(filename):
+            continue
+        if filename.casefold() not in {item.casefold() for item in filenames}:
+            filenames.append(filename)
+    return tuple(filenames)
+
+
 def _compact_sources(sources: Sequence[SourceItem], max_sources: int = 20) -> str:
     seen: set[tuple[str, int]] = set()
     lines: list[str] = []
+    graph_evidence_used = False
 
     for source in sources:
-        filename = str(source.filename or "").strip()
+        filename = _normalized_source_filename(source.filename)
         if not filename:
             continue
+        if _is_synthetic_graph_filename(filename):
+            graph_evidence_used = True
+            continue
+
         page = int(source.page or 0)
         key = (filename.casefold(), page)
         if key in seen:
@@ -487,16 +536,58 @@ def _compact_sources(sources: Sequence[SourceItem], max_sources: int = 20) -> st
         if len(lines) >= max_sources:
             break
 
-    return "\n".join(lines) if lines else "- Nessuna fonte disponibile."
+    if lines:
+        if graph_evidence_used and len(lines) < max_sources:
+            lines.append("- Knowledge Graph Neo4j (evidenza strutturale)")
+        return "\n".join(lines)
+    if graph_evidence_used:
+        return "- Knowledge Graph Neo4j (evidenza strutturale)"
+    return "- Nessuna fonte disponibile."
 
 
 def _answer_mentions_any_source(answer: str, sources: Sequence[SourceItem]) -> bool:
-    answer_lower = (answer or "").casefold()
-    return any(
-        str(source.filename or "").strip().casefold() in answer_lower
-        for source in sources
-        if str(source.filename or "").strip()
+    answer_lower = re.sub(r"\s+", " ", answer or "").casefold()
+    filenames = _citable_source_filenames(sources)
+    if not filenames:
+        return any(
+            _is_synthetic_graph_filename(source.filename)
+            for source in sources
+        ) and "neo4j" in answer_lower
+    return any(filename.casefold() in answer_lower for filename in filenames)
+
+
+def _remove_unretrieved_file_references(
+    sections: AnswerSections,
+    sources: Sequence[SourceItem],
+) -> tuple[AnswerSections, tuple[str, ...]]:
+    """Redact explicit filenames that are not present in the visible source set.
+
+    The deterministic D section is rebuilt separately. This guard only inspects
+    A/B/C so an LLM cannot retain a plausible but unretrieved filename as
+    evidence or as a factual limitation.
+    """
+
+    removed: list[str] = []
+
+    def clean_text(value: str) -> str:
+        def replace(match: re.Match[str]) -> str:
+            raw = match.group("quoted") or match.group("bare") or ""
+            reference = raw.strip("`\"'“”‘’«» ")
+            if any(document_matches(source.filename, reference) for source in sources):
+                return raw
+            removed.append(reference)
+            return _UNRETRIEVED_SOURCE_MARKER
+
+        return _FILE_REFERENCE_PATTERN.sub(replace, value or "")
+
+    cleaned = sections.model_copy(
+        update={
+            "answer": clean_text(sections.answer),
+            "evidence": clean_text(sections.evidence),
+            "limitations": clean_text(sections.limitations),
+        }
     )
+    return cleaned, tuple(dict.fromkeys(item for item in removed if item))
 
 
 def _has_visible_formula(answer: str) -> bool:
@@ -532,38 +623,111 @@ def _repair_graph_wording(value: str) -> tuple[str, int]:
 
 
 def _truncate_sections(sections: AnswerSections, max_chars: int) -> AnswerSections:
-    """Troncamento conservativo che mantiene sempre le quattro sezioni."""
+    """Truncate the final answer while preserving A/B/C/D and Markdown blocks."""
 
     rendered = sections.render()
     if len(rendered) <= max_chars:
         return sections
 
-    # Preserva sempre limiti e fonti; ripartisce il budget residuo tra A e B.
-    fixed = (
-        len(_REQUIRED_HEADERS[0])
-        + len(_REQUIRED_HEADERS[1])
-        + len(_REQUIRED_HEADERS[2])
-        + len(_REQUIRED_HEADERS[3])
-        + len(sections.limitations)
-        + len(sections.sources)
-        + 16
-    )
-    remaining = max(200, max_chars - fixed)
-    answer_budget = max(100, int(remaining * 0.65))
-    evidence_budget = max(100, remaining - answer_budget)
+    empty_render = AnswerSections().render()
+    available = max(0, int(max_chars) - len(empty_render))
+    if available <= 0:
+        return AnswerSections(
+            answer="Risposta troncata.",
+            evidence="- Evidenze non disponibili nel budget residuo.",
+            limitations="- Limite massimo della risposta raggiunto.",
+            sources="- Nessuna fonte visualizzabile nel budget residuo.",
+        )
 
-    def cut(text: str, budget: int) -> str:
-        if len(text) <= budget:
-            return text
-        suffix = "\n\n...[contenuto troncato dal quality gate]"
-        return text[: max(0, budget - len(suffix))].rstrip() + suffix
-
-    return AnswerSections(
-        answer=cut(sections.answer, answer_budget),
-        evidence=cut(sections.evidence, evidence_budget),
-        limitations=sections.limitations,
-        sources=sections.sources,
+    bodies = (
+        sections.answer,
+        sections.evidence,
+        sections.limitations,
+        sections.sources,
     )
+    weights = (0.48, 0.24, 0.16, 0.12)
+    budgets = [max(1, int(available * weight)) for weight in weights]
+
+    # Redistribute budget unused by short sections to longer sections.
+    for _ in range(2):
+        unused = 0
+        needs: list[int] = []
+        for index, body in enumerate(bodies):
+            if len(body) < budgets[index]:
+                unused += budgets[index] - len(body)
+                budgets[index] = len(body)
+            elif len(body) > budgets[index]:
+                needs.append(index)
+        if unused <= 0 or not needs:
+            break
+        share, remainder = divmod(unused, len(needs))
+        for offset, index in enumerate(needs):
+            budgets[index] += share + (1 if offset < remainder else 0)
+
+    answer_type = "auto"
+    evidence_type = "auto"
+    limitations_type = "text"
+    sources_type = "lines"
+
+    answer, _ = truncate_structured_content(
+        sections.answer,
+        budgets[0],
+        content_type=answer_type,
+    )
+    evidence, _ = truncate_structured_content(
+        sections.evidence,
+        budgets[1],
+        content_type=evidence_type,
+    )
+    limitations, _ = truncate_structured_content(
+        sections.limitations,
+        budgets[2],
+        content_type=limitations_type,
+    )
+    sources, _ = truncate_structured_content(
+        sections.sources,
+        budgets[3],
+        content_type=sources_type,
+    )
+
+    truncated = AnswerSections(
+        answer=answer or _FINAL_TRUNCATION_MARKER,
+        evidence=evidence or f"- {_FINAL_TRUNCATION_MARKER}",
+        limitations=limitations or f"- {_FINAL_TRUNCATION_MARKER}",
+        sources=sources or f"- {_FINAL_TRUNCATION_MARKER}",
+    )
+
+    # Guard against separator/rounding drift. Reduce the largest mutable body
+    # until the canonical rendering is within the configured hard limit.
+    for _ in range(8):
+        final_render = truncated.render()
+        overflow = len(final_render) - max_chars
+        if overflow <= 0:
+            return truncated
+
+        values = [
+            truncated.answer,
+            truncated.evidence,
+            truncated.limitations,
+            truncated.sources,
+        ]
+        index = max(range(len(values)), key=lambda item: len(values[item]))
+        new_limit = max(1, len(values[index]) - overflow - 4)
+        mode = (answer_type, evidence_type, limitations_type, sources_type)[index]
+        shortened, _ = truncate_structured_content(
+            values[index],
+            new_limit,
+            content_type=mode,
+        )
+        values[index] = shortened or _FINAL_TRUNCATION_MARKER[:new_limit]
+        truncated = AnswerSections(
+            answer=values[0],
+            evidence=values[1],
+            limitations=values[2],
+            sources=values[3],
+        )
+
+    return truncated
 
 
 def _extract_relevance_level(answer_section: str) -> int | None:
@@ -860,6 +1024,22 @@ class AnswerValidator:
                     repaired = True
                 sections = _complete_sections(sections)
 
+        sections, removed_source_references = _remove_unretrieved_file_references(
+            sections,
+            scoped_sources,
+        )
+        if removed_source_references:
+            repaired = True
+            issues.append(
+                _issue(
+                    ValidationCode.UNRETRIEVED_SOURCE_REFERENCE_REMOVED,
+                    ValidationSeverity.WARNING,
+                    "Sono stati rimossi riferimenti espliciti a file non presenti tra le fonti recuperate.",
+                    repaired=True,
+                    references=list(removed_source_references),
+                )
+            )
+
         graph_mode = (
             resolved.resolved_execution_mode() == RagExecutionMode.GRAPH_RELATION_STRICT
             or resolved.resolved_intent() == RagIntent.CHART
@@ -914,18 +1094,6 @@ class AnswerValidator:
                 )
             )
 
-        if scoped_sources and not _answer_mentions_any_source(
-            sections.evidence + "\n" + sections.sources,
-            scoped_sources,
-        ):
-            issues.append(
-                _issue(
-                    ValidationCode.SOURCE_CITATION_MISSING,
-                    ValidationSeverity.WARNING,
-                    "La risposta non cita esplicitamente alcun filename recuperato nella sezione evidenze/fonti.",
-                )
-            )
-
         if resolved.rebuild_sources_section:
             source_text = _compact_sources(scoped_sources)
             if sections.sources.strip() != source_text.strip():
@@ -940,6 +1108,18 @@ class AnswerValidator:
                         source_count=len(scoped_sources),
                     )
                 )
+
+        if scoped_sources and not _answer_mentions_any_source(
+            sections.evidence + "\n" + sections.sources,
+            scoped_sources,
+        ):
+            issues.append(
+                _issue(
+                    ValidationCode.SOURCE_CITATION_MISSING,
+                    ValidationSeverity.WARNING,
+                    "La risposta finale non cita esplicitamente alcuna fonte recuperata nella sezione evidenze/fonti.",
+                )
+            )
 
         max_chars = int(resolved.max_answer_chars or self._config.max_assistant_chars)
         rendered = sections.render()

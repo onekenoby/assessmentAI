@@ -55,3 +55,18 @@ def service_timeout_seconds() -> int:
     except ValueError:
         value = 300
     return max(5, value)
+
+
+@pytest.fixture(scope="session")
+def api_base_url() -> str:
+    return os.getenv("RAG_API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+
+
+@pytest.fixture(scope="session")
+def require_second_organization() -> bool:
+    return _env_bool("RAG_E2E_REQUIRE_SECOND_ORGANIZATION", False)
+
+
+@pytest.fixture(scope="session")
+def run_capacity_stress() -> bool:
+    return _env_bool("RAG_E2E_RUN_CAPACITY_STRESS", False)

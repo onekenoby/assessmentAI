@@ -461,7 +461,7 @@ def _required_positive_int_env(name: str) -> int:
 #     os.getenv("ORGANIZATION_ID", "1234") == "1234"
 # restituiva un booleano (True/False), causando organization_id=1/0.
 POC_MODE = True
-ORGANIZATION_ID: int = 1234
+ORGANIZATION_ID: int =8888 #1234
 
 # Per una futura versione multi-tenant autenticata sostituire la riga sopra con:
 # ORGANIZATION_ID = _required_positive_int_env("ORGANIZATION_ID")

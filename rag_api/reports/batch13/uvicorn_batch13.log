@@ -1,0 +1,311 @@
+INFO:     Started server process [3004]
+INFO:     Waiting for application startup.
+POC_MODE: ruolo PostgreSQL privilegiato consentito (user=admin, superuser=True, bypassrls=True)
+Inizializzazione risorse RAG fallita
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 284, in initialize
+    local["embedder"] = self._create_embedder()
+                        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 323, in _create_embedder
+    return SentenceTransformer(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\venv\Lib\site-packages\sentence_transformers\util\decorators.py", line 41, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\venv\Lib\site-packages\sentence_transformers\sentence_transformer\model.py", line 183, in __init__
+    super().__init__(
+  File "E:\Dev\assessmentAI\venv\Lib\site-packages\sentence_transformers\base\model.py", line 188, in __init__
+    raise FileNotFoundError(f"Path {model_name_or_path} not found")
+FileNotFoundError: Path /workspace/models/bge-m3 not found
+Inizializzazione risorse RAG fallita | state=failed
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 284, in initialize
+    local["embedder"] = self._create_embedder()
+                        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 323, in _create_embedder
+    return SentenceTransformer(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\venv\Lib\site-packages\sentence_transformers\util\decorators.py", line 41, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\venv\Lib\site-packages\sentence_transformers\sentence_transformer\model.py", line 183, in __init__
+    super().__init__(
+  File "E:\Dev\assessmentAI\venv\Lib\site-packages\sentence_transformers\base\model.py", line 188, in __init__
+    raise FileNotFoundError(f"Path {model_name_or_path} not found")
+FileNotFoundError: Path /workspace/models/bge-m3 not found
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\main.py", line 100, in lifespan
+    await asyncio.to_thread(
+  File "C:\python311\Lib\asyncio\threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\python311\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 960, in initialize_resources
+    resources.initialize(strict=strict, force=force)
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 311, in initialize
+    raise ResourceInitializationError(
+core.resources.ResourceInitializationError: Inizializzazione risorse RAG fallita: Path /workspace/models/bge-m3 not found
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:55072 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62465 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62465 - "GET /health/ready?deep=true HTTP/1.1" 503 Service Unavailable
+Qdrant retrieval failed
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1421, in _search_qdrant
+    embedder = self._resources.get_embedder()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 166, in get_embedder
+    self.require_ready()
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 161, in require_ready
+    raise ResourceNotReadyError(
+core.resources.ResourceNotReadyError: ResourceManager non pronto (state=failed): Path /workspace/models/bge-m3 not found
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 814, in _retrieve_sync
+    vector_hits = self._search_qdrant(
+                  ^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1424, in _search_qdrant
+    raise RetrievalConfigurationError(
+core.retrieval.RetrievalConfigurationError: Risorse embedding/Qdrant non inizializzate
+PostgreSQL retrieval failed
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 836, in _retrieve_sync
+    bm25_hits = self._search_pg_bm25(
+                ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1616, in _search_pg_bm25
+    with self._resources.postgres_connection(context=tenant_context) as conn:
+  File "C:\python311\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 415, in postgres_connection
+    pool = self.get_postgres_pool(required=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 208, in get_postgres_pool
+    self.require_ready()
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 161, in require_ready
+    raise ResourceNotReadyError(
+core.resources.ResourceNotReadyError: ResourceManager non pronto (state=failed): Path /workspace/models/bge-m3 not found
+RAG request failed | request_id=8bbb162b-0e75-4d14-8da3-a94488e17e50 | error=RagServiceRetrievalError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 1530, in _retrieve_and_rank
+    result = await result
+             ^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 338, in retrieve_candidates
+    result = await result
+             ^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 735, in retrieve_candidates
+    return await asyncio.to_thread(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\python311\Lib\asyncio\threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\python311\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1015, in _retrieve_sync
+    raise RetrievalBackendError(
+core.retrieval.RetrievalBackendError: Nessun backend di retrieval ha completato correttamente la richiesta
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 674, in query_rag
+    result = await rag_service.query(
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 961, in query
+    return await self._query_bound(command, context)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 1030, in _query_bound
+    sources, debug, rerank_warnings = await self._retrieve_and_rank(
+                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 1535, in _retrieve_and_rank
+    raise RagServiceRetrievalError(
+core.rag_service.RagServiceRetrievalError: Errore retrieval: RetrievalBackendError: Nessun backend di retrieval ha completato correttamente la richiesta
+INFO:     127.0.0.1:62465 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable
+Qdrant retrieval failed
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1421, in _search_qdrant
+    embedder = self._resources.get_embedder()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 166, in get_embedder
+    self.require_ready()
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 161, in require_ready
+    raise ResourceNotReadyError(
+core.resources.ResourceNotReadyError: ResourceManager non pronto (state=failed): Path /workspace/models/bge-m3 not found
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 814, in _retrieve_sync
+    vector_hits = self._search_qdrant(
+                  ^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1424, in _search_qdrant
+    raise RetrievalConfigurationError(
+core.retrieval.RetrievalConfigurationError: Risorse embedding/Qdrant non inizializzate
+PostgreSQL retrieval failed
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 836, in _retrieve_sync
+    bm25_hits = self._search_pg_bm25(
+                ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1616, in _search_pg_bm25
+    with self._resources.postgres_connection(context=tenant_context) as conn:
+  File "C:\python311\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 415, in postgres_connection
+    pool = self.get_postgres_pool(required=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 208, in get_postgres_pool
+    self.require_ready()
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 161, in require_ready
+    raise ResourceNotReadyError(
+core.resources.ResourceNotReadyError: ResourceManager non pronto (state=failed): Path /workspace/models/bge-m3 not found
+RAG request failed | request_id=725b1d18-cc03-4de4-a0be-1061777ab786 | error=RagServiceRetrievalError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 1530, in _retrieve_and_rank
+    result = await result
+             ^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 338, in retrieve_candidates
+    result = await result
+             ^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 735, in retrieve_candidates
+    return await asyncio.to_thread(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\python311\Lib\asyncio\threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\python311\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1015, in _retrieve_sync
+    raise RetrievalBackendError(
+core.retrieval.RetrievalBackendError: Nessun backend di retrieval ha completato correttamente la richiesta
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 674, in query_rag
+    result = await rag_service.query(
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 961, in query
+    return await self._query_bound(command, context)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 1030, in _query_bound
+    sources, debug, rerank_warnings = await self._retrieve_and_rank(
+                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 1535, in _retrieve_and_rank
+    raise RagServiceRetrievalError(
+core.rag_service.RagServiceRetrievalError: Errore retrieval: RetrievalBackendError: Nessun backend di retrieval ha completato correttamente la richiesta
+INFO:     127.0.0.1:62465 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable
+E:\Dev\assessmentAI\venv\Lib\site-packages\starlette\_exception_handler.py:59: StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated. Use 'HTTP_422_UNPROCESSABLE_CONTENT' instead.
+  response = await handler(conn, exc)  # type: ignore[arg-type]
+INFO:     127.0.0.1:62465 - "POST /api/v1/rag/query HTTP/1.1" 422 Unprocessable Entity
+RAG request failed | request_id=40ea136e-f791-432f-9bd5-2c0748976bc5 | error=CapacityRejectedError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 673, in query_rag
+    async with limiter.slot():
+  File "C:\python311\Lib\contextlib.py", line 210, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 146, in slot
+    await self.acquire()
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 116, in acquire
+    raise CapacityRejectedError("queue_full")
+core.capacity.CapacityRejectedError: queue_full
+Qdrant retrieval failed
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1421, in _search_qdrant
+    embedder = self._resources.get_embedder()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 166, in get_embedder
+    self.require_ready()
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 161, in require_ready
+    raise ResourceNotReadyError(
+core.resources.ResourceNotReadyError: ResourceManager non pronto (state=failed): Path /workspace/models/bge-m3 not found
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 814, in _retrieve_sync
+    vector_hits = self._search_qdrant(
+                  ^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1424, in _search_qdrant
+    raise RetrievalConfigurationError(
+core.retrieval.RetrievalConfigurationError: Risorse embedding/Qdrant non inizializzate
+RAG request failed | request_id=313b08e7-98b1-4ee2-b6e4-322da45fb8e6 | error=CapacityRejectedError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 673, in query_rag
+    async with limiter.slot():
+  File "C:\python311\Lib\contextlib.py", line 210, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 146, in slot
+    await self.acquire()
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 116, in acquire
+    raise CapacityRejectedError("queue_full")
+core.capacity.CapacityRejectedError: queue_full
+INFO:     127.0.0.1:62470 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable
+PostgreSQL retrieval failed
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 836, in _retrieve_sync
+    bm25_hits = self._search_pg_bm25(
+                ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1616, in _search_pg_bm25
+    with self._resources.postgres_connection(context=tenant_context) as conn:
+  File "C:\python311\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 415, in postgres_connection
+    pool = self.get_postgres_pool(required=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 208, in get_postgres_pool
+    self.require_ready()
+  File "E:\Dev\assessmentAI\rag_api\core\resources.py", line 161, in require_ready
+    raise ResourceNotReadyError(
+core.resources.ResourceNotReadyError: ResourceManager non pronto (state=failed): Path /workspace/models/bge-m3 not found
+INFO:     127.0.0.1:62469 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable
+RAG request failed | request_id=d99cb0fc-fa5d-425e-a4cf-0214cf3401af | error=RagServiceRetrievalError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 1530, in _retrieve_and_rank
+    result = await result
+             ^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 338, in retrieve_candidates
+    result = await result
+             ^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 735, in retrieve_candidates
+    return await asyncio.to_thread(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\python311\Lib\asyncio\threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\python311\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\retrieval.py", line 1015, in _retrieve_sync
+    raise RetrievalBackendError(
+core.retrieval.RetrievalBackendError: Nessun backend di retrieval ha completato correttamente la richiesta
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 674, in query_rag
+    result = await rag_service.query(
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 961, in query
+    return await self._query_bound(command, context)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 1030, in _query_bound
+    sources, debug, rerank_warnings = await self._retrieve_and_rank(
+                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\rag_service.py", line 1535, in _retrieve_and_rank
+    raise RagServiceRetrievalError(
+core.rag_service.RagServiceRetrievalError: Errore retrieval: RetrievalBackendError: Nessun backend di retrieval ha completato correttamente la richiesta
+INFO:     127.0.0.1:62468 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable

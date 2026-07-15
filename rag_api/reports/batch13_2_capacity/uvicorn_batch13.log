@@ -1,0 +1,65 @@
+INFO:     Started server process [11840]
+INFO:     Waiting for application startup.
+POC_MODE: ruolo PostgreSQL privilegiato consentito (user=admin, superuser=True, bypassrls=True)
+Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]Loading weights: 100%|##########| 391/391 [00:00<00:00, 20563.15it/s]
+Loading weights:   0%|          | 0/105 [00:00<?, ?it/s]Loading weights: 100%|##########| 105/105 [00:00<00:00, 2873.90it/s]
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8013 (Press CTRL+C to quit)
+INFO:     127.0.0.1:55222 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52031 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52031 - "GET /health/ready?deep=true HTTP/1.1" 200 OK
+RAG request failed | request_id=8a9fcc53-e5bb-4acc-8ade-f200c1eb2a5e | error=CapacityRejectedError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 673, in query_rag
+    async with limiter.slot():
+  File "C:\python311\Lib\contextlib.py", line 210, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 146, in slot
+    await self.acquire()
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 116, in acquire
+    raise CapacityRejectedError("queue_full")
+core.capacity.CapacityRejectedError: queue_full
+INFO:     127.0.0.1:59928 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable
+E:\Dev\assessmentAI\venv\Lib\site-packages\starlette\_exception_handler.py:59: StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated. Use 'HTTP_422_UNPROCESSABLE_CONTENT' instead.
+  response = await handler(conn, exc)  # type: ignore[arg-type]
+INFO:     127.0.0.1:59928 - "POST /api/v1/rag/query HTTP/1.1" 422 Unprocessable Entity
+RAG request failed | request_id=ae85b5ab-f2e0-4f84-956f-115f783a8669 | error=CapacityRejectedError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 673, in query_rag
+    async with limiter.slot():
+  File "C:\python311\Lib\contextlib.py", line 210, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 146, in slot
+    await self.acquire()
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 116, in acquire
+    raise CapacityRejectedError("queue_full")
+core.capacity.CapacityRejectedError: queue_full
+RAG request failed | request_id=7be4954f-2f92-46f1-84fb-e1ad140e7546 | error=CapacityRejectedError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 673, in query_rag
+    async with limiter.slot():
+  File "C:\python311\Lib\contextlib.py", line 210, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 146, in slot
+    await self.acquire()
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 116, in acquire
+    raise CapacityRejectedError("queue_full")
+core.capacity.CapacityRejectedError: queue_full
+INFO:     127.0.0.1:59929 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable
+RAG request failed | request_id=413c8f95-b80d-4f33-9ea8-395425ce6e7b | error=CapacityRejectedError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 673, in query_rag
+    async with limiter.slot():
+  File "C:\python311\Lib\contextlib.py", line 210, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 146, in slot
+    await self.acquire()
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 116, in acquire
+    raise CapacityRejectedError("queue_full")
+core.capacity.CapacityRejectedError: queue_full
+INFO:     127.0.0.1:59930 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable
+INFO:     127.0.0.1:59931 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable

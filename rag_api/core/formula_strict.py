@@ -696,13 +696,19 @@ def _aggregate_threshold_rules(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
     groups: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
 
     for r in threshold_rows:
-        rule_text = _formula_display_text(r.get("latex") or "", 900)
+        rule_text = _formula_display_text(
+            r.get("latex") or "",
+            900,
+        )
         fname = str(r.get("filename") or "N/D")
         page = int(r.get("page") or 0)
-        criterion = _extract_threshold_criterion(rule_text)
-        criterion_key = re.sub(r"\s+", " ", criterion.lower()).strip()
-        key = (fname, page, criterion_key)
-
+        source_id = str(
+            r.get("source_id") or ""
+        ).strip()
+        criterion = _extract_threshold_criterion(rule_text)        
+        
+        
+        key = (fname, page, criterion)
         domain = _extract_threshold_domain_from_rule(rule_text)
 
         if key not in groups:
@@ -711,13 +717,27 @@ def _aggregate_threshold_rules(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
                 "tipo": "Soglia normativa non di scoring",
                 "criterio": criterion,
                 "ambito": [],
-                "meaning": "Criterio/condizione normativa recuperata. Non è una formula computazionale e non è una regola di scoring.",
+                "meaning": (
+                    "Criterio/condizione normativa recuperata. "
+                    "Non è una formula computazionale e non è "
+                    "una regola di scoring."
+                ),
                 "filename": fname,
                 "page": page,
+                "source_ids": [],
             }
 
         if domain and domain not in groups[key]["ambito"]:
             groups[key]["ambito"].append(domain)
+
+        if (
+            source_id
+            and source_id not in groups[key]["source_ids"]
+        ):
+            groups[key]["source_ids"].append(
+                source_id
+            )
+
 
     out: List[Dict[str, Any]] = []
     for g in groups.values():
@@ -1376,6 +1396,132 @@ def _answer_formula_strict_core(query_text: str, sources: List[SourceItem]) -> O
         )
     )
 
+
+def formula_sources_used_in_answer(
+    query_text: str,
+    sources: Sequence[SourceItem],
+) -> tuple[SourceItem, ...]:
+    """
+    Restituisce soltanto le fonti che hanno prodotto righe
+    effettivamente renderizzate nella risposta Formula Strict.
+
+    Le fonti recuperate ma scartate dai filtri formula restano
+    disponibili nell'audit del retrieval.
+    """
+
+    scoped_sources = (
+        _scope_formula_sources_to_requested_document_v414(
+            query_text,
+            list(sources or ()),
+        )
+    )
+
+    rows = clean_formula_rows(
+        extract_formula_rows_from_sources(
+            scoped_sources
+        ),
+        max_rows=30,
+    )
+
+    if not rows:
+        return ()
+
+    computational = [
+        row
+        for row in rows
+        if str(
+            row.get("tipo") or ""
+        ).lower() == "formula computazionale"
+    ]
+
+    definitional = [
+        row
+        for row in rows
+        if str(
+            row.get("tipo") or ""
+        ).lower() == "metrica definitoria"
+    ]
+
+    thresholds = _aggregate_threshold_rules(
+        rows
+    )
+
+    cited = [
+        row
+        for row in rows
+        if str(
+            row.get("tipo") or ""
+        ).lower() == "metrica/elemento citato"
+    ]
+
+    query_lower = str(
+        query_text or ""
+    ).lower()
+
+    has_formula_terms = bool(
+        re.search(
+            r"\b(?:"
+            r"formula|formule|"
+            r"equazione|equazioni|"
+            r"formulas?|equations?"
+            r")\b",
+            query_lower,
+        )
+    )
+
+    has_metric_terms = bool(
+        re.search(
+            r"\b(?:"
+            r"metrica|metriche|"
+            r"indicatore|indicatori|"
+            r"scoring|"
+            r"metrics?|indicators?"
+            r")\b",
+            query_lower,
+        )
+    )
+
+    asks_only_formulas = (
+        has_formula_terms
+        and not has_metric_terms
+    )
+
+    primary_rows = (
+        computational
+        if asks_only_formulas
+        else computational + definitional
+    )
+
+    rows_for_sources = (
+        primary_rows
+        if asks_only_formulas
+        else primary_rows + thresholds + cited
+    )
+
+    used_ids: set[str] = set()
+
+    for row in rows_for_sources:
+        source_id = str(
+            row.get("source_id") or ""
+        ).strip()
+
+        if source_id:
+            used_ids.add(source_id)
+
+        for item in row.get("source_ids") or ():
+            clean_id = str(
+                item or ""
+            ).strip()
+
+            if clean_id:
+                used_ids.add(clean_id)
+
+    return tuple(
+        source
+        for source in scoped_sources
+        if str(source.id) in used_ids
+    )
+
 def _threshold_rule_segments_v413(text: str, max_segments: int = 8) -> List[str]:
     """Extract readable threshold-rule segments from arbitrary text."""
     raw = str(text or "")
@@ -1854,6 +2000,7 @@ def _extract_formula_rows_from_sources_core(sources: List[SourceItem]) -> List[D
                 "filename": filename,
                 "page": page,
                 "formula_origin": "document_equation",
+                "source_id": str(source.id),
             })
 
         # 2. Formule LaTeX esplicite: fallback per contenuti senza testo lineare.
@@ -1873,6 +2020,7 @@ def _extract_formula_rows_from_sources_core(sources: List[SourceItem]) -> List[D
                 "filename": filename,
                 "page": page,
                 "formula_origin": "latex",
+                "source_id": str(source.id),
             })
 
         # 3. Formula nodes del Knowledge Graph: fallback strutturato.
@@ -1898,11 +2046,14 @@ def _extract_formula_rows_from_sources_core(sources: List[SourceItem]) -> List[D
                     seen.add(key)
                     rows.append({
                         "name": plain or _extract_left_name_from_equation(latex) or "Formula recuperata",
-                        "latex": _strip_math_wrappers(_normalize_latex_value(formula_value)),
+                        "latex": _strip_math_wrappers(
+                            _normalize_latex_value(formula_value)
+                        ),
                         "meaning": meaning,
                         "filename": filename,
                         "page": page,
                         "formula_origin": "knowledge_graph",
+                        "source_id": str(source.id),
                     })
 
         # 4. Metriche citate senza equazione esplicita.
@@ -1928,12 +2079,15 @@ def _extract_formula_rows_from_sources_core(sources: List[SourceItem]) -> List[D
                 "latex": "formula esplicita non recuperata",
                 "meaning": (
                     "Metrica o indicatore citato nella fonte; nessuna equazione "
-                    "esplicita è stata individuata nella stessa riga."
+                    "esplicita è stata individuata nello stesso chunk."
                 ),
                 "filename": filename,
                 "page": page,
                 "formula_origin": "metric_text",
+                "source_id": str(source.id),
             })
+
+
 
             if len(rows) >= 60:
                 return rows
@@ -2177,18 +2331,39 @@ def _extract_formula_rows_from_sources_v417(sources: List[SourceItem]) -> List[D
         filename = getattr(s, "filename", "N/D") or "N/D"
         page = int(getattr(s, "page", 0) or 0)
 
-        for seg in _threshold_rule_segments_v413(content, max_segments=8):
-            key = ("regola soglia", seg.lower()[:500], filename.lower(), page)
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append({
-                "name": "Regola soglia",
-                "latex": seg,
-                "meaning": "Criterio/soglia normativa recuperata; non è una formula computazionale.",
-                "filename": filename,
-                "page": page,
-            })
+        for s in sources or []:
+            content = getattr(s, "content", "") or ""
+            filename = getattr(s, "filename", "N/D") or "N/D"
+            page = int(getattr(s, "page", 0) or 0)
+            source_id = str(getattr(s, "id", "") or "")
+
+            for seg in _threshold_rule_segments_v413(
+                content,
+                max_segments=8,
+            ):
+                key = (
+                    "regola soglia",
+                    seg.lower()[:500],
+                    filename.lower(),
+                    page,
+                )
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+                rows.append({
+                    "name": "Regola soglia",
+                    "latex": seg,
+                    "meaning": (
+                        "Criterio/soglia normativa recuperata; "
+                        "non è una formula computazionale."
+                    ),
+                    "filename": filename,
+                    "page": page,
+                    "source_id": source_id,
+                })
 
     return rows
 
@@ -2224,4 +2399,5 @@ __all__ = [
     "answer_formula_strict",
     "clean_formula_rows",
     "extract_formula_rows_from_sources",
+    "formula_sources_used_in_answer",
 ]

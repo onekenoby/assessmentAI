@@ -105,6 +105,19 @@ def _unique_strings(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     return tuple(output)
 
 
+def _metadata_nonnegative_int(metadata: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = metadata.get(key)
+        if value is None or str(value).strip() == "":
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        return max(0, parsed)
+    return 0
+
+
 class InternalModel(BaseModel):
     """Configurazione comune dei modelli interni mutabili."""
 
@@ -486,6 +499,7 @@ class RetrievalCandidate(InternalModel):
     def to_source_item(self, *, request_id: str = "") -> SourceItem:
         """Materializza il candidato come fonte finale canonica."""
 
+        metadata = dict(self.metadata)
         return SourceItem(
             id=self.id,
             content=self.content,
@@ -507,6 +521,26 @@ class RetrievalCandidate(InternalModel):
             classification=self.classification,
             embedding_model=self.embedding_model,
             request_id=request_id,
+            pg_ingestion_ts=str(
+                metadata.get("pg_ingestion_ts")
+                or metadata.get("ingestion_ts")
+                or ""
+            ),
+            pg_source_name=str(metadata.get("source_name") or ""),
+            pg_source_type=str(metadata.get("source_type") or ""),
+            pg_log_id=_metadata_nonnegative_int(metadata, "log_id", "pg_log_id"),
+            pg_chunk_id=_metadata_nonnegative_int(
+                metadata,
+                "chunk_index",
+                "chunk_id",
+                "pg_chunk_id",
+            ),
+            pg_page_chunk_index=_metadata_nonnegative_int(
+                metadata,
+                "page_chunk_index",
+                "pg_page_chunk_index",
+            ),
+            pg_toon_type=str(metadata.get("toon_type") or ""),
             db_origin=self.origin,
         )
 
@@ -558,12 +592,20 @@ class RetrievalDebug(InternalModel):
     qdrant_hits: int = Field(default=0, ge=0)
     postgres_bm25_hits: int = Field(default=0, ge=0)
     postgres_exact_phrase_hits: int = Field(default=0, ge=0)
+    postgres_document_scope_hits: int = Field(default=0, ge=0)
     neo4j_direct_hits: int = Field(default=0, ge=0)
     neo4j_expanded_hits: int = Field(default=0, ge=0)
 
     kept_after_quality_filters: int = Field(default=0, ge=0)
     rerank_candidates: int = Field(default=0, ge=0)
     final_sources: int = Field(default=0, ge=0)
+    reranked_sources: int = Field(default=0, ge=0)
+    prompt_context_sources: int = Field(default=0, ge=0)
+    prompt_dropped_sources: int = Field(default=0, ge=0)
+    history_messages: int = Field(default=0, ge=0)
+    history_chars: int = Field(default=0, ge=0)
+    history_dropped_messages: int = Field(default=0, ge=0)
+    history_truncated_messages: int = Field(default=0, ge=0)
 
     tier_counts: dict[str, int] = Field(default_factory=dict)
     score: ScoreStats = Field(default_factory=ScoreStats)
@@ -821,6 +863,76 @@ class RagEvalResult(InternalModel):
             hallucination_risk=0.0,
             verdict=EvaluationVerdict.DISABLED,
             reason="Evaluation disabled.",
+        )
+
+    @classmethod
+    def deterministic_pass(
+        cls,
+        *,
+        execution_mode: RagExecutionMode | str,
+        source_count: int = 0,
+    ) -> "RagEvalResult":
+        """Esito verificabile per rami che non usano un LLM generativo.
+
+        Il judge LLM non aggiunge garanzie ai risultati costruiti da solver,
+        lookup atomici, graph/formula strict o fallback senza fonti. In questi
+        rami la faithfulness deriva dal quality gate deterministico e dal set di
+        fonti già validato dal tenant/document scope.
+        """
+
+        mode = RagExecutionMode(str(execution_mode))
+        support = (
+            "input utente validato"
+            if mode == RagExecutionMode.MATH_DIRECT and source_count == 0
+            else f"{max(0, int(source_count))} fonte/i validate"
+        )
+        return cls(
+            faithfulness=1.0,
+            answer_relevance=1.0,
+            context_support=1.0,
+            hallucination_risk=0.0,
+            source_scope_violation=False,
+            verdict=EvaluationVerdict.PASS,
+            supported_claims=(
+                "Risposta prodotta senza generazione LLM e sottoposta al quality gate deterministico.",
+            ),
+            reason=(
+                f"Deterministic evaluation pass for {mode.value}; support: {support}. "
+                "LLM judge bypassed."
+            ),
+        )
+
+    @classmethod
+    def generation_failure_fallback(
+        cls,
+        *,
+        source_count: int = 0,
+        error_type: str = "GenerationError",
+    ) -> "RagEvalResult":
+        """Esito locale per il fallback tecnico dopo un errore LLM.
+
+        Il fallback non contiene claim documentali nuovi: dichiara soltanto che
+        retrieval e generazione hanno avuto esiti differenti. Per questo il
+        judge LLM viene bypassato, ma il verdetto resta ``WARN`` anziché
+        ``PASS`` per rendere visibile il degrado operativo.
+        """
+
+        count = max(0, int(source_count))
+        safe_error_type = str(error_type or "GenerationError").strip()[:200]
+        return cls(
+            faithfulness=1.0,
+            answer_relevance=1.0,
+            context_support=1.0 if count else 0.0,
+            hallucination_risk=0.0,
+            source_scope_violation=False,
+            verdict=EvaluationVerdict.WARN,
+            supported_claims=(
+                "Fallback tecnico costruito deterministicamente senza aggiungere claim documentali.",
+            ),
+            reason=(
+                f"Generation fallback after {safe_error_type}; "
+                f"tenant-visible sources preserved: {count}. LLM judge bypassed."
+            ),
         )
 
     @classmethod

@@ -1,0 +1,17 @@
+INFO:     Started server process [9556]
+INFO:     Waiting for application startup.
+POC_MODE: ruolo PostgreSQL privilegiato consentito (user=admin, superuser=True, bypassrls=True)
+Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]Loading weights: 100%|##########| 391/391 [00:00<00:00, 12744.88it/s]
+Loading weights:   0%|          | 0/105 [00:00<?, ?it/s]Loading weights: 100%|##########| 105/105 [00:00<00:00, 2967.49it/s]
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8013 (Press CTRL+C to quit)
+INFO:     127.0.0.1:56101 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56102 - "GET /health/ready?deep=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53070 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53070 - "GET /health/ready?deep=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53070 - "POST /api/v1/rag/query HTTP/1.1" 200 OK
+Ollama generation error | request_id=de7aac51-35d7-40e3-bf74-a906cdeb19d1 model=gemma4:12b attempt=1 retryable=True error=Errore di connessione verso Ollama: HTTPConnectionPool(host='127.0.0.1', port=11434): Read timed out. (read timeout=180)
+INFO:     127.0.0.1:53070 - "POST /api/v1/rag/query HTTP/1.1" 200 OK
+E:\Dev\assessmentAI\venv\Lib\site-packages\starlette\_exception_handler.py:59: StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated. Use 'HTTP_422_UNPROCESSABLE_CONTENT' instead.
+  response = await handler(conn, exc)  # type: ignore[arg-type]
+INFO:     127.0.0.1:53070 - "POST /api/v1/rag/query HTTP/1.1" 422 Unprocessable Entity

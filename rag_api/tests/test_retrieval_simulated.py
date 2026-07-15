@@ -40,16 +40,35 @@ class FakeResources:
 
 
 class StubEngine(HybridRetrievalEngine):
-    def __init__(self, *, config, resource_manager, qdrant_hits=(), pg_hits=(), fail_qdrant=False, fail_pg=False):
-        super().__init__(config=config, resource_manager=resource_manager)
+    def __init__(
+        self,
+        *,
+        config,
+        resource_manager,
+        qdrant_hits=(),
+        pg_hits=(),
+        fail_qdrant=False,
+        fail_pg=False,
+    ):
+        super().__init__(
+            config=config,
+            resource_manager=resource_manager,
+        )
         self.stub_qdrant_hits = list(qdrant_hits)
         self.stub_pg_hits = list(pg_hits)
         self.fail_qdrant = fail_qdrant
         self.fail_pg = fail_pg
 
+        # Consente di verificare il limite realmente ricevuto
+        # dal backend Qdrant simulato.
+        self.last_qdrant_limit = None
+
     def _search_qdrant(self, *args, **kwargs):
+        self.last_qdrant_limit = kwargs.get("limit")
+
         if self.fail_qdrant:
             raise RuntimeError("qdrant down")
+
         return list(self.stub_qdrant_hits)
 
     def _search_pg_bm25(self, *args, **kwargs):
@@ -114,6 +133,55 @@ def test_qdrant_search_filters_foreign_tenant(tenant_context):
     assert [item.id for item in result] == ["valid"]
     assert client.calls[0]["collection_name"] == settings.qdrant_collection
     assert client.calls[0]["with_payload"] is True
+
+
+@pytest.mark.asyncio
+async def test_retrieval_uses_explicit_qdrant_limit(
+    tenant_context,
+):
+    config = settings.model_copy(
+        update={
+            "pg_enrich_enabled": False,
+            "neo4j_enabled": False,
+        }
+    )
+
+    engine = StubEngine(
+        config=config,
+        resource_manager=FakeResources(),
+        qdrant_hits=[
+            _candidate("qdrant-limit")
+        ],
+    )
+
+    candidates, debug = await engine.retrieve_candidates(
+        query="confronto documentale completo",
+        intent=RagIntent.AUDIT,
+        answer_mode=RagAnswerMode.AUDIT,
+        target_document=None,
+        target_pages=(),
+        wants_evidence=True,
+        graph_relation_mode=False,
+        formula_mode=False,
+        exhaustive_formula_lookup=False,
+
+        # Limite simulato come se provenisse dal RagQueryRouter.
+        qdrant_limit=140,
+
+        tenant_context=tenant_context,
+    )
+
+    assert [
+        item.id
+        for item in candidates
+    ] == ["qdrant-limit"]
+
+    # Il limite deve arrivare alla ricerca Qdrant concreta.
+    assert engine.last_qdrant_limit == 140
+
+    # Il debug deve esporre lo stesso valore.
+    assert debug.qdrant_candidates == 140
+
 
 
 @pytest.mark.asyncio

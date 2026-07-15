@@ -161,6 +161,7 @@ DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS: Final[tuple[str, ...]] = (
     "THREATENS",
     "EXPLOITS",
     "PROTECTS",
+    "HAS_ACCESS_TO",
     "VULNERABLE_TO",
     "COMPROMISES",
     "IMPACTS",
@@ -305,15 +306,28 @@ class RagSettings(BaseModel):
     ollama_native_chat_url: str = "http://127.0.0.1:11434/api/chat"
     ollama_connect_timeout_seconds: int = 300
     llm_timeout_seconds: int = 300
+    llm_max_attempts: int = 2
     llm_num_ctx: int = 16384
     llm_num_predict: int = 4096
     llm_temperature: float = 0.15
     llm_repeat_penalty: float = 1.15
+    generation_failure_fallback_enabled: bool = True
+
+    # ------------------------------------------------------------------
+    # Concorrenza e backpressure
+    # Un singolo processo/GPU esegue per default una query pesante alla volta,
+    # mantenendo una coda breve e temporalmente limitata.
+    # ------------------------------------------------------------------
+    max_concurrent_queries: int = 1
+    max_queued_queries: int = 4
+    query_queue_timeout_seconds: float = 15.0
 
     # ------------------------------------------------------------------
     # Conversazione e retrieval
     # ------------------------------------------------------------------
     memory_limit: int = 3
+    history_max_message_chars: int = 15000
+    history_max_chars: int = 30000
     qdrant_candidates: int = 100
     rerank_candidates: int = 35
     final_sources: int = 8
@@ -357,9 +371,13 @@ class RagSettings(BaseModel):
         "qdrant_port",
         "ollama_connect_timeout_seconds",
         "llm_timeout_seconds",
+        "llm_max_attempts",
         "llm_num_ctx",
         "llm_num_predict",
+        "max_concurrent_queries",
         "memory_limit",
+        "history_max_message_chars",
+        "history_max_chars",
         "qdrant_candidates",
         "rerank_candidates",
         "final_sources",
@@ -375,6 +393,27 @@ class RagSettings(BaseModel):
     def validate_positive_integer(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("il valore deve essere maggiore di zero")
+        return value
+
+    @field_validator("llm_max_attempts")
+    @classmethod
+    def validate_llm_max_attempts(cls, value: int) -> int:
+        if value > 5:
+            raise ValueError("llm_max_attempts non può essere maggiore di 5")
+        return value
+
+    @field_validator("max_queued_queries")
+    @classmethod
+    def validate_nonnegative_integer(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("il valore non può essere negativo")
+        return value
+
+    @field_validator("query_queue_timeout_seconds")
+    @classmethod
+    def validate_positive_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("il timeout deve essere maggiore di zero")
         return value
 
     @field_validator(
@@ -540,13 +579,26 @@ def load_settings() -> RagSettings:
             "OLLAMA_CONNECT_TIMEOUT_S", 300
         ),
         llm_timeout_seconds=_env_int("LLM_TIMEOUT_S", 300),
+        llm_max_attempts=_env_int("LLM_MAX_ATTEMPTS", 2),
         llm_num_ctx=_env_int("LLM_NUM_CTX", 16384),
         llm_num_predict=_env_int("LLM_NUM_PREDICT", 4096),
         llm_temperature=_env_float("LLM_TEMPERATURE", 0.15),
         llm_repeat_penalty=_env_float("LLM_REPEAT_PENALTY", 1.15),
+        generation_failure_fallback_enabled=_env_bool(
+            "GENERATION_FAILURE_FALLBACK_ENABLED", True
+        ),
+
+        # Concorrenza/backpressure
+        max_concurrent_queries=_env_int("RAG_MAX_CONCURRENT_QUERIES", 1),
+        max_queued_queries=_env_int("RAG_MAX_QUEUED_QUERIES", 4),
+        query_queue_timeout_seconds=_env_float(
+            "RAG_QUERY_QUEUE_TIMEOUT_S", 15.0
+        ),
 
         # Retrieval
         memory_limit=_env_int("MEMORY_LIMIT", 3),
+        history_max_message_chars=_env_int("HISTORY_MAX_MESSAGE_CHARS", 15000),
+        history_max_chars=_env_int("HISTORY_MAX_CHARS", 30000),
         qdrant_candidates=_env_int("QDRANT_CANDIDATES", 100),
         rerank_candidates=_env_int("RERANK_CANDIDATES", 35),
         final_sources=_env_int("FINAL_SOURCES", 8),

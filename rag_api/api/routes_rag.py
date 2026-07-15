@@ -24,7 +24,9 @@ Sicurezza:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import threading
 from collections.abc import Mapping
 from typing import Annotated, Any
 from uuid import UUID, uuid4
@@ -51,6 +53,11 @@ from api.schemas import (
     SourceResponse,
 )
 from core.audit import AuditIdentityError
+from core.capacity import (
+    CapacityRejectedError,
+    CapacitySnapshot,
+    RequestCapacityLimiter,
+)
 from core.config import settings
 from core.models import RagServiceResult, RetrievalDebug, SourceItem
 from core.rag_service import (
@@ -80,6 +87,35 @@ REQUEST_ID_HEADER = "X-Request-ID"
 # ``include_debug`` espone metriche e audit Markdown. In produzione è limitato
 # a ruoli esplicitamente autorizzati; nel PoC resta disponibile per i test.
 DEBUG_ROLES = frozenset({"admin", "auditor", "rag_admin", "rag-debug"})
+
+_CAPACITY_STATE_ATTR = "rag_capacity_limiter"
+_CAPACITY_INIT_LOCK = threading.Lock()
+
+
+def create_request_capacity_limiter() -> RequestCapacityLimiter:
+    """Build the per-ASGI-app bounded gate from trusted settings."""
+
+    return RequestCapacityLimiter(
+        max_concurrent=settings.max_concurrent_queries,
+        max_queued=settings.max_queued_queries,
+        acquire_timeout_seconds=settings.query_queue_timeout_seconds,
+    )
+
+
+def _request_capacity_limiter(request: Request) -> RequestCapacityLimiter:
+    limiter = getattr(request.app.state, _CAPACITY_STATE_ATTR, None)
+    if limiter is not None:
+        return limiter
+
+    # Custom FastAPI apps used by tests may include the router directly rather
+    # than going through main.create_app().  Initialize exactly one limiter for
+    # that application without sharing asyncio primitives across event loops.
+    with _CAPACITY_INIT_LOCK:
+        limiter = getattr(request.app.state, _CAPACITY_STATE_ATTR, None)
+        if limiter is None:
+            limiter = create_request_capacity_limiter()
+            setattr(request.app.state, _CAPACITY_STATE_ATTR, limiter)
+    return limiter
 
 
 # =============================================================================
@@ -296,29 +332,79 @@ def _authorize_optional_features(
 # =============================================================================
 # MAPPING SERVICE -> RESPONSE
 # =============================================================================
+def _bounded_public_text(
+    value: Any,
+    max_chars: int,
+    *,
+    fallback: str = "",
+    single_line: bool = False,
+) -> str:
+    """Normalizza un campo interno prima di esporlo nel contratto pubblico.
+
+    I modelli interni ammettono limiti più ampi per conservare la provenance.
+    Il mapping HTTP deve quindi ridurre deterministicamente i valori reali,
+    anziché trasformare un record valido in un falso 422 lato client.
+    """
+
+    text = str(value or "").replace("\x00", " ").strip()
+    if single_line:
+        text = " ".join(text.split())
+    if not text:
+        text = str(fallback or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def _bounded_public_identifier(value: Any, max_chars: int, *, fallback: str) -> str:
+    """Compatta un identificativo mantenendo un suffisso hash anti-collisione."""
+
+    text = str(value or "").replace("\x00", " ").strip()
+    text = " ".join(text.split())
+    if not text:
+        text = fallback
+    if len(text) <= max_chars:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    prefix_chars = max(1, max_chars - len(digest) - 1)
+    return f"{text[:prefix_chars]}-{digest}"[:max_chars]
+
+
 def _source_to_response(source: SourceItem) -> SourceResponse:
     return SourceResponse(
-        source_id=source.id,
-        document_id=source.doc_id,
-        filename=source.filename,
+        source_id=_bounded_public_identifier(source.id, 256, fallback="source"),
+        document_id=_bounded_public_identifier(source.doc_id, 256, fallback=""),
+        filename=_bounded_public_text(
+            source.filename, 512, fallback="Unknown", single_line=True
+        ),
         page=source.page,
         page_chunk_index=source.page_chunk_index,
-        source_type=source.type,
+        source_type=_bounded_public_text(source.type, 100, fallback="text", single_line=True),
         score=source.score,
-        excerpt=source.excerpt(),
-        section_hint=source.section_hint,
+        excerpt=_bounded_public_text(source.excerpt(), 5_000),
+        section_hint=_bounded_public_text(source.section_hint, 500),
         graph_context=tuple(
             GraphEntityResponse(
-                name=entity.name,
-                type=entity.type,
-                relation=entity.relation,
+                name=_bounded_public_text(
+                    entity.name, 300, fallback="Entity", single_line=True
+                ),
+                type=_bounded_public_text(
+                    entity.type, 100, fallback="Entity", single_line=True
+                ),
+                relation=_bounded_public_text(
+                    entity.relation, 100, fallback="MENTIONED", single_line=True
+                ),
             )
             for entity in source.graph_context
         ),
         tier=str(source.tier),
         scope=str(source.scope),
-        classification=source.classification,
-        database_origin=source.db_origin,
+        classification=_bounded_public_text(
+            source.classification, 50, fallback="internal", single_line=True
+        ),
+        database_origin=_bounded_public_text(
+            source.db_origin, 150, fallback="Unknown", single_line=True
+        ),
     )
 
 
@@ -336,6 +422,10 @@ def _retrieval_to_response(debug: RetrievalDebug) -> RetrievalMetricsResponse:
         kept_after_quality_filters=debug.kept_after_quality_filters,
         rerank_candidates=debug.rerank_candidates,
         final_sources=debug.final_sources,
+        history_messages=debug.history_messages,
+        history_chars=debug.history_chars,
+        history_dropped_messages=debug.history_dropped_messages,
+        history_truncated_messages=debug.history_truncated_messages,
         tier_counts=dict(debug.tier_counts),
         score=ScoreSummary(
             minimum=debug.score.minimum,
@@ -468,6 +558,19 @@ def _map_service_exception(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if isinstance(exc, CapacityRejectedError):
+        return RagApiException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code=ApiErrorCode.SERVICE_BUSY,
+            message=(
+                "Il servizio RAG ha raggiunto la capacità concorrente "
+                "disponibile. Riprovare più tardi."
+            ),
+            request_id=request_id,
+            retryable=True,
+            headers={"Retry-After": "5"},
+        )
+
     if isinstance(exc, (ResourceNotReadyError, RagServiceConfigurationError)):
         return RagApiException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -524,10 +627,12 @@ def _map_service_exception(
         )
 
     if isinstance(exc, ValueError):
+        # Dopo la costruzione esplicita del comando, un ValueError proviene da
+        # mapping o invarianti interni e non deve essere attribuito al client.
         return RagApiException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            code=ApiErrorCode.VALIDATION_ERROR,
-            message="La richiesta contiene parametri non validi.",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            code=ApiErrorCode.INTERNAL_ERROR,
+            message="Il servizio RAG non ha completato la serializzazione sicura della risposta.",
             request_id=request_id,
         )
 
@@ -615,13 +720,22 @@ async def query_rag(
 
     try:
         _authorize_optional_features(payload, tenant)
-        command = _request_to_command(payload)
-        
-        result = await rag_service.query(
-            command,
-            tenant_context=tenant,
-        )
+        try:
+            command = _request_to_command(payload)
+        except ValueError as exc:
+            raise RagApiException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                code=ApiErrorCode.VALIDATION_ERROR,
+                message="La richiesta contiene parametri non validi.",
+                request_id=request_id,
+            ) from exc
+        limiter = _request_capacity_limiter(request)
 
+        async with limiter.slot():
+            result = await rag_service.query(
+                command,
+                tenant_context=tenant,
+            )
 
         api_response = _result_to_response(result, payload)
     except Exception as exc:
@@ -658,7 +772,11 @@ def _dependency_state(*, enabled: bool, ready: bool, required: bool) -> Dependen
     return DependencyState.DEGRADED
 
 
-def _health_response_from_snapshot(snapshot: Any) -> HealthResponse:
+def _health_response_from_snapshot(
+    snapshot: Any,
+    *,
+    capacity: CapacitySnapshot | None = None,
+) -> HealthResponse:
     dependencies: dict[str, DependencyHealthResponse] = {}
 
     for dependency in snapshot.dependencies:
@@ -671,7 +789,21 @@ def _health_response_from_snapshot(snapshot: Any) -> HealthResponse:
             detail=dependency.detail or "",
         )
 
-    if not snapshot.ready:
+    if capacity is not None:
+        dependencies["request_capacity"] = DependencyHealthResponse(
+            state=(
+                DependencyState.OK
+                if capacity.accepting
+                else DependencyState.DOWN
+            ),
+            detail=(
+                f"active={capacity.active}/{capacity.max_concurrent}; "
+                f"queued={capacity.queued}/{capacity.max_queued}; "
+                f"closed={str(capacity.closed).lower()}"
+            ),
+        )
+
+    if not snapshot.ready or (capacity is not None and not capacity.accepting):
         service_state = ServiceState.DOWN
     elif snapshot.degraded:
         service_state = ServiceState.DEGRADED
@@ -716,6 +848,7 @@ async def health_live(response: Response) -> HealthResponse:
     summary="Readiness probe",
 )
 async def health_ready(
+    request: Request,
     response: Response,
     deep: Annotated[
         bool,
@@ -729,10 +862,11 @@ async def health_ready(
     """Verifica lo stato delle risorse condivise del motore RAG."""
 
     snapshot = await asyncio.to_thread(resources.health_snapshot, deep=deep)
-    payload = _health_response_from_snapshot(snapshot)
+    capacity = _request_capacity_limiter(request).snapshot()
+    payload = _health_response_from_snapshot(snapshot, capacity=capacity)
 
     headers = {"Cache-Control": "no-store"}
-    if snapshot.ready:
+    if snapshot.ready and capacity.accepting:
         for key, value in headers.items():
             response.headers[key] = value
         return payload
@@ -816,6 +950,7 @@ __all__ = [
     "API_VERSION",
     "REQUEST_ID_HEADER",
     "RagApiException",
+    "create_request_capacity_limiter",
     "health_router",
     "install_rag_exception_handlers",
     "resolve_request_tenant",

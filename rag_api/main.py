@@ -34,6 +34,7 @@ from fastapi import FastAPI, Request, Response
 from api.routes_rag import (
     API_VERSION,
     REQUEST_ID_HEADER,
+    create_request_capacity_limiter,
     health_router,
     install_rag_exception_handlers,
     router as rag_router,
@@ -125,6 +126,13 @@ def _build_lifespan(
         try:
             yield
         finally:
+            limiter = getattr(app.state, "rag_capacity_limiter", None)
+            if limiter is not None:
+                try:
+                    await limiter.close()
+                except Exception:
+                    logger.exception("Chiusura capacity limiter fallita")
+
             logger.info("Chiusura risorse RAG avviata")
             try:
                 await asyncio.to_thread(close_resources)
@@ -239,6 +247,7 @@ def create_app(
     application.state.service_version = API_VERSION
     application.state.startup_complete = False
     application.state.startup_error = ""
+    application.state.rag_capacity_limiter = create_request_capacity_limiter()
 
     application.middleware("http")(_http_context_middleware)
 

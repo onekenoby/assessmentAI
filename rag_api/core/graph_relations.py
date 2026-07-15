@@ -331,6 +331,7 @@ def _parse_graph_relation_table_from_source(source: SourceItem) -> list[dict[str
             "page": columns[4],
             "evidence": "Relazione presente nel Knowledge Graph.",
             "status": "esplicita nel grafo",
+            "source_id": str(source.id),
         })
     return rows
 
@@ -339,6 +340,7 @@ def answer_graph_relations_strict(
     query_text: str,
     sources: Sequence[SourceItem],
     max_rows: int = 10,
+    used_source_ids: set[str] | None = None,
 ) -> str | None:
     concepts = extract_graph_concepts_from_query(query_text)
     if len(concepts) < 2:
@@ -346,6 +348,7 @@ def answer_graph_relations_strict(
     concepts = [concept for concept in concepts if len(str(concept).strip()) >= 3]
     if len(concepts) < 2:
         return None
+
 
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, ...]] = set()
@@ -384,10 +387,29 @@ def answer_graph_relations_strict(
             str(row.get("page", "")),
             status,
         )
+        
         if key in seen:
             return
+
         seen.add(key)
         rows.append(row)
+
+        source_id = str(
+            row.get("source_id") or ""
+        ).strip()
+
+        if (
+            source_id
+            and used_source_ids is not None
+        ):
+            used_source_ids.add(source_id)
+
+        source_id = str(
+            row.get("source_id") or ""
+        ).strip()
+
+        if source_id and used_source_ids is not None:
+            used_source_ids.add(source_id)
 
     for source in sources:
         if source.type == "graph_relations" or "Relazioni Neo4j trovate" in str(source.content or ""):
@@ -428,6 +450,7 @@ def answer_graph_relations_strict(
                         "page": source.page or "",
                         "evidence": snippet,
                         "status": status,
+                        "source_id": str(source.id),
                     })
                     if len(rows) >= max_rows:
                         break

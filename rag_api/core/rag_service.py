@@ -29,6 +29,7 @@ import inspect
 import logging
 import re
 import time
+from hashlib import sha256
 from dataclasses import dataclass, field, replace
 from pathlib import PurePath
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence, runtime_checkable
@@ -52,11 +53,9 @@ from .generation import (
     generator,
 )
 
-from .generation import (
-    GenerationError,
-    GenerationResult,
-    OllamaNativeGenerator,
-    generator,
+from .formula_strict import (
+    answer_formula_strict,
+    formula_sources_used_in_answer,
 )
 from .graph_relations import answer_graph_relations_strict
 
@@ -75,7 +74,6 @@ from .prompting import (
     PromptBuilder,
     PromptBundle,
     document_matches,
-    prompt_builder,
 )
 from .reranking import RankingContext, RerankingEngine, RerankingResult
 from .resources import ResourceManager, ResourceNotReadyError, resources
@@ -191,7 +189,16 @@ class RoutingDecision:
     answer_mode: RagAnswerMode
     execution_mode: RagExecutionMode
 
+    # Limiti di retrieval e reranking risolti deterministicamente
+    # sulla base della complessità della query.
+    qdrant_candidates: int
+    rerank_candidates: int
+    final_sources: int
+    max_per_document: int
+    max_per_page: int
+
     wants_evidence: bool = False
+        
     calculation_mode: bool = False
     analytics_mode: bool = False
     
@@ -211,6 +218,7 @@ class RoutingDecision:
     exhaustive_formula_lookup: bool = False
 
     requested_document: str | None = None
+    requested_pages: tuple[int, ...] = field(default_factory=tuple)
     retrieval_query: str = ""
 
     solver_result: SolverResult | None = None
@@ -265,6 +273,7 @@ class RetrievalPort(Protocol):
         graph_relation_mode: bool,
         formula_mode: bool,
         exhaustive_formula_lookup: bool,
+        qdrant_limit: int | None = None,
         tenant_context: TenantContext,
     ) -> (
         tuple[Sequence[RetrievalCandidate], RetrievalDebug]
@@ -363,10 +372,16 @@ class RagQueryRouter:
         "mapping", "righe", "rows", "colonne", "columns",
     )
     _GRAPH_TERMS = (
-        "neo4j", "cypher", "grafo", "graph", "relazioni", "relationships",
-        "nodi", "nodes", "archi", "edges", "percorso", "path",
-        "traversamento", "traversal", "multi-hop", "rete semantica",
-        "knowledge graph",
+        # Vocabolario chart/diagrammi del PoC Reflex.
+        "grafico", "graph", "flow", "flowchart", "diagramma", "diagram",
+        "architettura", "topologia", "chart", "figura", "rete",
+        "network map", "schema", "collegamenti", "nodo", "nodi",
+        "node", "nodes", "arco", "archi", "edge", "edges",
+        "percorso", "path", "traversamento", "traversal", "multi-hop",
+
+        # Trigger espliciti del Knowledge Graph.
+        "neo4j", "cypher", "grafo", "relazioni", "relationships",
+        "rete semantica", "knowledge graph",
     )
     _AUDIT_TERMS = (
         "audit", "compliance", "conformità", "conformita", "assessment",
@@ -393,11 +408,201 @@ class RagQueryRouter:
         "why", "relationship", "impact", "justify",
     )
 
+
+    def __init__(
+        self,
+        *,
+        config: RagSettings = settings,
+    ) -> None:
+        self._config = config
+
+    def _dynamic_retrieval_limits(
+        self,
+        query: str,
+        *,
+        graph_query: bool,
+        glossary_query: bool,
+    ) -> tuple[int, int, int, int, int]:
+        """
+        Determina i limiti di retrieval e reranking.
+
+        Ordine dei valori restituiti:
+        1. candidati Qdrant;
+        2. candidati inviati al reranker;
+        3. fonti finali;
+        4. massimo per documento;
+        5. massimo per pagina.
+
+        La logica è generale e replica il comportamento del PoC Reflex.
+        """
+
+        q = str(query or "").casefold()
+        long_query = len(q) > 300
+
+        multi_document_terms = (
+            # Corpus, normative e strutture
+            "documenti",
+            "fonti",
+            "normative",
+            "normativa",
+            "standard",
+            "framework",
+            "regolamenti",
+            "regolamento",
+            "documentazione",
+            "policy",
+            "direttive",
+            "direttiva",
+            "linee guida",
+            "allegati",
+            "architettura",
+            "manuale",
+            "guida",
+            "procedure",
+            "procedura",
+            "requisiti",
+            "requisito",
+            "specifiche",
+            "corpus",
+            "assessment",
+            "audit",
+            "ispezione",
+            "certificazione",
+
+            "documents",
+            "sources",
+            "regulations",
+            "regulation",
+            "documentation",
+            "policies",
+            "directives",
+            "directive",
+            "guidelines",
+            "attachments",
+            "architecture",
+            "manual",
+            "guide",
+            "procedures",
+            "procedure",
+            "requirements",
+            "requirement",
+            "specifications",
+            "reference materials",
+
+            # Confronto, mappatura e sintesi
+            "confronta",
+            "confronto",
+            "differenza",
+            "differenze",
+            "integra",
+            "integrazione",
+            "mappa",
+            "mappatura",
+            "matrice",
+            "correlazione",
+            "incrocia",
+            "valutazione",
+            "valuta",
+            "allineamento",
+            "sintesi",
+            "riassunto",
+            "sovrapposizione",
+            "congiunta",
+
+            "compare",
+            "comparison",
+            "difference",
+            "differences",
+            "integrate",
+            "integration",
+            "map",
+            "mapping",
+            "matrix",
+            "crosswalk",
+            "correlate",
+            "correlation",
+            "cross-reference",
+            "evaluate",
+            "evaluation",
+            "alignment",
+            "summary",
+            "overview",
+            "overlap",
+            "joint",
+
+            # Estensione e completezza
+            "passo-passo",
+            "fasi",
+            "fase",
+            "completo",
+            "completa",
+            "intero",
+            "intera",
+            "dettagliato",
+            "dettagliata",
+            "olistico",
+            "tutto il processo",
+            "dall'inizio alla fine",
+
+            "step-by-step",
+            "phases",
+            "phase",
+            "complete",
+            "entire",
+            "detailed",
+            "comprehensive",
+            "holistic",
+            "in-depth",
+            "end-to-end",
+            "start to finish",
+            "whole process",
+            "full walkthrough",
+        )
+
+        multi_document_matches = sum(
+            1
+            for term in multi_document_terms
+            if re.search(
+                rf"\b{re.escape(term)}\b",
+                q,
+            )
+        )
+
+        multi_document_query = multi_document_matches >= 2
+
+        if (
+            long_query
+            or multi_document_query
+            or graph_query
+            or glossary_query
+        ):
+            return (
+                140,  # Qdrant
+                45,   # reranker
+                15,   # fonti finali
+                8,    # massimo per documento
+                4,    # massimo per pagina
+            )
+
+        return (
+            int(self._config.qdrant_candidates),
+            int(self._config.rerank_candidates),
+            int(self._config.final_sources),
+            int(self._config.max_per_document),
+            int(self._config.max_per_page),
+        )
+
     def route(self, command: RagQueryCommand) -> RoutingDecision:
         query = command.query
         q = query.casefold()
 
-        requested_document = command.target_document or _extract_requested_document(query)
+        requested_document = _resolve_requested_document(command)
+
+        requested_pages = (
+            command.target_pages
+            or _extract_requested_pages(query)
+        )
+
         evidence_relevance = _is_evidence_relevance_query(query)
 
         intent = RagIntent.AUDIT if evidence_relevance else self._detect_intent(query)
@@ -425,9 +630,30 @@ class RagQueryRouter:
 
         strict_checklist_mode = _is_strict_checklist_query(query)
         crosswalk_mode = _is_crosswalk_query(query)
+        
         glossary_candidate = self._is_pure_glossary(query)
-        wants_evidence = evidence_relevance or any(term in q for term in self._EVIDENCE_TERMS)
+
+        wants_evidence = (
+            evidence_relevance
+            or any(
+                term in q
+                for term in self._EVIDENCE_TERMS
+            )
+        )
+
         exhaustive_formula_lookup = _is_exhaustive_formula_lookup(query)
+
+        (
+            qdrant_candidates,
+            rerank_candidates,
+            final_sources,
+            max_per_document,
+            max_per_page,
+        ) = self._dynamic_retrieval_limits(
+            query,
+            graph_query=graph_search_mode,
+            glossary_query=glossary_candidate,
+        )
 
         if solver_result and not math_needs_context:
             execution_mode = RagExecutionMode.MATH_DIRECT
@@ -452,7 +678,13 @@ class RagQueryRouter:
             intent=intent,
             answer_mode=answer_mode,
             execution_mode=execution_mode,
+            qdrant_candidates=qdrant_candidates,
+            rerank_candidates=rerank_candidates,
+            final_sources=final_sources,
+            max_per_document=max_per_document,
+            max_per_page=max_per_page,
             wants_evidence=wants_evidence,
+            
             calculation_mode=is_calculation_request(query),
             analytics_mode=analytics_mode,
             strict_checklist_mode=strict_checklist_mode,
@@ -464,8 +696,11 @@ class RagQueryRouter:
 
             glossary_candidate=glossary_candidate,
             exhaustive_formula_lookup=exhaustive_formula_lookup,
+            
             requested_document=requested_document,
+            requested_pages=tuple(requested_pages),
             retrieval_query=retrieval_query,
+            
             solver_result=solver_result,
             math_needs_document_context=math_needs_context,
         )
@@ -475,7 +710,6 @@ class RagQueryRouter:
     def _is_regulatory_classification_query(query_text: str) -> bool:
         """
         Riconosce domande normative e classificatorie che devono essere
-        tratt devono essere
         trattate come audit, non come formula, glossario o testo generico.
 
         La regola è framework-agnostic e non dipende da documenti o test.
@@ -689,7 +923,7 @@ class RagService:
         resource_manager: ResourceManager = resources,
         retriever: RetrievalPort | Any | None = None,
         router: RagQueryRouter | None = None,
-        prompt_factory: PromptBuilder = prompt_builder,
+        prompt_factory: PromptBuilder | None = None,
         llm_generator: OllamaNativeGenerator = generator,
         validator: AnswerValidator = answer_validator,
         evaluator: FaithfulnessEvaluator = faithfulness_evaluator,
@@ -698,9 +932,11 @@ class RagService:
     ) -> None:
         self._config = config
         self._resources = resource_manager
+        
         self._retriever = retriever or LazyRetrievalAdapter()
-        self._router = router or RagQueryRouter()
-        self._prompt_builder = prompt_factory
+        self._router = router or RagQueryRouter(config=config)
+        self._prompt_builder = prompt_factory or PromptBuilder(config=config)
+        
         self._generator = llm_generator
         self._validator = validator
         self._evaluator = evaluator
@@ -756,8 +992,12 @@ class RagService:
             answer_mode=route.answer_mode,
             wants_evidence=route.wants_evidence,
             default_tiers=tuple(self._config.rag_default_tiers),
+
+            # Numero massimo di candidati richiesto al backend vettoriale.
+            qdrant_candidates=route.qdrant_candidates,
+
             target_document=route.requested_document,
-            target_pages=command.target_pages,
+            target_pages=route.requested_pages,
         )
 
         execution_mode = route.execution_mode
@@ -766,6 +1006,9 @@ class RagService:
         audit_sources: tuple[SourceItem, ...] = ()
         prompt_bundle: PromptBundle | None = None
         generation: GenerationResult | None = None
+        generation_attempted = False
+        generation_failed = False
+        generation_error_type = ""
         evaluation: RagEvalResult | None = None
         direct_audit_markdown = ""
 
@@ -792,6 +1035,10 @@ class RagService:
                     )
                     warnings.extend(rerank_warnings)
 
+                # Coalescing before prompt construction is essential: the prompt
+                # must receive the richest merged representation of a chunk, not
+                # the first backend copy that happens to appear in ranking order.
+                sources = _dedupe_sources(sources)
                 audit_sources = sources
                 
                 if not sources:
@@ -821,13 +1068,20 @@ class RagService:
                         "Math-First Mode: risultato deterministico preservato; "
                         "generazione LLM non eseguita."
                     )
-
+                    
                 elif route.graph_relation_mode:
-                    execution_mode = RagExecutionMode.GRAPH_RELATION_STRICT
+                    execution_mode = (
+                        RagExecutionMode.GRAPH_RELATION_STRICT
+                    )
+
+                    # Set nuovo per ogni singola richiesta.
+                    # Non deve essere globale, statico o condiviso.
+                    used_graph_source_ids: set[str] = set()
 
                     graph_answer = answer_graph_relations_strict(
                         command.query,
                         sources,
+                        used_source_ids=used_graph_source_ids,
                     )
 
                     if graph_answer:
@@ -847,6 +1101,17 @@ class RagService:
                             "- Nessuna relazione deterministica costruibile."
                         )
 
+                    # Deve stare DOPO answer_graph_relations_strict(),
+                    # ma PRIMA della costruzione della ValidationPolicy.
+                    #
+                    # audit_sources è già stato valorizzato prima del ramo e
+                    # conserva quindi l'intero retrieval.
+                    sources = tuple(
+                        source
+                        for source in sources
+                        if str(source.id) in used_graph_source_ids
+                    )
+
                     direct_audit_markdown = (
                         "### Graph Relation Strict Mode\n"
                         "- Risposta costruita deterministicamente dalle fonti recuperate.\n"
@@ -857,6 +1122,55 @@ class RagService:
 
                     warnings.append(
                         "Graph Relation Strict Mode: risposta deterministica; "
+                        "generazione LLM non eseguita."
+                    )
+                    
+                elif route.formula_strict_mode:
+                    execution_mode = RagExecutionMode.FORMULA_STRICT
+
+                    formula_answer = answer_formula_strict(
+                        command.query,
+                        sources,
+                    )
+
+                    if formula_answer:
+                        answer = formula_answer
+                    else:
+                        answer = (
+                            "**A) Risposta**\n\n"
+                            "Non ho trovato formule computazionali, metriche definitorie "
+                            "o soglie normative esplicite nelle fonti recuperate.\n\n"
+                            "**B) Evidenze**\n\n"
+                            "- Le fonti recuperate sono state analizzate in modalità "
+                            "deterministica.\n\n"
+                            "**C) Limiti / Conflitti**\n\n"
+                            "- Non vengono inventate formule mancanti.\n"
+                            "- Percentuali isolate o definizioni testuali non vengono "
+                            "trasformate automaticamente in formule computazionali.\n\n"
+                            "**D) Fonti**\n\n"
+                            "- Nessuna formula esplicita recuperata."
+                        )
+
+                    # L'audit conserva l'intero set recuperato.
+                    # La risposta pubblica espone soltanto i chunk
+                    # che hanno prodotto le righe Formula Strict
+                    # effettivamente renderizzate.
+                    sources = formula_sources_used_in_answer(
+                        command.query,
+                        sources,
+                    )
+
+                    direct_audit_markdown = (
+                        "### Formula Strict Mode\n"
+                        "- Risposta costruita deterministicamente dalle fonti recuperate.\n"
+                        "- Formule computazionali, metriche definitorie e soglie normative "
+                        "sono classificate separatamente.\n"
+                        "- Le formule mancanti non vengono ricostruite o inventate.\n"
+                        "- Il modello generativo è stato bypassato."
+                    )
+
+                    warnings.append(
+                        "Formula Strict Mode: risposta deterministica; "
                         "generazione LLM non eseguita."
                     )
 
@@ -886,24 +1200,67 @@ class RagService:
                     )
                     warnings.extend(prompt_bundle.warnings)
 
+                    # Public/evaluation sources must match the documentary blocks
+                    # actually sent to the LLM. The complete reranked set remains
+                    # available in audit_sources for retrieval explainability.
+                    sources = _sources_in_prompt_context(
+                        sources,
+                        prompt_bundle.context.included_source_keys,
+                    )
+                    debug.prompt_context_sources = len(sources)
+                    debug.prompt_dropped_sources = prompt_bundle.context.dropped_sources
+                    debug.history_messages = prompt_bundle.history_messages
+                    debug.history_chars = prompt_bundle.history_chars
+                    debug.history_dropped_messages = prompt_bundle.history_dropped_messages
+                    debug.history_truncated_messages = prompt_bundle.history_truncated_messages
+
+                    generation_attempted = True
                     try:
                         generation = await self._generator.generate_async(prompt_bundle)
                     except GenerationError as exc:
-                        await self._audit_failed_generation(
-                            command=command,
-                            route=route,
-                            execution_mode=execution_mode,
-                            debug=debug,
-                            sources=audit_sources,
-                            prompt_bundle=prompt_bundle,
-                            context=context,
-                            started=started,
-                            error=exc,
-                        )
-                        raise RagServiceGenerationError(str(exc)) from exc
+                        generation_failed = True
+                        generation_error_type = type(exc).__name__
 
-                    answer = generation.content
-                    warnings.extend(generation.warnings)
+                        if not self._config.generation_failure_fallback_enabled:
+                            await self._audit_failed_generation(
+                                command=command,
+                                route=route,
+                                execution_mode=execution_mode,
+                                debug=debug,
+                                sources=audit_sources,
+                                prompt_bundle=prompt_bundle,
+                                context=context,
+                                started=started,
+                                error=exc,
+                            )
+                            raise RagServiceGenerationError(str(exc)) from exc
+
+                        answer = _generation_failure_fallback(
+                            source_count=len(sources),
+                            error_type=generation_error_type,
+                        )
+                        direct_audit_markdown = (
+                            "### Generation Degraded Mode\n"
+                            "- Il retrieval e il document scope sono stati completati.\n"
+                            "- La generazione LLM non ha prodotto una risposta valida dopo "
+                            "la policy di retry configurata.\n"
+                            "- È stato restituito un fallback deterministico senza claim "
+                            "documentali aggiuntivi.\n"
+                            f"- Tipo errore interno: `{generation_error_type}`."
+                        )
+                        warnings.append(
+                            "Generazione LLM degradata: restituito fallback "
+                            f"deterministico ({generation_error_type})."
+                        )
+                    else:
+                        answer = generation.content
+                        warnings.extend(generation.warnings)
+
+        # Final source coalescing is applied to every execution branch, including
+        # direct glossary and strict deterministic modes. Audit retains the full
+        # evidence semantics but not redundant backend copies of the same chunk.
+        sources = _dedupe_sources(sources)
+        audit_sources = _dedupe_sources(audit_sources)
 
         validation_policy = ValidationPolicy(
             intent=route.intent,
@@ -937,16 +1294,66 @@ class RagService:
 
         final_answer = validation.answer
         public_sources = tuple(validation.visible_sources)
+        model_name = (
+            generation.model
+            if generation is not None
+            else self._config.llm_model_name
+            if generation_attempted
+            else "not-used"
+        )
+
+        deterministic_execution = bool(
+            _is_deterministic_execution(route, execution_mode)
+            or generation is None
+        )
 
         strict_eval_blocked = False
         if command.include_evaluation:
-            evaluation = await self._evaluator.evaluate_async(
-                query=command.query,
-                answer=final_answer,
-                sources=public_sources,
-                requested_document=route.requested_document or "",
-                tenant_context=context,
-            )
+            evaluation_sources = public_sources
+
+            # Reflex termina i rami deterministici prima del judge. Replichiamo
+            # la stessa semantica: se non è stata eseguita alcuna generazione
+            # LLM, il quality gate e lo scope già validato producono un esito
+            # locale verificabile, senza una seconda chiamata potenzialmente
+            # incoerente o bloccante al modello judge.
+            if generation_failed:
+                if not self._config.evaluation_enabled:
+                    evaluation = RagEvalResult.disabled()
+                else:
+                    evaluation = RagEvalResult.generation_failure_fallback(
+                        source_count=len(evaluation_sources),
+                        error_type=generation_error_type,
+                    )
+                    warnings.append(
+                        "Evaluation locale WARN: judge LLM bypassato perché la "
+                        "generazione primaria è fallita."
+                    )
+            elif generation is None:
+                # Un ramo deterministico richiesto con include_evaluation=True
+                # produce sempre un esito locale PASS. EVAL_ENABLED governa il
+                # judge LLM, non il quality gate deterministico che non invoca
+                # alcun modello. Restituire DISABLED in questo caso rendeva il
+                # contratto HTTP incoerente con l'esecuzione math/graph/formula.
+                evaluation = RagEvalResult.deterministic_pass(
+                    execution_mode=execution_mode,
+                    source_count=len(evaluation_sources),
+                )
+                warnings.append(
+                    "Evaluation deterministica: judge LLM bypassato perché "
+                    "la risposta non usa generazione LLM."
+                )
+            else:
+                # Il generative branch continua a delegare al componente
+                # evaluator. L'implementazione standard applica internamente
+                # EVAL_ENABLED; i test/adapters possono comunque osservare le
+                # fonti realmente inviate al prompt.
+                evaluation = await self._evaluator.evaluate_async(
+                    query=command.query,
+                    answer=final_answer,
+                    sources=evaluation_sources,
+                    requested_document=route.requested_document or "",
+                    tenant_context=context,
+                )
 
             if evaluation_requires_block(evaluation, config=self._config):
                 strict_eval_blocked = True
@@ -960,13 +1367,19 @@ class RagService:
                 eval_audit = await append_rag_eval_log_async(
                     query=command.query,
                     answer=final_answer,
-                    sources=audit_sources,
+                    sources=evaluation_sources,
                     evaluation=evaluation,
                     requested_document=route.requested_document or "",
                     strict_block_applied=strict_eval_blocked,
                     warnings=tuple(warnings),
                     context=context,
                     config=self._config,
+                    llm_model=(model_name if generation_attempted else "not-used"),
+                    evaluation_model=(
+                        self._config.evaluation_model_name
+                        if generation is not None
+                        else "not-used"
+                    ),
                 )
                 if not eval_audit.success and not eval_audit.skipped:
                     warnings.append("Persistenza audit evaluation non completata.")
@@ -978,10 +1391,13 @@ class RagService:
                 )
                 warnings.append(f"Audit evaluation degradato: {type(exc).__name__}.")
 
+        # ``final_sources`` is the public/evaluation evidence set, while
+        # ``reranked_sources`` preserves the size of the complete ranked set.
+        debug.final_sources = len(public_sources)
+
         elapsed_ms = int(round((time.perf_counter() - started) * 1000.0))
         prompt_hash = prompt_bundle.prompt_sha256 if prompt_bundle else ""
         context_chars = prompt_bundle.context.context_chars if prompt_bundle else 0
-        model_name = generation.model if generation else ""
 
         audit = create_query_audit(
             query=command.query,
@@ -990,11 +1406,22 @@ class RagService:
             answer_mode=route.answer_mode,
             execution_mode=execution_mode,
             retrieval=debug,
-            filters=self._audit_filters(command, route, validation.blocked),
+            filters={
+                **self._audit_filters(command, route, validation.blocked),
+                "generation_attempted": generation_attempted,
+                "generation_failed": generation_failed,
+                "generation_fallback_applied": generation_failed,
+                "generation_error_type": generation_error_type,
+            },
             prompt_sha256=prompt_hash,
             context_chars=context_chars,
-            deterministic=route.deterministic,
-            llm_model=model_name or self._config.llm_model_name,
+            
+            deterministic=deterministic_execution,
+
+            # Non attribuire un modello a rami che non hanno eseguito alcuna
+            # generazione: l'audit deve distinguere chiaramente "configurato"
+            # da "effettivamente usato".
+            llm_model=(model_name if generation_attempted else "not-used"),
             elapsed_ms=elapsed_ms,
             warnings=tuple(warnings),
             context=context,
@@ -1028,7 +1455,7 @@ class RagService:
             intent=route.intent,
             answer_mode=route.answer_mode,
             execution_mode=execution_mode,
-            deterministic=route.deterministic or execution_mode == RagExecutionMode.GLOSSARY_DIRECT,
+            deterministic=deterministic_execution,
             sources=public_sources,
             retrieval=debug,
             evaluation=evaluation,
@@ -1089,13 +1516,18 @@ class RagService:
                 intent=route.intent,
                 answer_mode=route.answer_mode,
                 target_document=route.requested_document,
-                target_pages=command.target_pages,
+                target_pages=route.requested_pages,
                 wants_evidence=route.wants_evidence,
                 graph_relation_mode=route.graph_search_mode,
                 formula_mode=route.formula_strict_mode,
                 exhaustive_formula_lookup=route.exhaustive_formula_lookup,
+
+                # Limite determinato dal router sulla complessità della query.
+                qdrant_limit=route.qdrant_candidates,
+
                 tenant_context=context,
             )
+            
             if inspect.isawaitable(result):
                 result = await result
             candidates, retrieved_debug = _validate_retrieval_result(result)
@@ -1113,8 +1545,14 @@ class RagService:
         debug.intent = route.intent
         debug.answer_mode = route.answer_mode
         debug.wants_evidence = route.wants_evidence
+
+        # Il limite deciso dal router è autoritativo rispetto a eventuali
+        # valori statici o mancanti restituiti dall'adapter di retrieval.
+        debug.qdrant_candidates = route.qdrant_candidates
+
         debug.target_document = route.requested_document
-        debug.target_pages = command.target_pages
+        debug.target_pages = route.requested_pages
+        
         debug.kept_after_quality_filters = max(
             debug.kept_after_quality_filters,
             len(candidates),
@@ -1142,29 +1580,36 @@ class RagService:
                 if document_matches(candidate.filename, route.requested_document)
             ]
 
-        if command.target_pages:
-            page_set = set(command.target_pages)
+        if route.requested_pages:
+            page_set = set(route.requested_pages)
             visible_candidates = [
-                candidate for candidate in visible_candidates if candidate.page in page_set
+                candidate
+                for candidate in visible_candidates
+                if candidate.page in page_set
             ]
 
         if not visible_candidates:
             debug.final_sources = 0
+            debug.reranked_sources = 0
             return (), debug, ()
 
         reranking_engine = self._get_reranking_engine()
+        
         ranking_context = RankingContext(
             query_text=command.query,
             intent=route.intent,
             wants_evidence=route.wants_evidence,
             formula_query=route.formula_strict_mode,
-            requested_pages=command.target_pages,
+            requested_pages=route.requested_pages,
             target_document=route.requested_document or "",
         )
 
         final_limit = min(
-            int(command.max_sources or self._config.final_sources),
-            int(self._config.final_sources),
+            int(
+                command.max_sources
+                or route.final_sources
+            ),
+            int(route.final_sources),
         )
 
         try:
@@ -1173,8 +1618,18 @@ class RagService:
                 visible_candidates,
                 context=ranking_context,
                 exhaustive=route.exhaustive_formula_lookup,
+
+                # Numero massimo di candidati sottoposti al reranker.
+                rerank_limit=route.rerank_candidates,
+
+                # Numero massimo di fonti finali, eventualmente ristretto dal client.
                 final_k=final_limit,
+
+                # Limiti di diversificazione dinamici.
+                max_per_page=route.max_per_page,
+                max_per_document=route.max_per_document,
             )
+            
         except Exception as exc:
             raise RagServiceRetrievalError(
                 f"Errore reranking: {type(exc).__name__}: {exc}"
@@ -1188,6 +1643,7 @@ class RagService:
 
         debug.rerank_candidates = reranked.preselected_count
         debug.final_sources = len(sources)
+        debug.reranked_sources = len(sources)
         debug.reranker_used = reranked.reranker_used
         debug.timings_ms["rerank"] = int(round(reranked.elapsed_ms))
         debug.tier_counts = _tier_counts(sources)
@@ -1242,7 +1698,10 @@ class RagService:
             },
             prompt_sha256=prompt_bundle.prompt_sha256,
             context_chars=prompt_bundle.context.context_chars,
-            deterministic=route.deterministic,
+            deterministic=_is_deterministic_execution(
+                route,
+                execution_mode,
+            ),
             llm_model=self._config.llm_model_name,
             elapsed_ms=elapsed_ms,
             warnings=(f"Generation failed: {type(error).__name__}",),
@@ -1291,10 +1750,19 @@ class RagService:
         route: RoutingDecision,
         blocked: bool,
     ) -> dict[str, Any]:
+
         return {
             "target_document": route.requested_document or "",
-            "target_pages": list(command.target_pages),
+            "target_pages": list(route.requested_pages),
             "max_sources": command.max_sources,
+
+            # Limiti effettivamente determinati dal router.
+            "qdrant_candidates_limit": route.qdrant_candidates,
+            "rerank_candidates_limit": route.rerank_candidates,
+            "final_sources_limit": route.final_sources,
+            "max_per_document": route.max_per_document,
+            "max_per_page": route.max_per_page,
+
             "include_evaluation": command.include_evaluation,
             "wants_evidence": route.wants_evidence,
             "calculation_mode": route.calculation_mode,
@@ -1307,7 +1775,6 @@ class RagService:
             "exhaustive_formula_lookup": route.exhaustive_formula_lookup,
             "quality_gate_blocked": blocked,
         }
-
 
 # =============================================================================
 # UTILITY DEL SERVICE
@@ -1324,25 +1791,253 @@ def _safe_document_name(value: str | None) -> str:
 
 
 def _extract_requested_document(query: str) -> str | None:
-    """Fallback compatibile col PoC quando il client non usa target_document."""
+    """Estrae un filename esplicito senza inglobare il testo della domanda.
+
+    Ordine:
+    1. filename tra virgolette;
+    2. filename non quotato dopo ``documento``, ``file`` o ``pdf``;
+    3. filename bare senza spazi.
+
+    I nomi con spazi restano supportati quando sono quotati o introdotti da
+    una keyword documentale. Il fallback bare è volutamente restrittivo per
+    evitare risultati come ``Valuta se il documento evidenza.pdf``.
+    """
+
+    normalized = (
+        str(query or "")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("‘", "'")
+        .replace("’", "'")
+    )
+
+    extension = r"(?:pdf|md|txt|docx|html|csv|xlsx)"
+    filename_words = r"[A-Za-z0-9À-ÿ_().\-]+(?:\s+[A-Za-z0-9À-ÿ_().\-]+)*"
+
+    patterns = (
+        rf"[\"'«]([^\"'»]+\.{extension})[\"'»]",
+        rf"\b(?:documento|file|pdf)\s+({filename_words}\.{extension})\b",
+        rf"\b([A-Za-z0-9À-ÿ_()\-]+\.{extension})\b",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            return _safe_document_name(match.group(1).strip(" .,:;!?\"'")) or None
+        except ValueError:
+            return None
+
+    return None
+
+
+
+def _is_follow_up_query(query: str) -> bool:
+    """
+    Riconosce richieste che dipendono semanticamente dal turno precedente.
+
+    Vengono considerati soltanto segnali espliciti di continuazione o
+    riferimenti anaforici. Una nuova domanda autonoma non eredita lo scope.
+    """
+
+    q = str(query or "").casefold().strip()
+
+    if not q:
+        return False
+
+    follow_up_terms = (
+        # Italiano
+        "approfondisci",
+        "esplora",
+        "approfondire",
+        "continua",
+        "continuiamo",
+        "prosegui",
+        "proseguiamo",
+        "spiega meglio",
+        "più in dettaglio",
+        "maggiori dettagli",
+        "questo punto",
+        "questa parte",
+        "questo aspetto",
+        "questa evidenza",
+        "questo documento",
+        "su questo",
+        "su questa",
+        "in merito a questo",
+        "rispetto a quanto sopra",
+        "nella risposta precedente",
+        "nel messaggio precedente",
+        "nel precedente",
+
+        # Inglese
+        "go deeper",
+        "explore",
+        "continue",
+        "please continue",
+        "elaborate",
+        "expand on",
+        "explain further",
+        "more detail",
+        "more details",
+        "this point",
+        "this part",
+        "this aspect",
+        "this evidence",
+        "this document",
+        "on this",
+        "about this",
+        "regarding this",
+        "in the previous answer",
+        "in the previous message",
+        "in the previous",
+    )
+
+    return any(
+        term in q
+        for term in follow_up_terms
+    )
+
+
+def _history_message_field(
+    message: Any,
+    field_name: str,
+    default: Any = "",
+) -> Any:
+    """Legge un campo da messaggi history dict, Pydantic o dataclass."""
+
+    if isinstance(message, Mapping):
+        return message.get(field_name, default)
+
+    return getattr(message, field_name, default)
+
+
+def _last_explicit_document_from_history(
+    history: Sequence[Any],
+    max_messages: int = 20,
+) -> str | None:
+    """
+    Recupera l'ultimo documento esplicitamente nominato dall'utente.
+
+    I messaggi assistant non vengono analizzati perché possono contenere
+    più fonti nella sezione D e contaminare lo scope conversazionale.
+    """
+
+    messages = tuple(history or ())
+
+    for message in reversed(messages[-max(1, int(max_messages)) :]):
+        role = str(
+            _history_message_field(message, "role", "")
+            or ""
+        ).strip().casefold()
+
+        if role != "user":
+            continue
+
+        content = str(
+            _history_message_field(message, "content", "")
+            or ""
+        ).strip()
+
+        if not content:
+            continue
+
+        document = _extract_requested_document(content)
+
+        if document:
+            return document
+
+    return None
+
+
+def _resolve_requested_document(
+    command: RagQueryCommand,
+) -> str | None:
+    """
+    Risolve lo scope documentale con precedenza deterministica.
+
+    Priorità:
+    1. target_document esplicito dell'API;
+    2. documento nominato nella query corrente;
+    3. documento dell'ultimo turno utente, solo per follow-up reali;
+    4. nessuno scope.
+    """
+
+    if command.target_document:
+        return command.target_document
+
+    current_document = _extract_requested_document(command.query)
+
+    if current_document:
+        return current_document
+
+    if not _is_follow_up_query(command.query):
+        return None
+
+    return _last_explicit_document_from_history(command.history)
+
+
+
+def _extract_requested_pages(query: str) -> tuple[int, ...]:
+    """
+    Estrae uno scope di pagina espresso nella query.
+
+    Formati supportati:
+    - pagina 8
+    - pag. 8-9
+    - page 10-12
+    - p. 15
+    - pagina 8/9
+
+    Gli intervalli superiori a 20 pagine vengono ridotti ai soli estremi
+    per evitare espansioni eccessive.
+    """
+
+    q = str(query or "").casefold().strip()
+
+    if not q:
+        return ()
+
+    pattern = (
+        r"\b(?:pag(?:ina)?|page|p)\.?\s*[:=]?\s*"
+        r"(\d{1,4})"
+        r"(?:\s*[-/]\s*(\d{1,4}))?\b"
+    )
 
     match = re.search(
-        r"(?:[\"“'«])([^\"”'»]+\.(?:pdf|md|txt|docx|html|csv|xlsx))(?:[\"”'»])",
-        query or "",
+        pattern,
+        q,
         flags=re.IGNORECASE,
     )
+
     if not match:
-        match = re.search(
-            r"\b([A-Za-z0-9À-ÿ][A-Za-z0-9À-ÿ._()\- ]{0,250}\.(?:pdf|md|txt|docx|html|csv|xlsx))\b",
-            query or "",
-            flags=re.IGNORECASE,
-        )
-    if not match:
-        return None
-    try:
-        return _safe_document_name(match.group(1)) or None
-    except ValueError:
-        return None
+        return ()
+
+    first_page = int(match.group(1))
+    last_page = (
+        int(match.group(2))
+        if match.group(2)
+        else None
+    )
+
+    if last_page is None:
+        return (first_page,) if first_page > 0 else ()
+
+    if first_page <= 0 or last_page <= 0:
+        return ()
+
+    low, high = (
+        (first_page, last_page)
+        if first_page <= last_page
+        else (last_page, first_page)
+    )
+
+    # Parità con il Reflex: non espandere intervalli enormi.
+    if high - low > 20:
+        return (low, high)
+
+    return tuple(range(low, high + 1))
 
 
 def _is_evidence_relevance_query(query: str) -> bool:
@@ -1813,13 +2508,6 @@ def _should_use_graph_relation_strict_mode(query: str) -> bool:
         "nodo",
         "path",
         "percorso",
-        "travers4j",
-        "archi",
-        "arco",
-        "nodi",
-        "nodo",
-        "path",
-        "percorso",
         "traversamento",
         "multi-hop",
         "catena semantica",
@@ -2016,17 +2704,49 @@ def _is_formula_strict_query(query: str) -> bool:
 
 
 def _is_strict_checklist_query(query: str) -> bool:
-    q = (query or "").casefold()
-    strong = ("checklist", "crosswalk", "matrice", "matrix", "griglia", "grid")
-    if any(term in q for term in strong):
-        return True
-    weak = (
-        "assessment", "evidenza", "evidence", "controllo", "control",
-        "requisito", "requirement", "audit", "linee guida", "guidelines",
-        "elenco", "lista", "list", "kpi", "indicatore", "indicator",
-        "questionario", "questionnaire",
+    """Attiva la checklist solo con segnali lessicali distinti e completi.
+
+    Le word boundary evitano che ``control`` venga contato dentro
+    ``controllo``. I sinonimi e le varianti singolare/plurale sono raggruppati
+    nello stesso concetto, quindi non possono incrementare artificialmente il
+    punteggio.
+    """
+
+    q = str(query or "").casefold()
+
+    strong_terms = (
+        "checklist", "crosswalk", "matrice", "matrix", "griglia", "grid",
     )
-    return sum(1 for term in weak if term in q) >= 2
+    if any(
+        re.search(rf"\b{re.escape(term)}\b", q)
+        for term in strong_terms
+    ):
+        return True
+
+    weak_concept_groups = (
+        ("assessment",),
+        ("evidenza", "evidenze", "evidence"),
+        ("controllo", "controlli", "control", "controls"),
+        ("requisito", "requisiti", "requirement", "requirements"),
+        ("audit",),
+        ("linee guida", "guidelines"),
+        ("elenco", "lista", "list"),
+        ("kpi",),
+        ("indicatore", "indicatori", "indicator", "indicators"),
+        ("questionario", "questionnaire"),
+        ("domanda", "domande", "question", "questions", "checkpoints"),
+    )
+
+    matched_concepts = sum(
+        1
+        for aliases in weak_concept_groups
+        if any(
+            re.search(rf"\b{re.escape(alias)}\b", q)
+            for alias in aliases
+        )
+    )
+
+    return matched_concepts >= 2
 
 
 def _is_crosswalk_query(query: str) -> bool:
@@ -2297,22 +3017,342 @@ def _build_math_answer_with_document_context(
 
 
 
-def _dedupe_sources(sources: Sequence[SourceItem]) -> tuple[SourceItem, ...]:
-    out: list[SourceItem] = []
-    seen: set[tuple[str, str, int, int, str]] = set()
-    for source in sources:
-        key = (
-            source.id,
-            source.filename.casefold(),
+_SOURCE_UNKNOWN_FILENAMES = frozenset({"", "unknown", "n/d", "neo4j"})
+_SOURCE_GENERIC_IDS = frozenset({"graph", "neo4j_relations", "user_input", "error"})
+_SOURCE_TYPE_PRIORITY = {
+    "text": 0,
+    "image": 1,
+    "chart": 2,
+    "table": 3,
+    "graph": 4,
+    "graph_relations": 5,
+    "formula": 6,
+}
+_CLASSIFICATION_PRIORITY = {
+    "public": 0,
+    "internal": 1,
+    "confidential": 2,
+    "restricted": 3,
+}
+_GRAPH_FORMULA_MARKER = "--- Formule collegate dal Knowledge Graph ---"
+
+
+def _normalized_source_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _normalized_source_filename(value: Any) -> str:
+    filename = PurePath(str(value or "").strip()).name.casefold()
+    filename = re.sub(r"\.(pdf|md|txt|docx|html|csv|xlsx)$", "", filename)
+    return re.sub(r"[^a-z0-9]+", "", filename)
+
+
+def _source_content_hash(content: str, *, max_chars: int = 1_200) -> str:
+    normalized = _normalized_source_text(content)[:max_chars]
+    return sha256(normalized.encode("utf-8")).hexdigest()[:20]
+
+
+def _source_identity_key(source: SourceItem) -> tuple[Any, ...]:
+    """Return a tenant-bound identity for final source coalescing.
+
+    A real chunk id is authoritative even when filename, page or source type
+    differ between Qdrant, PostgreSQL and Neo4j. Generic synthetic ids are not
+    authoritative because they can represent multiple graph rows or fallbacks.
+    """
+
+    boundary = (
+        str(source.scope),
+        int(source.organization_id or 0),
+    )
+    source_id = str(source.id or "").strip()
+    if source_id and source_id.casefold() not in _SOURCE_GENERIC_IDS:
+        return ("id", *boundary, source_id)
+
+    document_key = str(source.doc_id or "").strip() or _normalized_source_filename(
+        source.filename
+    )
+    if document_key and int(source.page_chunk_index) > 0:
+        return (
+            "position",
+            *boundary,
+            document_key.casefold(),
             int(source.page),
             int(source.page_chunk_index),
-            source.type,
+        )
+
+    return (
+        "content",
+        *boundary,
+        document_key.casefold(),
+        int(source.page),
+        str(source.type),
+        _source_content_hash(source.content),
+    )
+
+
+def _merge_graph_context(
+    first: Sequence[Any],
+    second: Sequence[Any],
+) -> list[Any]:
+    output: list[Any] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entity in (*first, *second):
+        key = (
+            str(entity.name).casefold(),
+            str(entity.type).casefold(),
+            str(entity.relation).casefold(),
         )
         if key in seen:
             continue
         seen.add(key)
-        out.append(source)
-    return tuple(out)
+        output.append(entity)
+    return output
+
+
+def _merge_source_origins(*values: str) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for part in str(value or "").split("+"):
+            clean = part.strip()
+            key = clean.casefold()
+            if clean and key not in seen:
+                seen.add(key)
+                parts.append(clean)
+    return " + ".join(parts) or "Unknown"
+
+
+def _source_type_with_more_information(first: str, second: str) -> str:
+    return max(
+        (str(first or "text"), str(second or "text")),
+        key=lambda item: _SOURCE_TYPE_PRIORITY.get(item, 0),
+    )
+
+
+def _merge_source_content(existing: SourceItem, incoming: SourceItem) -> str:
+    """Preserve the richest representation without duplicating equal prose."""
+
+    first = str(existing.content or "").strip()
+    second = str(incoming.content or "").strip()
+    if not first:
+        return second
+    if not second:
+        return first
+
+    first_norm = _normalized_source_text(first)
+    second_norm = _normalized_source_text(second)
+    if first_norm == second_norm:
+        return first if len(first) >= len(second) else second
+    if first_norm in second_norm:
+        return second
+    if second_norm in first_norm:
+        return first
+
+    first_formula = existing.type == "formula"
+    second_formula = incoming.type == "formula"
+    if first_formula != second_formula:
+        formula_content = first if first_formula else second
+        document_content = second if first_formula else first
+        if _normalized_source_text(formula_content) in _normalized_source_text(document_content):
+            return document_content
+        if _GRAPH_FORMULA_MARKER in formula_content:
+            # A Batch-4 merged formula already contains its canonical document
+            # text and is therefore the richer representation.
+            return formula_content
+        return (
+            f"{document_content.rstrip()}\n\n"
+            f"{_GRAPH_FORMULA_MARKER}\n{formula_content.strip()}"
+        ).strip()
+
+    if first_formula and second_formula:
+        return (
+            f"{first.rstrip()}\n\n"
+            f"{_GRAPH_FORMULA_MARKER}\n{second.strip()}"
+        ).strip()
+
+    # Raw and semantic representations of the same chunk are intentionally not
+    # concatenated: retain the more substantial one to avoid duplicated prose in
+    # prompts and public evidence.
+    return first if len(first_norm) >= len(second_norm) else second
+
+
+def _source_provenance_weight(source: SourceItem) -> tuple[int, int, float]:
+    pg_fields = (
+        source.pg_ingestion_ts,
+        source.pg_source_name,
+        source.pg_source_type,
+        source.pg_log_id,
+        source.pg_chunk_id,
+        source.pg_page_chunk_index,
+        source.pg_toon_type,
+    )
+    provenance_count = sum(bool(value) for value in pg_fields)
+    canonical_tier = 0 if str(source.tier) == "GRAPH" else 1
+    return canonical_tier, provenance_count, float(source.score)
+
+
+def _prefer_nonempty(primary: Any, secondary: Any) -> Any:
+    return primary if primary not in (None, "", 0) else secondary
+
+
+def _merge_source_items(existing: SourceItem, incoming: SourceItem) -> SourceItem:
+    """Coalesce two final records for the same tenant-visible chunk."""
+
+    if _source_provenance_weight(incoming) > _source_provenance_weight(existing):
+        canonical, secondary = incoming, existing
+    else:
+        canonical, secondary = existing, incoming
+
+    filename = canonical.filename
+    if filename.casefold() in _SOURCE_UNKNOWN_FILENAMES and (
+        secondary.filename.casefold() not in _SOURCE_UNKNOWN_FILENAMES
+    ):
+        filename = secondary.filename
+
+    classification = max(
+        (str(existing.classification), str(incoming.classification)),
+        key=lambda item: _CLASSIFICATION_PRIORITY.get(item, 0),
+    )
+
+    return canonical.model_copy(
+        deep=True,
+        update={
+            "content": _merge_source_content(existing, incoming),
+            "filename": filename,
+            "page": int(_prefer_nonempty(canonical.page, secondary.page) or 0),
+            "page_chunk_index": int(
+                _prefer_nonempty(
+                    canonical.page_chunk_index,
+                    secondary.page_chunk_index,
+                )
+                or 0
+            ),
+            "doc_id": str(_prefer_nonempty(canonical.doc_id, secondary.doc_id) or ""),
+            "type": _source_type_with_more_information(existing.type, incoming.type),
+            "score": max(float(existing.score), float(incoming.score)),
+            "graph_context": _merge_graph_context(
+                existing.graph_context,
+                incoming.graph_context,
+            ),
+            "section_hint": max(
+                (str(existing.section_hint or ""), str(incoming.section_hint or "")),
+                key=len,
+            ),
+            "image_id": (
+                canonical.image_id
+                if canonical.image_id is not None
+                else secondary.image_id
+            ),
+            "ingestion_run_id": str(
+                _prefer_nonempty(
+                    canonical.ingestion_run_id,
+                    secondary.ingestion_run_id,
+                )
+                or ""
+            ),
+            "corpus_version": str(
+                _prefer_nonempty(canonical.corpus_version, secondary.corpus_version)
+                or ""
+            ),
+            "classification": classification,
+            "embedding_model": str(
+                _prefer_nonempty(canonical.embedding_model, secondary.embedding_model)
+                or ""
+            ),
+            "request_id": str(
+                _prefer_nonempty(canonical.request_id, secondary.request_id) or ""
+            ),
+            "pg_ingestion_ts": str(
+                _prefer_nonempty(
+                    canonical.pg_ingestion_ts,
+                    secondary.pg_ingestion_ts,
+                )
+                or ""
+            ),
+            "pg_source_name": str(
+                _prefer_nonempty(canonical.pg_source_name, secondary.pg_source_name)
+                or ""
+            ),
+            "pg_source_type": str(
+                _prefer_nonempty(canonical.pg_source_type, secondary.pg_source_type)
+                or ""
+            ),
+            "pg_log_id": int(
+                _prefer_nonempty(canonical.pg_log_id, secondary.pg_log_id) or 0
+            ),
+            "pg_chunk_id": int(
+                _prefer_nonempty(canonical.pg_chunk_id, secondary.pg_chunk_id) or 0
+            ),
+            "pg_page_chunk_index": int(
+                _prefer_nonempty(
+                    canonical.pg_page_chunk_index,
+                    secondary.pg_page_chunk_index,
+                )
+                or 0
+            ),
+            "pg_toon_type": str(
+                _prefer_nonempty(canonical.pg_toon_type, secondary.pg_toon_type)
+                or ""
+            ),
+            "db_origin": _merge_source_origins(
+                existing.db_origin,
+                incoming.db_origin,
+            ),
+        },
+    )
+
+
+def _sources_in_prompt_context(
+    sources: Sequence[SourceItem],
+    included_source_keys: Sequence[str],
+) -> tuple[SourceItem, ...]:
+    """Return sources in the exact order selected by the prompt layer.
+
+    ``SourceItem.id`` alone is not sufficient because synthetic graph rows and
+    historical imports may reuse identifiers. The prompt layer therefore
+    exposes the same stable ``dedupe_key`` used to build its context blocks.
+    Missing keys are ignored fail-closed instead of reintroducing sources that
+    were not sent to the model.
+    """
+
+    if not included_source_keys:
+        return ()
+
+    by_key = {source.dedupe_key: source for source in sources}
+    selected: list[SourceItem] = []
+    seen: set[str] = set()
+
+    for raw_key in included_source_keys:
+        key = str(raw_key or "").strip()
+        if not key or key in seen:
+            continue
+        source = by_key.get(key)
+        if source is None:
+            continue
+        seen.add(key)
+        selected.append(source)
+
+    return tuple(selected)
+
+
+def _dedupe_sources(sources: Sequence[SourceItem]) -> tuple[SourceItem, ...]:
+    """Deduplicate final evidence while preserving multi-backend information.
+
+    The first occurrence fixes the ranking position. Equivalent later records
+    enrich that source instead of being silently discarded.
+    """
+
+    order: list[tuple[Any, ...]] = []
+    by_key: dict[tuple[Any, ...], SourceItem] = {}
+    for source in sources:
+        key = _source_identity_key(source)
+        current = by_key.get(key)
+        if current is None:
+            order.append(key)
+            by_key[key] = source.model_copy(deep=True)
+            continue
+        by_key[key] = _merge_source_items(current, source)
+    return tuple(by_key[key] for key in order)
 
 
 def _tier_counts(sources: Sequence[SourceItem]) -> dict[str, int]:
@@ -2323,6 +3363,29 @@ def _tier_counts(sources: Sequence[SourceItem]) -> dict[str, int]:
     return counts
 
 
+def _is_deterministic_execution(
+    route: RoutingDecision,
+    execution_mode: RagExecutionMode,
+) -> bool:
+    """
+    Restituisce il flag deterministico effettivo dell'esecuzione.
+
+    La decisione dipende dalla modalità realmente eseguita, non soltanto
+    dalla presenza di un solver matematico.
+    """
+
+    return bool(
+        route.deterministic
+        or execution_mode
+        in {
+            RagExecutionMode.GLOSSARY_DIRECT,
+            RagExecutionMode.MATH_DIRECT,
+            RagExecutionMode.GRAPH_RELATION_STRICT,
+            RagExecutionMode.FORMULA_STRICT,
+        }
+    )
+
+
 def _unique_strings(values: Sequence[Any]) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
@@ -2330,6 +3393,36 @@ def _unique_strings(values: Sequence[Any]) -> tuple[str, ...]:
             for value in values
             if str(value or "").strip()
         )
+    )
+
+
+def _generation_failure_fallback(*, source_count: int, error_type: str) -> str:
+    """Risposta strutturata e non rivelatrice quando Ollama fallisce.
+
+    Il dettaglio dell'eccezione resta nell'audit tecnico. La risposta pubblica
+    espone soltanto la classe dell'errore e non include URL, payload, prompt o
+    messaggi potenzialmente sensibili provenienti dal transport layer.
+    """
+
+    count = max(0, int(source_count))
+    safe_type = re.sub(r"[^A-Za-z0-9_.-]", "", str(error_type or "GenerationError"))
+    safe_type = safe_type[:120] or "GenerationError"
+
+    return (
+        "**A) Risposta**\n\n"
+        "Il retrieval è stato completato, ma il modello generativo non ha "
+        "prodotto una risposta valida. Per evitare contenuti inventati, il "
+        "backend restituisce questo esito tecnico deterministico.\n\n"
+        "**B) Evidenze**\n\n"
+        f"- Fonti tenant-visible preservate dopo il context scope: `{count}`.\n"
+        "- Nessun claim documentale aggiuntivo è stato generato dal fallback.\n\n"
+        "**C) Limiti / Conflitti**\n\n"
+        f"- Classe dell'errore di generazione: `{safe_type}`.\n"
+        "- La sintesi LLM non è disponibile per questa richiesta.\n"
+        "- È possibile ripetere la richiesta dopo aver verificato Ollama, "
+        "timeout e disponibilità del modello.\n\n"
+        "**D) Fonti**\n\n"
+        "- Le fonti recuperate vengono ricostruite dal quality gate."
     )
 
 

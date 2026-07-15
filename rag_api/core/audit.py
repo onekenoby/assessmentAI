@@ -743,7 +743,14 @@ def format_retrieval_audit_markdown(audit: AuditTrail) -> str:
         f"- Execution mode: `{audit.execution_mode}`",
         f"- Deterministico: **{'sì' if audit.deterministic else 'no'}**",
         f"- Modello: `{audit.llm_model or 'N/D'}`",
-        f"- Fonti finali: **{retrieval.final_sources}**",
+        f"- Fonti dopo reranking/diversificazione: **{retrieval.reranked_sources}**",
+        f"- Fonti pubbliche finali: **{retrieval.final_sources}**",
+        f"- Fonti effettivamente inserite nel prompt: **{retrieval.prompt_context_sources}**",
+        f"- Fonti escluse dal prompt per filtri/budget: **{retrieval.prompt_dropped_sources}**",
+        f"- Messaggi history inseriti nel prompt: **{retrieval.history_messages}**",
+        f"- Caratteri history nel prompt: **{retrieval.history_chars}**",
+        f"- Messaggi history esclusi/collassati: **{retrieval.history_dropped_messages}**",
+        f"- Messaggi history troncati: **{retrieval.history_truncated_messages}**",
     ]
 
     if retrieval.target_document:
@@ -855,6 +862,8 @@ def append_rag_eval_log(
     context: TenantContext | None = None,
     raise_on_failure: bool = False,
     config: RagSettings = settings,
+    llm_model: str | None = None,
+    evaluation_model: str | None = None,
 ) -> AuditWriteResult:
     tenant = context or get_tenant_context()
     record = EvaluationAuditRecord.from_evaluation(
@@ -864,8 +873,12 @@ def append_rag_eval_log(
         metrics=evaluation,
         context=tenant,
         requested_document=requested_document,
-        llm_model=config.llm_model_name,
-        evaluation_model=config.evaluation_model_name,
+        llm_model=(config.llm_model_name if llm_model is None else llm_model),
+        evaluation_model=(
+            config.evaluation_model_name
+            if evaluation_model is None
+            else evaluation_model
+        ),
         corpus_version=config.corpus_version,
         strict_block_applied=strict_block_applied,
         warnings=warnings,
