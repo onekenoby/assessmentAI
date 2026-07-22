@@ -1,20 +1,21 @@
 # FINAL MULTI-TENANT HARDENED VERSION - aligned with Architecture v1.1
 
+
 """
 set EMBED_BATCH_SIZE=16
 set DB_FLUSH_SIZE=96
 set VISION_PARALLEL_WORKERS=1
-s1300
 set MAX_KG_CHUNKS_PER_DOC=10
 
 set PG_COMMIT_EVERY_N_PAGES=25
 """
 
 """
-Ingestion Engine - v2.4 HYPER-FAST (Virtual Markdown + Asset Parking)
+Ingestion Engine - v2.5 DATABASE BYTEA
+✅ Source: protected PostgreSQL rag_ingestion worker APIs
 ✅ Strategy: PDF -> Virtual MD + Image Asset Park (RAM)
-✅ Vision: Surgical AI on parked assets only (Gemma 3 12B)
-✅ Value Hunter: Tier-based selective KG + AI Gatekeeper (num_predict: 2)
+✅ Vision: Surgical AI on parked assets only
+✅ Value Hunter: DB-tier-aware selective KG + AI Gatekeeper
 ✅ Hardware: Optimized for P5000 (16GB VRAM, num_ctx: 3072)
 """
 
@@ -63,6 +64,7 @@ from threading import Lock
 import gc
 import queue
 import threading
+import tempfile
 
 
 #import pytesseract
@@ -76,10 +78,9 @@ if TESSERACT_CMD:
 
 
 import unicodedata
-import shutil 
 import fitz  # PyMuPDF
 import psycopg2
-from psycopg2.extras import Json, execute_values
+from psycopg2.extras import Json, execute_values, RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2 import errors as pg_errors
 
@@ -106,374 +107,34 @@ import torch
 
 
 # =========================
-# TIERS / TAXONOMY (DOC ORGANIZATION) - NEW
+# DOCUMENT CLASSIFICATION SOURCE
 # =========================
-
-# File: core/taxonomy.py
-
-TIER_FOLDERS = {
-    # ==========================================
-    # TIER A: NORMATIVE (Verità Nominale)
-    # ==========================================
-    "norm_frameworks_intl":    {"tier": "A", "content_type": "framework",   "source_kind": "global_standard"},
-    "norm_regulations_local":  {"tier": "A", "content_type": "regulation",  "source_kind": "legal_requirement"},
-    "norm_audit_guidelines":   {"tier": "A", "content_type": "guideline",   "source_kind": "best_practice"},
-
-    # ==========================================
-    # TIER B: GOVERNANCE (Attuazione Dichiarata)
-    # ==========================================
-    "gov_infosec_policies":    {"tier": "B", "content_type": "policy",      "source_kind": "internal_governance"},
-    "gov_it_procedures":       {"tier": "B", "content_type": "procedure",   "source_kind": "internal_governance"},
-    "gov_bcdr_plans":          {"tier": "B", "content_type": "bcdr_plan",   "source_kind": "internal_governance"},
-    "gov_hr_policies":         {"tier": "B", "content_type": "hr_policy",   "source_kind": "internal_governance"},
-    "gov_org_charts_roles":    {"tier": "B", "content_type": "org_chart",   "source_kind": "internal_governance"},
-
-    # ==========================================
-    # TIER C: EVIDENCES (Prova di Conformità)
-    # ==========================================
-    # 1. Technical Evidences
-    "tech_evidence_sys_config":     {"tier": "C", "content_type": "sys_config",     "source_kind": "technical_evidence"},
-    "tech_evidence_audit_logs":     {"tier": "C", "content_type": "audit_log",      "source_kind": "technical_evidence"},
-    "tech_evidence_vuln_patching":  {"tier": "C", "content_type": "vuln_report",    "source_kind": "technical_evidence"},
-    "tech_evidence_backup_restore": {"tier": "C", "content_type": "backup_log",     "source_kind": "technical_evidence"},
-    "tech_evidence_net_access":     {"tier": "C", "content_type": "network_config", "source_kind": "technical_evidence"},
-
-    # 2. Organizational Evidences
-    "org_evidence_mgmt_reviews":    {"tier": "C", "content_type": "mgmt_review",    "source_kind": "organizational_evidence"},
-    "org_evidence_training_aware":  {"tier": "C", "content_type": "training_log",   "source_kind": "organizational_evidence"},
-    "org_evidence_incident_rep":    {"tier": "C", "content_type": "incident_ticket","source_kind": "organizational_evidence"},
-    "org_evidence_risk_mgmt":       {"tier": "C", "content_type": "risk_register",  "source_kind": "organizational_evidence"},
-
-    # 3. Legal & Vendor Evidences
-    "legal_evidence_vendor_contracts":{"tier": "C","content_type":"vendor_contract","source_kind": "legal_evidence"},
-    "legal_evidence_data_privacy":    {"tier": "C","content_type":"privacy_record", "source_kind": "legal_evidence"},
-    "legal_evidence_nda_clauses":     {"tier": "C","content_type":"nda_agreement",  "source_kind": "legal_evidence"},
-
-    # 4. Physical Evidences
-    "phys_evidence_env_controls":   {"tier": "C", "content_type": "env_control",    "source_kind": "physical_evidence"},
-    "phys_evidence_access_logs":    {"tier": "C", "content_type": "access_log",     "source_kind": "physical_evidence"},
-}
-
-
-
-
-DEFAULT_TIER_META = {"tier": "B", "content_type": "reference", "source_kind": "internal"}
-
-# Ontology layer (2° livello cartella): esempi -> normative, governance, evidences, risk, legal, technical, generic...
-DEFAULT_ONTOLOGY = "generic"
-
-# opzionale: topic keyword -> topics (solo best-effort su filename; puoi estendere più avanti)
-
-# File: core/taxonomy.py
-
-TOPIC_PATTERNS = {
-    "Governance_Policies": [
-        "policy", "procedura", "standard", "guideline", "linea guida", 
-        "regolamento", "direttiva", "manuale", "organigramma", "ruoli e responsabilità",
-        "segregation of duties", "sod"
-    ],
-    
-    "Risk_Management": [
-        "rischio", "risk", "minaccia", "threat", "vulnerabilità", "vulnerability", 
-        "mitigazione", "risk assessment", "trattamento del rischio", "risk register", 
-        "matrice dei rischi"
-    ],
-    
-    "Compliance_Audit": [
-        "iso 27001", "iso 27002", "gdpr", "nis2", "dora", "nist", 
-        "audit", "assessment", "conformità", "compliance", "non-conformità", 
-        "certificazione", "ispezione", "evidenza"
-    ],
-    
-    "Business_Continuity_DR": [
-        "business continuity", "disaster recovery", "bcp", "drp", "backup", 
-        "ripristino", "restore", "rto", "rpo", "resilienza", "copia di sicurezza",
-        "continuità operativa"
-    ],
-    
-    "Incident_Management": [
-        "incidente", "incident", "data breach", "violazione", "anomalia", 
-        "segnalazione", "incident response", "triage", "compromissione"
-    ],
-    
-    "Access_Identity_Control": [
-        "accesso", "access control", "autenticazione", "mfa", "password", 
-        "identità", "iam", "credenziali", "privilegi", "active directory", 
-        "logon", "sso"
-    ],
-    
-    "Technical_Network_Security": [
-        "firewall", "crittografia", "encryption", "siem", "log", "monitoraggio", 
-        "patch", "endpoint", "antivirus", "malware", "rete", "vlan", "vpn", 
-        "vulnerability scan", "penetration test", "pt"
-    ],
-    
-    "HR_Awareness_Security": [
-        "formazione", "training", "awareness", "consapevolezza", "assunzione", 
-        "onboarding", "offboarding", "nda", "codice etico", "dipendente", 
-        "phishing", "risorse umane"
-    ],
-    
-    "Vendor_SupplyChain_Security": [
-        "fornitore", "vendor", "supply chain", "terze parti", "sla", "provider","supply chain security","third-party risk",
-        "contratto", "outsourcing", "subfornitore", "cloud provider", "dpa", "data processing agreement","soc 2", "audit fornitore"
-    ],
-    
-    "Physical_Environmental_Security": [
-        "sicurezza fisica", "controlli ambientali", "badge", "videosorveglianza", 
-        "cctv", "sala server", "datacenter", "estintori", "ups", "condizionamento"
-    ]
-}
-
-def infer_topics_regex(text: str, max_topics: int = 6) -> list[str]:
-    """
-    Tag 'regex-safe': conta i match per topic e ritorna i top N.
-    - Usa IGNORECASE
-    - Evita falsi positivi (word boundary)
-    """
-    if not text:
-        return []
-
-    # Normalizzazione leggera (non distruttiva)
-    t = text
-
-    scores = {}
-    for topic, patterns in TOPIC_PATTERNS.items():
-        topic_score = 0
-        for pat in patterns:
-            try:
-                topic_score += len(re.findall(pat, t, flags=re.IGNORECASE))
-            except re.error:
-                # pattern sbagliato non deve rompere ingestion
-                continue
-        if topic_score > 0:
-            scores[topic] = topic_score
-
-    if not scores:
-        return []
-
-    # Ordina per score decrescente
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [k for k, _ in ranked[:max_topics]]
-
-
-def _safe_read_json(path: str) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
-    except Exception:
-        return {}
-
-def read_sidecar_meta(file_path: str) -> dict:
-    """
-    Supporta: <file>.meta.json affiancato (override puntuale, consigliato per casi speciali).
-    """
-    sidecar = file_path + ".meta.json"
-    if os.path.exists(sidecar):
-        return _safe_read_json(sidecar)
-    return {}
-
-def dispatch_document(file_path: str, root_dir: str) -> dict:
-    """
-    Classifica il documento in modo coerente con l'alberatura Assessment:
-
-    INBOX/
-      TIER_A_NORMATIVE/<categoria>/file
-      TIER_B_GOVERNANCE/<categoria>/file
-      TIER_C_EVIDENCES/<macro_area>/<categoria>/file
-
-    Regola importante:
-    - parts[0] identifica il macro-tier fisico.
-    - l'ultima cartella riconosciuta in TIER_FOLDERS identifica content_type/source_kind.
-    - il macro-tier fisico prevale sul default, così i documenti normativi non ricadono
-      accidentalmente nel DEFAULT_TIER_META (Tier B).
-    """
-    rel = os.path.relpath(root_dir, INBOX_DIR).replace("\\", "/")
-    parts = [p for p in rel.split("/") if p and p != "."]
-
-    macro_tier_folder = parts[0].upper() if parts else ""
-
-    # Cerca la cartella più specifica censita in TIER_FOLDERS.
-    # Esempi:
-    # - TIER_A_NORMATIVE/norm_frameworks_intl -> norm_frameworks_intl
-    # - TIER_C_EVIDENCES/1_technical_evidences/tech_evidence_sys_config -> tech_evidence_sys_config
-    category_key = ""
-    for p in reversed(parts):
-        p_norm = p.strip()
-        if p_norm in TIER_FOLDERS:
-            category_key = p_norm
-            break
-
-    base = dict(TIER_FOLDERS.get(category_key, DEFAULT_TIER_META))
-
-    # Macro-tier fisico: fonte primaria per la gerarchia del RAG.
-    if macro_tier_folder == "TIER_A_NORMATIVE":
-        base["tier"] = "A"
-        base["scope"] = "GLOBAL"
-    elif macro_tier_folder == "TIER_B_GOVERNANCE":
-        base["tier"] = "B"
-        base["scope"] = "ACCOUNT"
-    elif macro_tier_folder == "TIER_C_EVIDENCES":
-        base["tier"] = "C"
-        base["scope"] = "ACCOUNT"
-    else:
-        # Fallback di sicurezza
-        base["tier"] = base.get("tier", "B")
-        base["scope"] = "GLOBAL" if base["tier"] == "A" else "ACCOUNT"
-
-    # Assegnazione dell'Organization ID
-    # Il TIER A è globale, quindi non appartiene a nessuna organizzazione specifica.
-    if base["scope"] == "ACCOUNT":
-        base["organization_id"] = ORGANIZATION_ID
-    else:
-        base["organization_id"] = None
-
-    # Ontology coerente con assessment.
-    # Per Tier C manteniamo la macro-area evidenziale (technical / organizational / legal / physical).
-    # Per Tier A/B, se non c'è un vero secondo livello ontologico, usiamo il content_type.
-    if macro_tier_folder == "TIER_C_EVIDENCES" and len(parts) >= 2:
-        ontology = parts[1].lower()
-    elif len(parts) >= 3:
-        ontology = parts[1].lower()
-    else:
-        ontology = str(base.get("content_type") or DEFAULT_ONTOLOGY).lower()
-
-    base["ontology"] = ontology
-
-    # Topics: usa filename + cartelle per migliorare il tagging su assessment.
-    fname = os.path.basename(file_path)
-    topic_seed = " ".join([fname] + parts)
-    base["topics"] = infer_topics_regex(topic_seed)[:6]
-
-    # Le evidenze hanno una data effettiva utile per audit/assessment.
-    if base.get("tier") == "C" and not base.get("effective_date"):
-        base["effective_date"] = time.strftime("%Y-%m-%d")
-
-    # Sidecar meta JSON: può arricchire i metadati descrittivi, ma non può
-    # cambiare tier/scope/organization_id calcolati dall'alberatura e dal job.
-    side = read_sidecar_meta(file_path)
-    if isinstance(side, dict) and side:
-        safe_side = {
-            key: value
-            for key, value in side.items()
-            if key not in SECURITY_META_FIELDS
-        }
-        base.update(safe_side)
-
-    # Invarianti fail-closed della segregazione.
-    tier = str(base.get("tier") or "").strip().upper()
-    scope = str(base.get("scope") or "").strip().upper()
-
-    if scope == "GLOBAL":
-        if tier != "A":
-            raise ValueError("Solo il Tier A può avere scope GLOBAL")
-        base["organization_id"] = None
-    elif scope == "ACCOUNT":
-        if tier not in {"B", "C"}:
-            raise ValueError("Lo scope ACCOUNT è consentito solo ai Tier B/C")
-        base["organization_id"] = int(ORGANIZATION_ID)
-    else:
-        raise ValueError(f"Scope documento non valido: {scope!r}")
-
-    classification = str(base.get("classification") or DEFAULT_CLASSIFICATION).strip().lower()
-    if classification not in {"public", "internal", "confidential", "restricted"}:
-        raise ValueError(f"Classificazione documento non valida: {classification!r}")
-
-    base["tier"] = tier
-    base["scope"] = scope
-    base["tenant_key"] = build_tenant_key(scope, base.get("organization_id"))
-    base["status"] = DOCUMENT_ACTIVE_STATUS
-    base["classification"] = classification
-    base["embedding_model"] = EMBEDDING_MODEL_NAME
-    base["corpus_version"] = CORPUS_VERSION
-
-    return base
-
-def ensure_inbox_structure(inbox_dir: str):
-    """
-    Crea automaticamente l'alberatura fisica per l'Assessment (Cybersecurity & Compliance).
-    """
-    structure = {
-        "TIER_A_NORMATIVE": [
-            "norm_frameworks_intl",
-            "norm_regulations_local",
-            "norm_audit_guidelines"
-        ],
-        "TIER_B_GOVERNANCE": [
-            "gov_infosec_policies",
-            "gov_it_procedures",
-            "gov_bcdr_plans",
-            "gov_hr_policies",
-            "gov_org_charts_roles"
-        ],
-        "TIER_C_EVIDENCES": [
-            "1_technical_evidences/tech_evidence_sys_config",
-            "1_technical_evidences/tech_evidence_audit_logs",
-            "1_technical_evidences/tech_evidence_vuln_patching",
-            "1_technical_evidences/tech_evidence_backup_restore",
-            "1_technical_evidences/tech_evidence_net_access",
-            "2_organizational_evidences/org_evidence_mgmt_reviews",
-            "2_organizational_evidences/org_evidence_training_aware",
-            "2_organizational_evidences/org_evidence_incident_rep",
-            "2_organizational_evidences/org_evidence_risk_mgmt",
-            "3_legal_vendor_evidences/legal_evidence_vendor_contracts",
-            "3_legal_vendor_evidences/legal_evidence_data_privacy",
-            "3_legal_vendor_evidences/legal_evidence_nda_clauses",
-            "4_physical_security_evidences/phys_evidence_env_controls",
-            "4_physical_security_evidences/phys_evidence_access_logs"
-        ]
-    }
-
-    for tier_folder, subfolders in structure.items():
-        for sub in subfolders:
-            # os.path.join gestisce automaticamente i path annidati (es. 1_technical_evidences/...)
-            tier_path = os.path.join(inbox_dir, tier_folder, sub)
-            os.makedirs(tier_path, exist_ok=True)
-
-# =========================# =========================# =========================# 
+# TIER, scope, organization_id and ontology are authoritative metadata
+# returned by the protected worker APIs of schema rag_ingestion.
+# No local source directory or path-based taxonomy is used.
 
 
 # =========================
 # MULTI-TENANT CONTEXT
 # =========================
-# L'organizzazione arriva esclusivamente dal contesto trusted del job/container.
-# Nessun fallback implicito: un job senza tenant esplicito non deve partire.
-def _required_positive_int_env(name: str) -> int:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        raise RuntimeError(f"Variabile ambiente obbligatoria non configurata: {name}")
-    try:
-        value = int(str(raw).strip())
-    except ValueError as exc:
-        raise RuntimeError(f"{name} deve essere un intero positivo") from exc
-    if value <= 0:
-        raise RuntimeError(f"{name} deve essere maggiore di zero")
-    return value
+# organization_id, TIER, scope and tenant_key are always read from the
+# claimed job in Database A. There is no fixed tenant in the runtime.
 
-
-
-# ============================================================
-# POC TENANT CONFIGURATION
-# ============================================================
-# Nel POC l'organizzazione è intenzionalmente fissa e trusted.
-# IMPORTANTE: deve essere un intero. La precedente espressione
-#     os.getenv("ORGANIZATION_ID", "1234") == "1234"
-# restituiva un booleano (True/False), causando organization_id=1/0.
-POC_MODE = True
-ORGANIZATION_ID: int = 1234
-
-# Per una futura versione multi-tenant autenticata sostituire la riga sopra con:
-# ORGANIZATION_ID = _required_positive_int_env("ORGANIZATION_ID")
+POC_MODE = os.getenv("POC_MODE", "1") == "1"
 CORPUS_VERSION = (os.getenv("CORPUS_VERSION", "v1").strip() or "v1")
-DEFAULT_CLASSIFICATION = (os.getenv("DEFAULT_CLASSIFICATION", "internal").strip().lower() or "internal")
+DEFAULT_CLASSIFICATION = (
+    os.getenv("DEFAULT_CLASSIFICATION", "internal").strip().lower()
+    or "internal"
+)
 DOCUMENT_ACTIVE_STATUS = "active"
 INGESTION_RUN_STATUSES = {"RUNNING", "DONE", "FAILED", "PARTIAL_FAILED"}
 PG_AUTO_HARDEN_SCHEMA = os.getenv("PG_AUTO_HARDEN_SCHEMA", "0") == "1"
 PG_SCHEMA_MIGRATION_ONLY = os.getenv("PG_SCHEMA_MIGRATION_ONLY", "0") == "1"
-
-# Nel POC il database usa ancora il ruolo admin/superuser.
-# Il controllo resta disponibile per il futuro, ma non blocca il POC.
 PG_ENFORCE_LEAST_PRIVILEGE = False
+
+# Contesto thread-local usato esclusivamente per impostare la RLS del
+# Database B durante l'elaborazione del job corrente.
+_OUTPUT_DB_CONTEXT = threading.local()
 
 
 def build_tenant_key(scope: str, organization_id: Optional[int]) -> str:
@@ -496,33 +157,6 @@ def build_tenant_key(scope: str, organization_id: Optional[int]) -> str:
     return f"ORG:{org_id}"
 
 
-def tenant_scoped_doc_id(file_path: str, doc_meta: Optional[dict]) -> str:
-    """
-    ID documento deterministico e segregato.
-    - Tier A/GLOBAL: stesso file -> stesso ID globale.
-    - Tier B/C/ACCOUNT: stesso file in tenant diversi -> ID diversi.
-    """
-    meta = doc_meta or {}
-    tenant_key = build_tenant_key(
-        meta.get("scope", "ACCOUNT"),
-        meta.get("organization_id", ORGANIZATION_ID),
-    )
-    file_hash = sha256_file(file_path)
-    return sha256_hex(f"{tenant_key}::{file_hash}".encode("utf-8"))[:32]
-
-
-SECURITY_META_FIELDS = {
-    "tier",
-    "scope",
-    "organization_id",
-    "tenant_key",
-    "status",
-    "ingestion_run_id",
-    "embedding_model",
-    "corpus_version",
-    "classification",
-}
-
 # -------------------------
 # KG LIMITS (coherent names)
 # -------------------------
@@ -536,7 +170,7 @@ KG_WINDOW_OVERLAP_CHARS = int(os.getenv("KG_WINDOW_OVERLAP_CHARS", "300"))
 # 0 = nessun limite. Ogni pagina lunga viene coperta da tutte le finestre necessarie.
 KG_MAX_WINDOWS_PER_PAGE = int(os.getenv("KG_MAX_WINDOWS_PER_PAGE", "0"))
 KG_MAX_TRIPLES = int(os.getenv("KG_MAX_TRIPLES", "50"))           # 10 soft cap (sanitize already caps)
-KG_TIMEOUT = int(os.getenv("KG_TIMEOUT", "180"))                   # seconds per KG task/page
+KG_TIMEOUT = int(os.getenv("KG_TIMEOUT", "360"))                   # seconds per KG task/page
 
 # Backward-compat aliases (do NOT use in new code)
 KG_CHARS_LIMIT = KG_TEXT_MAX_CHARS
@@ -551,10 +185,6 @@ KG_TIMEOUT_PER_PAGE = KG_TIMEOUT
 
 
 
-BASE_DATA_DIR = os.getenv("BASE_DIR", "./data/assessment")
-INBOX_DIR = os.path.join(BASE_DATA_DIR, "INBOX")
-PROCESSED_DIR = os.getenv("PROCESSED_DIR", "./data/assessment/processed")
-FAILED_DIR = os.getenv("FAILED_DIR", "./data/assessment/failed")
 
 CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "800"))
 CHUNK_OVERLAP_CHARS = int(os.getenv("CHUNK_OVERLAP_CHARS", "200"))
@@ -807,6 +437,38 @@ PG_PASS = os.getenv("PG_PASS", "admin_password")
 PG_MIN_CONN = int(os.getenv("PG_MIN_CONN", "1"))
 PG_MAX_CONN = int(os.getenv("PG_MAX_CONN", "8"))
 
+
+# PostgreSQL Database A: applicazione + schema rag_ingestion + file BYTEA.
+# Per requisito usa lo stesso host, porta, utente e password del Database B.
+SOURCE_PG_HOST = os.getenv("SOURCE_PG_HOST", PG_HOST)
+SOURCE_PG_PORT = int(os.getenv("SOURCE_PG_PORT", str(PG_PORT)))
+SOURCE_PG_DB = os.getenv("SOURCE_PG_DB", "assessment_gestio_tier")
+SOURCE_PG_USER = os.getenv("SOURCE_PG_USER", PG_USER)
+SOURCE_PG_PASS = os.getenv("SOURCE_PG_PASS", PG_PASS)
+SOURCE_PG_MIN_CONN = int(os.getenv("SOURCE_PG_MIN_CONN", "1"))
+SOURCE_PG_MAX_CONN = int(os.getenv("SOURCE_PG_MAX_CONN", "4"))
+
+INGESTION_WORKER_ID = (
+    os.getenv("INGESTION_WORKER_ID", "worker-ingestion-01").strip()
+    or "worker-ingestion-01"
+)
+JOB_HEARTBEAT_SECONDS = max(
+    10,
+    int(os.getenv("JOB_HEARTBEAT_SECONDS", "60")),
+)
+JOB_RETRY_DELAY = (
+    os.getenv("JOB_RETRY_DELAY", "15 minutes").strip()
+    or "15 minutes"
+)
+
+DB_MAX_JOBS_PER_RUN = os.getenv("DB_MAX_JOBS_PER_RUN", 100)
+
+
+#DB_MAX_JOBS_PER_RUN = max(
+#    0,
+#    int(os.getenv("DB_MAX_JOBS_PER_RUN", "0")),
+#)
+
 # Neo4j
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7688")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
@@ -862,12 +524,12 @@ OLLAMA_AUTOSTART = os.getenv("OLLAMA_AUTOSTART", "1") == "1"
 # Embeddings
 #EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
 
-# EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
+EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
 
-EMBEDDING_MODEL_NAME = os.getenv(
-    "EMBEDDING_MODEL_NAME",
-    "/workspace/models/bge-m3"
-)
+#EMBEDDING_MODEL_NAME = os.getenv(
+#    "EMBEDDING_MODEL_NAME",
+#    "/workspace/models/bge-m3"
+#)
 
 
 QDRANT_TEXT_MAX_CHARS = int(os.getenv("QDRANT_TEXT_MAX_CHARS", "2500"))
@@ -917,6 +579,17 @@ pg_pool = ThreadedConnectionPool(
     PG_MIN_CONN, PG_MAX_CONN,
     host=PG_HOST, port=PG_PORT, dbname=PG_DB,
     user=PG_USER, password=PG_PASS
+)
+
+
+source_pg_pool = ThreadedConnectionPool(
+    SOURCE_PG_MIN_CONN,
+    SOURCE_PG_MAX_CONN,
+    host=SOURCE_PG_HOST,
+    port=SOURCE_PG_PORT,
+    dbname=SOURCE_PG_DB,
+    user=SOURCE_PG_USER,
+    password=SOURCE_PG_PASS,
 )
 
 # ==============================================================================
@@ -1325,33 +998,6 @@ _VISION_STATS_LOCK = Lock()
 # --- UTILITY DI PULIZIA E FILTRAGGIO MD ---
 
 
-def move_file_preserving_structure(file_path: str, target_base_dir: str):
-    """
-    Sposta il file mantenendo l'alberatura originale (Tier e Ontology) rispetto a INBOX_DIR.
-    """
-    try:
-        if not os.path.exists(file_path):
-            return
-            
-        # Calcola il percorso relativo (es. TIER_B_GOVERNANCE/gov_infosec_policies/file.md)
-        rel_path = os.path.relpath(file_path, INBOX_DIR)
-        
-        # Unisce il path relativo alla nuova root (es. ./data/assessment/processed/...)
-        dest_path = os.path.join(target_base_dir, rel_path)
-        
-        # Crea tutte le sottocartelle necessarie nella destinazione
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        
-        # Se esiste già un file omonimo nella destinazione, sovrascrivilo
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-            
-        shutil.move(file_path, dest_path)
-    except Exception as e:
-        print(f"   ⚠️ Errore spostamento file in {target_base_dir}: {e}")
-
-
-
 def ai_vision_gatekeeper(image_bytes: bytes) -> bool:
     # filtro dimensione (icone/loghi)
     if not image_bytes or len(image_bytes) < MIN_ASSET_SIZE:
@@ -1604,12 +1250,6 @@ def force_unload_ollama(model_name: str):
     except Exception:
         pass
 
-import os
-import time
-import shutil
-import subprocess
-import requests
-
 
 def force_restart_ollama(num_parallel: str = "1") -> bool:
     """
@@ -1731,16 +1371,6 @@ def ensure_ollama_parallel(num_parallel="4"):
 
 
 
-def sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(chunk_size)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
-
 def deterministic_chunk_id(
     doc_id: str,
     page_no: int,
@@ -1825,11 +1455,6 @@ def normalize_doc_name(value: str) -> str:
 
 
 
-import json
-import re
-from typing import Any, Dict, Optional, Tuple, Union
-
-
 def safe_json_extract(raw: str):
     """
     Estrae in modo robusto il primo JSON valido (dict/list) da una risposta LLM.
@@ -1842,8 +1467,6 @@ def safe_json_extract(raw: str):
       - FIX LATEX: Escaping automatico per sintassi LaTeX (\\sum -> \\\\sum)
     Ritorna: dict | list | None
     """
-    import json, re
-
     if raw is None:
         return None
 
@@ -2470,14 +2093,93 @@ def log_phase(filename: str, label: str, ms: int):
 # =========================
 # Postgres helpers
 # =========================
+def set_output_db_tenant_context(doc_meta: Optional[dict]) -> None:
+    """Imposta nel thread corrente il tenant derivato dal job Database A."""
+    meta = doc_meta or {}
+    tier = str(meta.get("tier") or "").strip().upper()
+    scope = str(meta.get("scope") or "").strip().upper()
+    organization_id = meta.get("organization_id")
+
+    if scope == "GLOBAL":
+        if tier != "A" or organization_id is not None:
+            raise ValueError(
+                "Contesto GLOBAL non valido: richiesti Tier A e organization_id NULL"
+            )
+        tenant_key = "GLOBAL"
+        allow_global = True
+        organization_id = None
+    elif scope == "ACCOUNT":
+        if tier not in {"B", "C"} or organization_id is None:
+            raise ValueError(
+                "Contesto ACCOUNT non valido: richiesti Tier B/C e organization_id"
+            )
+        organization_id = int(organization_id)
+        if organization_id <= 0:
+            raise ValueError("organization_id deve essere maggiore di zero")
+        tenant_key = build_tenant_key(scope, organization_id)
+        allow_global = False
+    else:
+        raise ValueError(f"Scope documento non valido: {scope!r}")
+
+    expected_tenant_key = str(meta.get("tenant_key") or tenant_key)
+    if expected_tenant_key != tenant_key:
+        raise ValueError(
+            f"tenant_key non coerente: atteso={tenant_key}, ricevuto={expected_tenant_key}"
+        )
+
+    _OUTPUT_DB_CONTEXT.organization_id = organization_id
+    _OUTPUT_DB_CONTEXT.allow_global_ingestion = allow_global
+    _OUTPUT_DB_CONTEXT.tenant_key = tenant_key
+    _OUTPUT_DB_CONTEXT.corpus_version = str(
+        meta.get("corpus_version") or CORPUS_VERSION
+    )
+
+
+def clear_output_db_tenant_context() -> None:
+    for attr in (
+        "organization_id",
+        "allow_global_ingestion",
+        "tenant_key",
+        "corpus_version",
+    ):
+        try:
+            delattr(_OUTPUT_DB_CONTEXT, attr)
+        except AttributeError:
+            pass
+
+
+def _current_output_tenant_key() -> str:
+    tenant_key = getattr(_OUTPUT_DB_CONTEXT, "tenant_key", None)
+    if not tenant_key:
+        raise RuntimeError(
+            "Contesto tenant non inizializzato: il documento deve provenire "
+            "da un job rag_ingestion valido"
+        )
+    return str(tenant_key)
+
+
 def pg_get_conn():
+    """Connessione al Database B con RLS impostata dal job Database A."""
+    if not hasattr(_OUTPUT_DB_CONTEXT, "allow_global_ingestion"):
+        raise RuntimeError(
+            "Contesto tenant Database B non inizializzato prima della connessione"
+        )
+
+    organization_id = getattr(_OUTPUT_DB_CONTEXT, "organization_id", None)
+    allow_global = bool(
+        getattr(_OUTPUT_DB_CONTEXT, "allow_global_ingestion", False)
+    )
+
     conn = pg_pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT set_config('app.current_customer_account_id', %s, false), "
-                "set_config('app.allow_global_ingestion', '1', false)",
-                (str(ORGANIZATION_ID),),
+                "set_config('app.allow_global_ingestion', %s, false)",
+                (
+                    "" if organization_id is None else str(organization_id),
+                    "1" if allow_global else "0",
+                ),
             )
         conn.commit()
         return conn
@@ -2485,6 +2187,7 @@ def pg_get_conn():
         conn.rollback()
         pg_pool.putconn(conn)
         raise
+
 
 def pg_put_conn(conn):
     if conn is None:
@@ -2703,7 +2406,7 @@ def ensure_postgres_security_schema() -> None:
             # La validazione rigorosa resta attiva fuori dal POC.
             if POC_MODE:
                 print(
-                    f"ℹ️ POC MODE attivo | ORGANIZATION_ID={ORGANIZATION_ID} | "
+                    "ℹ️ POC MODE attivo | tenant derivato dal job Database A | "
                     "controllo RLS/least-privilege non bloccante."
                 )
                 return
@@ -2811,6 +2514,36 @@ def pg_close_log(log_id: int, status: str, total_chunks: int, processing_ms: int
                 WHERE log_id = %s
                 """,
                 (status, total_chunks, processing_ms, error_msg, log_id),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pg_put_conn(conn)
+
+
+
+def pg_fail_log_if_running(
+    log_id: int,
+    processing_ms: int,
+    error_msg: str,
+) -> None:
+    """Imposta FAILED solo se il log non è già DONE/PARTIAL_FAILED."""
+    conn = pg_get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE public.ingestion_logs
+                SET status = 'FAILED',
+                    processing_time_ms = %s,
+                    error_message = %s,
+                    completed_at = NOW()
+                WHERE log_id = %s
+                  AND status = 'RUNNING'
+                """,
+                (processing_ms, error_msg, log_id),
             )
         conn.commit()
     except Exception:
@@ -2997,6 +2730,10 @@ def ensure_qdrant_collection():
         "organization_id": models.PayloadSchemaType.INTEGER,
         "status": models.PayloadSchemaType.KEYWORD,
         "doc_id": models.PayloadSchemaType.KEYWORD,
+        "document_id": models.PayloadSchemaType.KEYWORD,
+        "ontology": models.PayloadSchemaType.KEYWORD,
+        "ontology_codes": models.PayloadSchemaType.KEYWORD,
+        "document_context_ids": models.PayloadSchemaType.KEYWORD,
         "chunk_id": models.PayloadSchemaType.KEYWORD,
         "ingestion_run_id": models.PayloadSchemaType.KEYWORD,
         "source_type": models.PayloadSchemaType.KEYWORD,
@@ -3032,6 +2769,9 @@ SET d.filename = r.filename,
     d.organization_id = r.organization_id,
     d.tenant_key = r.tenant_key,
     d.ontology = r.ontology,
+    d.ontology_codes = r.ontology_codes,
+    d.document_context_ids = r.document_context_ids,
+    d.contexts_json = r.contexts_json,
     d.log_id = r.log_id,
     d.status = r.status,
     d.ingestion_run_id = r.ingestion_run_id,
@@ -3049,6 +2789,9 @@ SET p.doc_id = r.doc_id,
     p.organization_id = r.organization_id,
     p.tenant_key = r.tenant_key,
     p.ontology = r.ontology,
+    p.ontology_codes = r.ontology_codes,
+    p.document_context_ids = r.document_context_ids,
+    p.contexts_json = r.contexts_json,
     p.status = r.status,
     p.ingestion_run_id = r.ingestion_run_id,
     p.corpus_version = r.corpus_version,
@@ -3068,6 +2811,9 @@ SET c.chunk_id = r.chunk_id,
     c.organization_id = r.organization_id,
     c.tenant_key = r.tenant_key,
     c.ontology = r.ontology,
+    c.ontology_codes = r.ontology_codes,
+    c.document_context_ids = r.document_context_ids,
+    c.contexts_json = r.contexts_json,
     c.status = r.status,
     c.ingestion_run_id = r.ingestion_run_id,
     c.corpus_version = r.corpus_version,
@@ -3907,8 +3653,17 @@ OLLAMA_API_CHAT = os.getenv(
 )
 '''
 
-OLLAMA_API_CHAT="http://ollama_assessment:11434/api/chat"
-OLLAMA_API_GENERATE="http://ollama_assessment:11434/api/generate"
+# Endpoint unico e configurabile.
+# - Esecuzione Windows/.venv: default http://127.0.0.1:11434
+# - Docker Compose: impostare OLLAMA_BASE_URL=http://ollama_assessment:11434
+OLLAMA_API_CHAT = os.getenv(
+    "OLLAMA_API_CHAT",
+    f"{OLLAMA_BASE_URL}/api/chat",
+)
+OLLAMA_API_GENERATE = os.getenv(
+    "OLLAMA_API_GENERATE",
+    f"{OLLAMA_BASE_URL}/api/generate",
+)
 
 
 # Timeout separati: evitano che una singola chiamata Ollama sembri bloccare tutta l'ingestion.
@@ -4117,7 +3872,11 @@ _vision_cache: Dict[str, Dict[str, Any]] = {}
 _vision_cache_order: List[str] = []
 
 def _tenant_cache_key(key: str) -> str:
-    return f"ORG:{ORGANIZATION_ID}|{CORPUS_VERSION}|{VISION_MODEL_NAME}|{key}"
+    tenant_key = _current_output_tenant_key()
+    corpus_version = str(
+        getattr(_OUTPUT_DB_CONTEXT, "corpus_version", CORPUS_VERSION)
+    )
+    return f"{tenant_key}|{corpus_version}|{VISION_MODEL_NAME}|{key}"
 
 
 def _vision_cache_get(key: str) -> Optional[Dict[str, Any]]:
@@ -5227,11 +4986,10 @@ def extract_file_chunks(
 
     try:
         doc = fitz.open(file_path)
-        # Calcolo ID univoco documento (hash)
-        doc_id = tenant_scoped_doc_id(
-            file_path,
-            doc_meta or {"scope": "ACCOUNT", "organization_id": ORGANIZATION_ID},
-        )
+        # Il document_id canonico proviene esclusivamente dal Database A.
+        doc_id = str((doc_meta or {}).get("document_id") or "").strip()
+        if not doc_id:
+            raise ValueError("document_id assente nel payload del job Database A")
 
         # ==============================================================
         # CICLO UNICO: SCORRIAMO LE PAGINE UNA SOLA VOLTA
@@ -5433,10 +5191,9 @@ def extract_pdf_as_markdown_assets(
 
     filename = os.path.basename(file_path)
     total_pages = len(doc)
-    doc_id = tenant_scoped_doc_id(
-        file_path,
-        doc_meta or {"scope": "ACCOUNT", "organization_id": ORGANIZATION_ID},
-    )
+    doc_id = str((doc_meta or {}).get("document_id") or "").strip()
+    if not doc_id:
+        raise ValueError("document_id assente nel payload del job Database A")
 
     print(f"   🚀 Ingestion: {total_pages} pagine | Vision: {VISION_MODEL_NAME} | Brain: {LLM_MODEL_NAME}")
 
@@ -6017,7 +5774,7 @@ def enrich_synonyms_from_local_text(nodes: list[dict], text: str) -> list[dict]:
 
 
 # =========================
-# FILE DISPATCH (PDF only here)
+# PIPELINE AI E PERSISTENZA OUTPUT
 # =========================
 
 def mark_ingestion_run_partial_failure(
@@ -6109,15 +5866,23 @@ def process_ai_and_db(
     parcheggiate entità su chunk diversi da quello che le ha generate.
     """
     t0 = time.time()
-    filename = os.path.basename(file_path)
+    set_output_db_tenant_context(doc_meta)
+    filename = str(
+        (doc_meta or {}).get("source_name")
+        or os.path.basename(file_path)
+    )
 
-    os.makedirs(PROCESSED_DIR, exist_ok=True)
-    os.makedirs(FAILED_DIR, exist_ok=True)
-
-    tier = str((doc_meta or {}).get("tier", "B")).strip().upper()
-    scope = str((doc_meta or {}).get("scope", "ACCOUNT")).strip().upper()
+    tier = str((doc_meta or {}).get("tier") or "").strip().upper()
+    scope = str((doc_meta or {}).get("scope") or "").strip().upper()
     org_id = (doc_meta or {}).get("organization_id")
-    ontology = (doc_meta or {}).get("ontology", DEFAULT_ONTOLOGY)
+    ontology_codes = list((doc_meta or {}).get("ontology_codes") or [])
+    ontology_contexts = list((doc_meta or {}).get("ontology_contexts") or [])
+    document_context_ids = list(
+        (doc_meta or {}).get("document_context_ids") or []
+    )
+    if not ontology_codes:
+        raise ValueError("Nessuna ontology restituita dal Database A")
+    ontology = str(ontology_codes[0])
     ingestion_run_id = str((doc_meta or {}).get("ingestion_run_id") or uuid.uuid4())
     (doc_meta or {})["ingestion_run_id"] = ingestion_run_id
     classification = str((doc_meta or {}).get("classification") or DEFAULT_CLASSIFICATION).lower()
@@ -6136,6 +5901,8 @@ def process_ai_and_db(
         raise ValueError(f"Scope documento non valido: {scope!r}")
 
     tenant_key = build_tenant_key(scope, org_id)
+    if str((doc_meta or {}).get("tenant_key") or tenant_key) != tenant_key:
+        raise ValueError("tenant_key del job non coerente con scope/organization_id")
 
     print(
         f"   ⚙️ Engine Start: {filename} | tier={tier} | scope={scope} | org_id={org_id} | "
@@ -6163,13 +5930,9 @@ def process_ai_and_db(
     finally:
         pg_put_conn(conn)
 
-    doc_id = tenant_scoped_doc_id(
-        file_path,
-        {
-            "scope": scope,
-            "organization_id": org_id,
-        },
-    )
+    doc_id = str((doc_meta or {}).get("document_id") or "").strip()
+    if not doc_id:
+        raise ValueError("document_id assente nel payload del job Database A")
 
     global embedder, qdrant_client
     embedder = get_embedder()
@@ -6178,8 +5941,7 @@ def process_ai_and_db(
 
     if not chunks:
         pg_close_log(log_id, "FAILED", 0, _ms(t0), "No chunks extracted")
-        move_file_preserving_structure(file_path, FAILED_DIR)
-        return
+        raise RuntimeError("No chunks extracted")
 
     # Indici stabili e chunk_id deterministico calcolato una sola volta.
     page_chunk_counters: Dict[int, int] = {}
@@ -6548,11 +6310,15 @@ def process_ai_and_db(
                 "toon_type": ch.get("toon_type", "text"),
                 "filename": filename,
                 "doc_id": doc_id,
+                "document_id": doc_id,
                 "tier": tier,
                 "scope": scope,
                 "organization_id": org_id,
                 "tenant_key": tenant_key,
                 "ontology": ontology,
+                "ontology_codes": ontology_codes,
+                "document_context_ids": document_context_ids,
+                "ontology_contexts": ontology_contexts,
                 "source_name": filename,
                 "source_type": source_type,
                 "log_id": log_id,
@@ -6702,6 +6468,13 @@ def process_ai_and_db(
                 "organization_id": org_id,
                 "tenant_key": tenant_key,
                 "ontology": ontology,
+                "ontology_codes": ontology_codes,
+                "document_context_ids": document_context_ids,
+                "contexts_json": json.dumps(
+                    ontology_contexts,
+                    ensure_ascii=False,
+                    default=str,
+                ),
                 "log_id": log_id,
                 "status": document_status,
                 "ingestion_run_id": ingestion_run_id,
@@ -6757,7 +6530,6 @@ def process_ai_and_db(
                     point_ids=current_point_ids,
                     error=exc,
                 )
-                move_file_preserving_structure(file_path, FAILED_DIR)
                 raise
 
             pg_rows.clear()
@@ -6790,275 +6562,1131 @@ def process_ai_and_db(
 
         validate_neo4j_graph_model(doc_id)
 
-    move_file_preserving_structure(file_path, PROCESSED_DIR)
-
     print(
         f"   ✅ Completed: {filename} | chunks={total_chunks} | "
         f"time={total_ms / 1000:.2f}s"
     )
+    return {
+        "status": "DONE",
+        "chunks": total_chunks,
+        "processing_time_ms": total_ms,
+        "document_id": doc_id,
+        "ontology_codes": ontology_codes,
+    }
+
+# =========================
+# Database A / rag_ingestion job helpers
+# =========================
+def source_pg_get_conn():
+    return source_pg_pool.getconn()
+
+
+def source_pg_put_conn(conn) -> None:
+    if conn is None:
+        return
+    try:
+        if not conn.closed:
+            conn.rollback()
+    except Exception:
+        pass
+    finally:
+        source_pg_pool.putconn(conn)
+
+
+def verify_source_db_contract() -> None:
+    """Verifica che il Database A esponga le API worker previste dalla DDL."""
+    expected = {
+        "fn_claim_next_ingestion_job": 1,
+        "fn_get_claimed_job_payload": 3,
+        "fn_heartbeat_ingestion_job": 3,
+        "fn_complete_ingestion_job": 6,
+        "fn_fail_ingestion_job": 6,
+    }
+
+    conn = source_pg_get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_database(), current_user")
+            database_name, role_name = cur.fetchone()
+            cur.execute(
+                """
+                SELECT p.proname, p.pronargs
+                FROM pg_catalog.pg_proc p
+                JOIN pg_catalog.pg_namespace n
+                  ON n.oid = p.pronamespace
+                WHERE n.nspname = 'rag_ingestion'
+                  AND p.proname = ANY(%s)
+                """,
+                (list(expected),),
+            )
+            found: Dict[str, set[int]] = {}
+            for name, argument_count in cur.fetchall():
+                found.setdefault(str(name), set()).add(int(argument_count))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        source_pg_put_conn(conn)
+
+    missing = [
+        name
+        for name, argument_count in expected.items()
+        if argument_count not in found.get(name, set())
+    ]
+    if missing:
+        raise RuntimeError(
+            "Contratto DDL rag_ingestion non compatibile. "
+            f"Funzioni mancanti o con firma diversa: {missing}"
+        )
+
+    if str(database_name) != SOURCE_PG_DB:
+        raise RuntimeError(
+            f"Database sorgente inatteso: connesso a {database_name!r}, "
+            f"configurato {SOURCE_PG_DB!r}"
+        )
+
+    print(
+        f"   ✅ Contratto Database A verificato | "
+        f"db={database_name} | role={role_name}"
+    )
+
+
+def claim_next_db_job() -> Optional[Dict[str, Any]]:
+    """Acquisisce atomicamente il prossimo job PENDING dal Database A."""
+    conn = source_pg_get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM rag_ingestion.fn_claim_next_ingestion_job(%s)",
+                (INGESTION_WORKER_ID,),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return dict(row) if row else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        source_pg_put_conn(conn)
+
+
+def get_claimed_db_job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Legge BYTEA e metadati solo per un job posseduto dal worker."""
+    conn = source_pg_get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM rag_ingestion.fn_get_claimed_job_payload(%s, %s, %s)
+                """,
+                (
+                    job["job_id"],
+                    INGESTION_WORKER_ID,
+                    job["lock_token"],
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        if not row:
+            raise RuntimeError(
+                f"Payload non disponibile per job {job.get('job_id')}"
+            )
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        source_pg_put_conn(conn)
+
+
+def heartbeat_db_job(job: Dict[str, Any]) -> bool:
+    conn = source_pg_get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT rag_ingestion.fn_heartbeat_ingestion_job(%s, %s, %s)",
+                (
+                    job["job_id"],
+                    INGESTION_WORKER_ID,
+                    job["lock_token"],
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return bool(row and row[0])
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        source_pg_put_conn(conn)
+
+
+def complete_db_job(
+    job: Dict[str, Any],
+    external_log_id: Optional[int],
+    metrics: Optional[Dict[str, Any]] = None,
+    result: Optional[Dict[str, Any]] = None,
+) -> None:
+    conn = source_pg_get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rag_ingestion.fn_complete_ingestion_job(
+                    %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    job["job_id"],
+                    INGESTION_WORKER_ID,
+                    job["lock_token"],
+                    external_log_id,
+                    Json(metrics or {}),
+                    Json(result or {}),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        source_pg_put_conn(conn)
+
+
+def fail_db_job(
+    job: Dict[str, Any],
+    error: Exception,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    conn = source_pg_get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rag_ingestion.fn_fail_ingestion_job(
+                    %s, %s, %s, %s, %s::interval, %s
+                )
+                """,
+                (
+                    job["job_id"],
+                    INGESTION_WORKER_ID,
+                    job["lock_token"],
+                    str(error)[:4000],
+                    JOB_RETRY_DELAY,
+                    Json(metrics or {}),
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return str(row[0]) if row else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        source_pg_put_conn(conn)
+
+
+class JobHeartbeat:
+    """Mantiene valido il lock del job durante estrazione e pipeline AI."""
+
+    def __init__(self, job: Dict[str, Any]):
+        self.job = job
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"heartbeat-{job.get('job_id')}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(JOB_HEARTBEAT_SECONDS):
+            try:
+                if not heartbeat_db_job(self.job):
+                    print(
+                        f"   ⚠️ Heartbeat rifiutato per job "
+                        f"{self.job.get('job_id')}"
+                    )
+                    return
+            except Exception as exc:
+                print(
+                    f"   ⚠️ Heartbeat fallito per job "
+                    f"{self.job.get('job_id')}: {exc}"
+                )
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe_value(v) for v in value]
+    if isinstance(value, (uuid.UUID,)):
+        return str(value)
+    return value
+
+
+def _normalize_contexts(raw_contexts: Any) -> List[Dict[str, Any]]:
+    if raw_contexts is None:
+        return []
+    if isinstance(raw_contexts, str):
+        raw_contexts = json.loads(raw_contexts or "[]")
+    if isinstance(raw_contexts, dict):
+        raw_contexts = [raw_contexts]
+    if not isinstance(raw_contexts, list):
+        raise ValueError("contexts_json non valido nel payload del job")
+    return [
+        _json_safe_value(dict(context))
+        for context in raw_contexts
+        if isinstance(context, dict)
+    ]
+
+
+def suffix_from_db_payload(payload: Dict[str, Any]) -> str:
+    mime_type = str(payload.get("mime_type") or "").split(";", 1)[0]
+    mime_type = mime_type.strip().lower()
+    source_format = str(payload.get("source_format") or "").strip().lower()
+
+    if mime_type == "application/pdf" or source_format in {
+        "pdf",
+        ".pdf",
+        "application/pdf",
+    }:
+        return ".pdf"
+    if mime_type in {"text/markdown", "text/x-markdown"} or source_format in {
+        "md",
+        ".md",
+        "markdown",
+        "text/markdown",
+        "text/x-markdown",
+    }:
+        return ".md"
+
+    raise ValueError(
+        "Formato non supportato dalla pipeline corrente: "
+        f"mime_type={mime_type!r}, source_format={source_format!r}. "
+        "Sono ammessi PDF e Markdown."
+    )
+
+
+def build_doc_meta_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Costruisce metadati esclusivamente dai valori autorevoli del DB."""
+    document_id = str(payload.get("document_id") or "").strip()
+    if not document_id:
+        raise ValueError("document_id assente nel payload")
+
+    job_id = str(payload.get("job_id") or "").strip()
+    if not job_id:
+        raise ValueError("job_id assente nel payload")
+
+    job_type = str(payload.get("job_type") or "").strip().upper()
+    if job_type not in {"CONTENT_INGESTION", "CONTEXT_SYNC"}:
+        raise ValueError(f"job_type non valido: {job_type!r}")
+
+    tier = str(payload.get("tier_code") or "").strip().upper()
+    scope = str(payload.get("scope_code") or "").strip().upper()
+    organization_id = payload.get("organization_id")
+
+    if scope == "GLOBAL":
+        if tier != "A" or organization_id is not None:
+            raise ValueError(
+                "Payload GLOBAL non valido: richiesti Tier A e organization_id NULL"
+            )
+        organization_id = None
+    elif scope == "ACCOUNT":
+        if tier not in {"B", "C"} or organization_id is None:
+            raise ValueError(
+                "Payload ACCOUNT non valido: richiesti Tier B/C e organization_id"
+            )
+        organization_id = int(organization_id)
+        if organization_id <= 0:
+            raise ValueError("organization_id deve essere maggiore di zero")
+    else:
+        raise ValueError(f"scope_code non valido: {scope!r}")
+
+    tenant_key = build_tenant_key(scope, organization_id)
+    payload_tenant_key = str(payload.get("tenant_key") or "").strip()
+    if payload_tenant_key and payload_tenant_key != tenant_key:
+        raise ValueError(
+            f"tenant_key non coerente: atteso={tenant_key}, "
+            f"ricevuto={payload_tenant_key}"
+        )
+
+    contexts = _normalize_contexts(payload.get("contexts_json"))
+    ontology_codes = list(
+        dict.fromkeys(
+            str(context.get("ontology_code") or "").strip().lower()
+            for context in contexts
+            if str(context.get("ontology_code") or "").strip()
+        )
+    )
+    if not ontology_codes:
+        raise ValueError(
+            "Nessuna ontology configurata nel Database A per "
+            f"document_id={document_id}"
+        )
+
+    document_context_ids = [
+        str(context.get("document_context_id"))
+        for context in contexts
+        if context.get("document_context_id")
+    ]
+
+    payload_context_id = (
+        str(payload.get("document_context_id"))
+        if payload.get("document_context_id")
+        else None
+    )
+    if job_type == "CONTENT_INGESTION" and payload_context_id is not None:
+        raise ValueError(
+            "CONTENT_INGESTION non deve avere document_context_id sul job"
+        )
+    if job_type == "CONTEXT_SYNC":
+        if payload_context_id is None:
+            raise ValueError("CONTEXT_SYNC richiede document_context_id")
+        if payload_context_id not in document_context_ids:
+            raise ValueError(
+                "Il contesto del job CONTEXT_SYNC non è presente in contexts_json"
+            )
+
+    classification = str(
+        payload.get("classification") or DEFAULT_CLASSIFICATION
+    ).strip().lower()
+    if classification not in {
+        "public",
+        "internal",
+        "confidential",
+        "restricted",
+    }:
+        raise ValueError(f"classification non valida: {classification!r}")
+
+    source_suffix = suffix_from_db_payload(payload)
+
+    # Il nome originale proviene dall'API del Database A. Per gli upload
+    # applicativi è letto da public.file_asset; per i caricamenti CORPUS
+    # manuali è letto da rag_file_blob.security_scan_details.
+    raw_original_filename = next(
+        (
+            str(context.get("original_filename") or "").strip()
+            for context in contexts
+            if str(context.get("original_filename") or "").strip()
+        ),
+        "",
+    )
+
+    if raw_original_filename:
+        # Accetta solo il basename: nessun percorso proveniente dal DB può
+        # influenzare la directory temporanea del worker.
+        source_name = re.split(r"[\\/]", raw_original_filename)[-1].strip()
+        source_name = source_name.replace("\x00", "")
+        if source_name in {"", ".", ".."}:
+            source_name = f"{document_id}{source_suffix}"
+        else:
+            stem, current_suffix = os.path.splitext(source_name)
+            if current_suffix.lower() != source_suffix:
+                source_name = f"{stem or document_id}{source_suffix}"
+            source_name = source_name[:255]
+    else:
+        source_name = f"{document_id}{source_suffix}"
+
+    return {
+        "db_source": True,
+        "job_id": job_id,
+        "job_type": job_type,
+        "document_id": document_id,
+        "document_context_id": payload_context_id,
+        "organization_id": organization_id,
+        "tier": tier,
+        "scope": scope,
+        "tenant_key": tenant_key,
+        "ontology": ontology_codes[0],
+        "ontology_codes": ontology_codes,
+        "ontology_contexts": contexts,
+        "document_context_ids": document_context_ids,
+        "pipeline_version": str(payload.get("pipeline_version") or "v1"),
+        "corpus_version": str(
+            payload.get("corpus_version") or CORPUS_VERSION
+        ),
+        "classification": classification,
+        "embedding_model": EMBEDDING_MODEL_NAME,
+        "ingestion_run_id": str(uuid.uuid4()),
+        "source_name": source_name,
+        "mime_type": str(payload.get("mime_type") or "").lower(),
+        "source_format": str(payload.get("source_format") or ""),
+        "content_sha256": str(payload.get("content_sha256") or "").lower(),
+        "file_size_bytes": int(payload.get("file_size_bytes") or 0),
+        "file_blob_id": (
+            str(payload.get("file_blob_id"))
+            if payload.get("file_blob_id")
+            else None
+        ),
+    }
+
+
+def materialize_claimed_bytea(
+    payload: Dict[str, Any],
+    doc_meta: Dict[str, Any],
+) -> str:
+    """
+    Materializza temporaneamente il BYTEA per gli estrattori esistenti.
+
+    La sorgente del documento resta il Database A; non viene consultata alcuna
+    directory sorgente. La directory temporanea viene rimossa al termine del job.
+    """
+    raw_content = payload.get("content_data")
+    if raw_content is None:
+        raise ValueError("content_data BYTEA assente nel payload")
+
+    content_bytes = (
+        raw_content.tobytes()
+        if isinstance(raw_content, memoryview)
+        else bytes(raw_content)
+    )
+
+    expected_size = int(payload.get("file_size_bytes") or 0)
+    if expected_size <= 0 or len(content_bytes) != expected_size:
+        raise ValueError(
+            "Dimensione BYTEA non coerente: "
+            f"attesa={expected_size}, letta={len(content_bytes)}"
+        )
+
+    expected_sha = str(payload.get("content_sha256") or "").strip().lower()
+    actual_sha = hashlib.sha256(content_bytes).hexdigest()
+    if not expected_sha or actual_sha != expected_sha:
+        raise ValueError(
+            "SHA-256 BYTEA non coerente per "
+            f"document_id={payload.get('document_id')}"
+        )
+
+    temporary_dir = tempfile.mkdtemp(
+        prefix=f"rag_job_{str(payload.get('job_id'))[:12]}_"
+    )
+    temporary_path = os.path.join(temporary_dir, doc_meta["source_name"])
+
+    with open(temporary_path, "wb") as temporary_file:
+        temporary_file.write(content_bytes)
+
+    try:
+        os.chmod(temporary_path, 0o600)
+    except OSError:
+        pass
+
+    doc_meta["temporary_dir"] = temporary_dir
+    doc_meta["temporary_file_path"] = temporary_path
+    return temporary_path
+
+
+def cleanup_materialized_bytea(doc_meta: Optional[Dict[str, Any]]) -> None:
+    temporary_dir = str((doc_meta or {}).get("temporary_dir") or "").strip()
+    if not temporary_dir:
+        return
+    try:
+        shutil.rmtree(temporary_dir, ignore_errors=False)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(
+            f"   ⚠️ Impossibile eliminare la directory temporanea "
+            f"{temporary_dir}: {exc}"
+        )
+
+
+def extract_db_document_chunks(
+    file_path: str,
+    log_id: int,
+    doc_meta: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if file_path.lower().endswith(".md"):
+        return extract_markdown_chunks(file_path, log_id)
+    if file_path.lower().endswith(".pdf"):
+        return extract_file_chunks(file_path, log_id, doc_meta)
+    raise ValueError(f"Formato temporaneo non supportato: {file_path}")
+
+
+def _merge_context_lists(
+    existing: List[Dict[str, Any]],
+    incoming: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for context in existing + incoming:
+        if not isinstance(context, dict):
+            continue
+        key = str(context.get("document_context_id") or "").strip()
+        if not key:
+            key = json.dumps(context, sort_keys=True, default=str)
+        merged[key] = _json_safe_value(dict(context))
+    return list(merged.values())
+
+
+def sync_context_only(doc_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Sincronizza nuove ontology senza ripetere OCR, embedding o KG."""
+    set_output_db_tenant_context(doc_meta)
+    document_id = str(doc_meta["document_id"])
+    incoming_contexts = list(doc_meta.get("ontology_contexts") or [])
+
+    conn = pg_get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT chunk_uuid, metadata_json
+                FROM public.document_chunks
+                WHERE status = 'active'
+                  AND scope = %s
+                  AND organization_id IS NOT DISTINCT FROM %s
+                  AND (
+                        metadata_json ->> 'document_id' = %s
+                        OR metadata_json ->> 'doc_id' = %s
+                  )
+                ORDER BY chunk_index
+                """,
+                (
+                    doc_meta["scope"],
+                    doc_meta.get("organization_id"),
+                    document_id,
+                    document_id,
+                ),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                raise RuntimeError(
+                    "CONTEXT_SYNC impossibile: nessun chunk attivo per "
+                    f"document_id={document_id}"
+                )
+
+            first_metadata = rows[0].get("metadata_json") or {}
+            if isinstance(first_metadata, str):
+                first_metadata = json.loads(first_metadata)
+            existing_contexts = list(
+                first_metadata.get("ontology_contexts") or []
+            )
+            merged_contexts = _merge_context_lists(
+                existing_contexts,
+                incoming_contexts,
+            )
+            ontology_codes = list(
+                dict.fromkeys(
+                    str(context.get("ontology_code") or "").strip().lower()
+                    for context in merged_contexts
+                    if str(context.get("ontology_code") or "").strip()
+                )
+            )
+            if not ontology_codes:
+                raise RuntimeError("CONTEXT_SYNC senza ontology valide")
+            context_ids = [
+                str(context.get("document_context_id"))
+                for context in merged_contexts
+                if context.get("document_context_id")
+            ]
+
+            update_rows = []
+            chunk_ids = []
+            for row in rows:
+                metadata = row.get("metadata_json") or {}
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata)
+                metadata["ontology"] = ontology_codes[0]
+                metadata["ontology_codes"] = ontology_codes
+                metadata["document_context_ids"] = context_ids
+                metadata["ontology_contexts"] = merged_contexts
+                update_rows.append(
+                    (
+                        Json(metadata),
+                        row["chunk_uuid"],
+                        doc_meta["scope"],
+                        doc_meta.get("organization_id"),
+                    )
+                )
+                chunk_ids.append(str(row["chunk_uuid"]))
+
+            cur.executemany(
+                """
+                UPDATE public.document_chunks
+                SET metadata_json = %s
+                WHERE chunk_uuid = %s
+                  AND scope = %s
+                  AND organization_id IS NOT DISTINCT FROM %s
+                """,
+                update_rows,
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pg_put_conn(conn)
+
+    qdrant = get_qdrant_client()
+    qdrant.set_payload(
+        collection_name=QDRANT_COLLECTION,
+        payload={
+            "ontology": ontology_codes[0],
+            "ontology_codes": ontology_codes,
+            "document_context_ids": context_ids,
+            "ontology_contexts": merged_contexts,
+        },
+        points=chunk_ids,
+        wait=True,
+    )
+
+    if NEO4J_ENABLED and neo4j_driver:
+        contexts_json = json.dumps(
+            merged_contexts,
+            ensure_ascii=False,
+            default=str,
+        )
+        with neo4j_driver.session() as session:
+            session.run(
+                """
+                MATCH (d:Document {doc_id: $doc_id})
+                SET d.ontology = $ontology,
+                    d.ontology_codes = $ontology_codes,
+                    d.document_context_ids = $context_ids,
+                    d.contexts_json = $contexts_json
+                WITH d
+                OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
+                SET p.ontology = $ontology,
+                    p.ontology_codes = $ontology_codes,
+                    p.document_context_ids = $context_ids,
+                    p.contexts_json = $contexts_json
+                WITH d
+                OPTIONAL MATCH (d)-[:HAS_PAGE]->(:Page)-[:HAS_CHUNK]->(c:Chunk)
+                SET c.ontology = $ontology,
+                    c.ontology_codes = $ontology_codes,
+                    c.document_context_ids = $context_ids,
+                    c.contexts_json = $contexts_json
+                """,
+                doc_id=document_id,
+                ontology=ontology_codes[0],
+                ontology_codes=ontology_codes,
+                context_ids=context_ids,
+                contexts_json=contexts_json,
+            ).consume()
+
+    return {
+        "status": "DONE",
+        "job_type": "CONTEXT_SYNC",
+        "document_id": document_id,
+        "chunks_updated": len(chunk_ids),
+        "ontology_codes": ontology_codes,
+    }
+
+
+def prepare_claimed_job_item(
+    job: Dict[str, Any],
+    heartbeat: JobHeartbeat,
+) -> Dict[str, Any]:
+    started = time.time()
+    doc_meta: Optional[Dict[str, Any]] = None
+    log_id: Optional[int] = None
+
+    try:
+        payload = get_claimed_db_job_payload(job)
+        doc_meta = build_doc_meta_from_payload(payload)
+        set_output_db_tenant_context(doc_meta)
+
+        print(
+            f"   📥 Job {job['job_id']} | type={doc_meta['job_type']} | "
+            f"document={doc_meta['document_id']} | tier={doc_meta['tier']} | "
+            f"org={doc_meta.get('organization_id')} | "
+            f"ontology={doc_meta['ontology_codes']}"
+        )
+
+        if doc_meta["job_type"] == "CONTEXT_SYNC":
+            log_id = pg_start_log(
+                doc_meta["source_name"],
+                "context_sync",
+                doc_meta,
+            )
+            return {
+                "kind": "CONTEXT_SYNC",
+                "job": job,
+                "heartbeat": heartbeat,
+                "doc_meta": doc_meta,
+                "log_id": log_id,
+                "file_path": None,
+                "chunks": None,
+                "started": started,
+            }
+
+        file_path = materialize_claimed_bytea(payload, doc_meta)
+        log_id = pg_start_log(doc_meta["source_name"], "document", doc_meta)
+        chunks = extract_db_document_chunks(file_path, log_id, doc_meta)
+        if not chunks:
+            raise RuntimeError("No chunks extracted")
+
+        return {
+            "kind": "CONTENT_INGESTION",
+            "job": job,
+            "heartbeat": heartbeat,
+            "doc_meta": doc_meta,
+            "log_id": log_id,
+            "file_path": file_path,
+            "chunks": chunks,
+            "started": started,
+        }
+
+    except Exception as exc:
+        if log_id is not None and doc_meta is not None:
+            try:
+                pg_fail_log_if_running(
+                    log_id,
+                    _ms(started),
+                    str(exc)[:500],
+                )
+            except Exception:
+                pass
+        cleanup_materialized_bytea(doc_meta)
+        clear_output_db_tenant_context()
+        raise
+
+
+def consume_claimed_job_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    job = item["job"]
+    heartbeat = item["heartbeat"]
+    doc_meta = item["doc_meta"]
+    log_id = item["log_id"]
+    file_path = item.get("file_path")
+    started = item["started"]
+
+    set_output_db_tenant_context(doc_meta)
+    try:
+        if item["kind"] == "CONTEXT_SYNC":
+            result = sync_context_only(doc_meta)
+            pg_close_log(log_id, "DONE", 0, _ms(started))
+        else:
+            chunks = item["chunks"]
+            print(
+                f"   🧠 Processing: {doc_meta['source_name']} | "
+                f"chunks={len(chunks)}"
+            )
+            result = process_ai_and_db(
+                file_path=file_path,
+                source_type="document",
+                doc_meta=doc_meta,
+                chunks=chunks,
+                log_id=log_id,
+            ) or {}
+
+        complete_db_job(
+            job,
+            external_log_id=log_id,
+            metrics={
+                "processing_time_ms": _ms(started),
+                "chunks": int(
+                    result.get("chunks", result.get("chunks_updated", 0)) or 0
+                ),
+                "ontology_codes": doc_meta.get("ontology_codes", []),
+            },
+            result=result,
+        )
+        heartbeat.stop()
+        print(f"   ✅ Job completato: {job['job_id']}")
+        return result
+
+    except Exception as exc:
+        heartbeat.stop()
+        print(f"   ❌ Job fallito {job.get('job_id')}: {exc}")
+        try:
+            pg_fail_log_if_running(
+                log_id,
+                _ms(started),
+                str(exc)[:500],
+            )
+        except Exception:
+            pass
+        try:
+            next_status = fail_db_job(
+                job,
+                exc,
+                metrics={"processing_time_ms": _ms(started)},
+            )
+            print(f"   ↩️ Stato job dopo errore: {next_status}")
+        except Exception as fail_exc:
+            print(
+                "   ⚠️ Impossibile registrare il fallimento del job: "
+                f"{fail_exc}"
+            )
+        raise
+    finally:
+        cleanup_materialized_bytea(doc_meta)
+        clear_output_db_tenant_context()
+
 
 def main():
     """
-    Producer/Consumer:
-    - Producer: estrae chunk da PDF/MD
-    - Consumer: fa embeddings, KG, Qdrant, Postgres, Neo4j
+    Producer/Consumer alimentato esclusivamente dal Database A:
+    - claim atomico dei job rag_ingestion;
+    - lettura del BYTEA e delle ontology configurate nel DB;
+    - pipeline AI/Qdrant/PostgreSQL/Neo4j invariata;
+    - completamento o fallimento del job nel Database A.
     """
     total_t0 = time.time()
 
     ensure_postgres_security_schema()
     ensure_neo4j_security_schema()
 
+    if not PG_SCHEMA_MIGRATION_ONLY:
+        verify_source_db_contract()
+
     if PG_SCHEMA_MIGRATION_ONLY:
-        print("✅ Bootstrap sicurezza PostgreSQL/Neo4j completato. Nessuna ingestion eseguita.")
+        print(
+            "✅ Bootstrap sicurezza PostgreSQL/Neo4j completato. "
+            "Nessuna ingestion eseguita."
+        )
         return
 
-    USE_PRODUCER_CONSUMER = os.getenv("USE_PRODUCER_CONSUMER", "1") == "1"
-    os.environ["PRODUCER_CONSUMER_MODE"] = "1" if USE_PRODUCER_CONSUMER else "0"
-    
-    #USE_PRODUCER_CONSUMER = os.getenv("USE_PRODUCER_CONSUMER", "1") == "1"
+    use_producer_consumer = (
+        os.getenv("USE_PRODUCER_CONSUMER", "1") == "1"
+    )
+    os.environ["PRODUCER_CONSUMER_MODE"] = (
+        "1" if use_producer_consumer else "0"
+    )
 
-
-
-    # 1. Preparazione cartelle
-    os.makedirs(INBOX_DIR, exist_ok=True)
-    os.makedirs(PROCESSED_DIR, exist_ok=True)
-    os.makedirs(FAILED_DIR, exist_ok=True)
-    ensure_inbox_structure(INBOX_DIR)
-
-
-
-    # 2. Reset Ollama
     if not USE_REMOTE_OLLAMA and OLLAMA_AUTOSTART:
-        if not force_restart_ollama(num_parallel=os.getenv("OLLAMA_NUM_PARALLEL", "1")):
-            print("   ❌ Errore: Impossibile avviare Ollama in modalità ottimizzata.")
-            print("   ⚠️ L'ingestion potrebbe fallire o risultare estremamente lenta.")
+        if not force_restart_ollama(
+            num_parallel=os.getenv("OLLAMA_NUM_PARALLEL", "1")
+        ):
+            print(
+                "   ❌ Errore: impossibile avviare Ollama "
+                "in modalità ottimizzata."
+            )
+            print(
+                "   ⚠️ L'ingestion potrebbe fallire o risultare "
+                "estremamente lenta."
+            )
     else:
         print("   ☁️ Ollama remoto/containerizzato: skip restart locale.")
 
+    print(
+        f"   🔌 Ollama endpoint | base={OLLAMA_BASE_URL} "
+        f"| chat={OLLAMA_API_CHAT} | generate={OLLAMA_API_GENERATE}"
+    )
+
     print("\n" + "=" * 60)
-    print("=== Ingestion Engine v2.5 (Producer/Consumer Edition) ===")
+    print("=== Ingestion Engine v2.5 (Database BYTEA) ===")
+    print(
+        f"=== Source DB: {SOURCE_PG_DB} | "
+        f"Worker: {INGESTION_WORKER_ID} ==="
+    )
     print("=" * 60 + "\n")
 
-    supported = {".pdf", ".md"}
+    claimed_jobs = 0
+    processed_jobs = 0
+    counter_lock = threading.Lock()
 
+    def register_claim() -> None:
+        nonlocal claimed_jobs
+        with counter_lock:
+            claimed_jobs += 1
 
-    # 3. Scansione input
-    input_files = []
-    for root, _, files in os.walk(INBOX_DIR):
-        for fname in files:
-            if fname.lower().endswith(".meta.json"):
-                continue
+    def register_processed() -> None:
+        nonlocal processed_jobs
+        with counter_lock:
+            processed_jobs += 1
 
-            ext = os.path.splitext(fname)[1].lower()
-            if ext in supported:
-                input_files.append((root, os.path.join(root, fname)))
+    def can_claim_more() -> bool:
+        with counter_lock:
+            return (
+                DB_MAX_JOBS_PER_RUN == 0
+                or claimed_jobs < DB_MAX_JOBS_PER_RUN
+            )
 
-    if not input_files:
-        print("   ✅ INBOX vuota: nessuna operazione necessaria.")
-        return
+    def claim_one() -> Optional[Dict[str, Any]]:
+        if not can_claim_more():
+            return None
+        job = claim_next_db_job()
+        if job:
+            register_claim()
+        return job
 
-    print(f"   📂 Trovati {len(input_files)} file. Inizio sequenza PRODUCER/CONSUMER...")
+    if not use_producer_consumer:
+        print(
+            "   🧱 Modalità sequenziale attiva: "
+            "producer/consumer disabilitato."
+        )
+        while can_claim_more():
+            job = claim_one()
+            if not job:
+                break
 
-
-
-    # Modalità sequenziale opzionale:
-    # utile per PDF molto pesanti Vision-heavy, dove producer e consumer
-    # rischiano di stressare Ollama anche con un solo consumer.
-    if not USE_PRODUCER_CONSUMER:
-        print("   🧱 Modalità sequenziale attiva: producer/consumer disabilitato.")
-
-        for root_folder, file_path in input_files:
-            filename = os.path.basename(file_path)
-            log_id = None
-
+            heartbeat = JobHeartbeat(job)
+            heartbeat.start()
+            item = None
             try:
-                doc_meta = dispatch_document(file_path, root_folder)
-                doc_meta["ingestion_run_id"] = str(uuid.uuid4())
-                log_id = pg_start_log(filename, "document", doc_meta)
-
-                print(f"   ⚙️ Extracting: {filename}...")
-
-
-
-
-
-                if file_path.lower().endswith(".md"):
-                    chunks = extract_markdown_chunks(file_path, log_id)
-                else:
-                    chunks = extract_file_chunks(file_path, log_id, doc_meta)
-
-                if not chunks:
-                    pg_close_log(log_id, "FAILED", 0, 0, "No chunks extracted")
-                    shutil.move(file_path, os.path.join(FAILED_DIR, filename))
-                    continue
-
-                print(f"   🧠 Processing: {filename} | chunks={len(chunks)}")
-
-                process_ai_and_db(
-                    file_path=file_path,
-                    source_type="document",
-                    doc_meta=doc_meta,
-                    chunks=chunks,
-                    log_id=log_id
-                )
-
-            except Exception as e:
-                print(f"   ❌ Errore sequenziale su {filename}: {e}")
-
-                if log_id is not None:
+                item = prepare_claimed_job_item(job, heartbeat)
+                consume_claimed_job_item(item)
+            except Exception as exc:
+                if item is None:
+                    heartbeat.stop()
                     try:
-                        pg_close_log(log_id, "FAILED", 0, 0, str(e)[:500])
-                    except Exception:
-                        pass
+                        next_status = fail_db_job(
+                            job,
+                            exc,
+                            metrics={"processing_time_ms": 0},
+                        )
+                        print(
+                            f"   ↩️ Stato job dopo errore iniziale: "
+                            f"{next_status}"
+                        )
+                    except Exception as fail_exc:
+                        print(
+                            "   ⚠️ Impossibile registrare il fallimento "
+                            f"del job: {fail_exc}"
+                        )
+                # consume_claimed_job_item ha già gestito log/job/cleanup.
+            finally:
+                if item is None:
+                    clear_output_db_tenant_context()
+                register_processed()
 
-                try:
-                    move_file_preserving_structure(file_path, FAILED_DIR)
-                except Exception as move_e:
-                    print(f"   ⚠️ Errore spostamento FAILED: {move_e}")
-
+        if processed_jobs == 0:
+            print(
+                "   ✅ Nessun job PENDING disponibile nel Database A."
+            )
         print("\n" + "=" * 60)
-        print(f"   ✨ Ingestion sequenziale completata | total_time={time.time() - total_t0:.2f}s")
+        print(
+            "   ✨ Ingestion DB sequenziale completata | "
+            f"jobs={processed_jobs} | "
+            f"total_time={time.time() - total_t0:.2f}s"
+        )
         print("=" * 60)
         return
 
+    doc_queue = queue.Queue(
+        maxsize=int(os.getenv("DOC_QUEUE_MAXSIZE", "1"))
+    )
+    num_consumers = 1
 
-    # 4. Coda documenti
-    # Con PDF Vision-heavy conviene tenerla a 1:
-    # - meno RAM occupata
-    # - meno pressione su producer
-    # - meno rischio di avere troppi chunk pronti mentre Ollama è occupato
-    doc_queue = queue.Queue(maxsize=int(os.getenv("DOC_QUEUE_MAXSIZE", "1")))
-
-    # 1 consumer perché hai una sola GPU/Ollama seriale.
-    NUM_CONSUMERS = 1
-
-    def consumer_worker():
+    def consumer_worker() -> None:
         while True:
             item = doc_queue.get()
-
             try:
                 if item is None:
                     return
-
-                file_path, source_type, doc_meta, chunks, log_id = item
-                filename = os.path.basename(file_path)
-
                 try:
-                    print(f"   🧠 Consumer Processing: {filename} | chunks={len(chunks)}")
-
-                    process_ai_and_db(
-                        file_path=file_path,
-                        source_type=source_type,
-                        doc_meta=doc_meta,
-                        chunks=chunks,
-                        log_id=log_id
-                    )
-
-                except Exception as e:
-                    print(f"   ❌ Errore Consumer su {filename}: {e}")
-
-                    try:
-                        pg_close_log(log_id, "FAILED", 0, 0, str(e)[:500])
-                    except Exception:
-                        pass
-
-                    try:
-                        if os.path.exists(file_path):
-                            shutil.move(file_path, os.path.join(FAILED_DIR, filename))
-                    except Exception as move_e:
-                        print(f"   ⚠️ Errore spostamento FAILED: {move_e}")
-
+                    consume_claimed_job_item(item)
+                except Exception:
+                    # Errore già registrato dalla funzione di consumo.
+                    pass
+                finally:
+                    register_processed()
             finally:
                 doc_queue.task_done()
 
-    # 5. Avvio consumer
     consumers = []
-    for _ in range(NUM_CONSUMERS):
-        t = threading.Thread(target=consumer_worker, daemon=False)
-        t.start()
-        consumers.append(t)
+    for _ in range(num_consumers):
+        thread = threading.Thread(
+            target=consumer_worker,
+            daemon=False,
+        )
+        thread.start()
+        consumers.append(thread)
 
-    # 6. Producer: estrae i documenti e li mette in coda
-    for root_folder, file_path in input_files:
-        filename = os.path.basename(file_path)
-        log_id = None
+    while can_claim_more():
+        job = claim_one()
+        if not job:
+            break
 
+        heartbeat = JobHeartbeat(job)
+        heartbeat.start()
+        item = None
         try:
-            doc_meta = dispatch_document(file_path, root_folder)
-            doc_meta["ingestion_run_id"] = str(uuid.uuid4())
-            log_id = pg_start_log(filename, "document", doc_meta)
-
-            print(f"   ⚙️ Producer Extracting: {filename}...")
-
-
-            if file_path.lower().endswith(".md"):
-                chunks = extract_markdown_chunks(file_path, log_id)
-            else:
-                chunks = extract_file_chunks(file_path, log_id, doc_meta)
-
-            if not chunks:
-                pg_close_log(log_id, "FAILED", 0, 0, "No chunks extracted")
-
-                try:
-                    shutil.move(file_path, os.path.join(FAILED_DIR, filename))
-                except Exception as move_e:
-                    print(f"   ⚠️ Errore spostamento FAILED: {move_e}")
-
-                continue
-
-            # Se la coda è piena, il producer aspetta.
-            # Logghiamo l'attesa per evitare l'impressione che lo script sia bloccato.
+            item = prepare_claimed_job_item(job, heartbeat)
             while True:
                 try:
-                    doc_queue.put((file_path, "document", doc_meta, chunks, log_id), timeout=30)
+                    doc_queue.put(item, timeout=30)
                     break
                 except queue.Full:
-                    print("   ⏳ Coda piena: attendo il consumer AI/DB...")
+                    print(
+                        "   ⏳ Coda piena: attendo il consumer AI/DB..."
+                    )
+        except Exception as exc:
+            heartbeat.stop()
+            print(
+                f"   ❌ Errore preparazione job {job.get('job_id')}: {exc}"
+            )
+            if item is not None:
+                doc_meta = item.get("doc_meta")
+                log_id = item.get("log_id")
+            else:
+                doc_meta = None
+                log_id = None
 
-        except Exception as e:
-            print(f"   ❌ Errore Producer su {filename}: {e}")
-
-            if log_id is not None:
+            if doc_meta:
                 try:
-                    pg_close_log(log_id, "FAILED", 0, 0, str(e)[:500])
+                    set_output_db_tenant_context(doc_meta)
                 except Exception:
                     pass
-
+            if log_id is not None:
+                try:
+                    pg_fail_log_if_running(
+                        log_id,
+                        0,
+                        str(exc)[:500],
+                    )
+                except Exception:
+                    pass
             try:
-                if os.path.exists(file_path):
-                    shutil.move(file_path, os.path.join(FAILED_DIR, filename))
-            except Exception as move_e:
-                print(f"   ⚠️ Errore spostamento FAILED: {move_e}")
+                next_status = fail_db_job(
+                    job,
+                    exc,
+                    metrics={"processing_time_ms": 0},
+                )
+                print(
+                    f"   ↩️ Stato job dopo errore iniziale: {next_status}"
+                )
+            except Exception as fail_exc:
+                print(
+                    "   ⚠️ Impossibile registrare il fallimento del job: "
+                    f"{fail_exc}"
+                )
+            cleanup_materialized_bytea(doc_meta)
+            clear_output_db_tenant_context()
+            register_processed()
+        else:
+            # Il consumer imposterà il proprio contesto thread-local.
+            clear_output_db_tenant_context()
 
-    # 7. Fine producer: invia poison pill
-    print("   ⏳ Lettura documenti completata. Attesa completamento AI/Database...")
-
-    for _ in range(NUM_CONSUMERS):
+    print(
+        "   ⏳ Claim e lettura BYTEA completati. "
+        "Attesa completamento AI/Database..."
+    )
+    for _ in range(num_consumers):
         doc_queue.put(None)
-
-    # Aspetta anche i poison pill, perché consumer chiama task_done() nel finally
     doc_queue.join()
+    for thread in consumers:
+        thread.join()
 
-    for t in consumers:
-        t.join()
+    if claimed_jobs == 0:
+        print("   ✅ Nessun job PENDING disponibile nel Database A.")
 
-    # 8. Cleanup finale Ollama
     try:
         if PDF_VISION_ENABLED and VISION_MODEL_NAME:
             force_unload_ollama(VISION_MODEL_NAME)
-
         if LLM_MODEL_NAME:
             force_unload_ollama(LLM_MODEL_NAME)
-
     except Exception:
         pass
 
     total_ms = _ms(total_t0)
-
     print("\n" + "=" * 60)
-    print(f"   ✨ Ingestion Producer/Consumer completata con successo | total_time={total_ms/1000:.2f}s")
+    print(
+        "   ✨ Ingestion DB Producer/Consumer completata | "
+        f"jobs={processed_jobs} | total_time={total_ms / 1000:.2f}s"
+    )
     print("=" * 60)
-    
-    
+
+
 if __name__ == "__main__":
     main()

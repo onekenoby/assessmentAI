@@ -1228,5 +1228,75 @@
     "verb": "COLLABORATES_WITH",
     "object": "",
     "qualifier": ""
+  },
+  "APPEARS_TO": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "APPEARS_TO"
+  },
+  "DISTRACTS": {
+    "verb": "THREATENS",
+    "object": "",
+    "qualifier": "DISTRACTS"
+  },
+  "TRAPS": {
+    "verb": "MITIGATES",
+    "object": "",
+    "qualifier": "TRAPS"
+  },
+  "UNDERSTANDS": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": "UNDERSTANDS"
+  },
+  "HAS_ISSUE": {
+    "verb": "HAS_GAP",
+    "object": "",
+    "qualifier": ""
+  },
+  "MONITORED_BY": {
+    "verb": "MONITORS",
+    "object": "",
+    "qualifier": ""
+  },
+  "SENT_BY": {
+    "verb": "SUPPORTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "TRANSFERS_TO": {
+    "verb": "TRANSFER",
+    "object": "",
+    "qualifier": ""
+  },
+  "ATTEMPTS_TO_ACCESS": {
+    "verb": "EXPLOITS",
+    "object": "",
+    "qualifier": ""
+  },
+  "ACQUIRES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "ACCESSIBLE_THROUGH": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "APPROVED_BY": {
+    "verb": "APPROVES",
+    "object": "",
+    "qualifier": ""
+  },
+  "ACQUIRES_FROM": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "ACQUIRES_FROM"
+  },
+  "OFFERS": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
   }
 }
