@@ -1,0 +1,1822 @@
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/README.md ingestion_api/README.md
+--- ingestion_api_original_compare/ingestion_api/README.md	2026-07-23 09:51:51.000000000 +0000
++++ ingestion_api/README.md	2026-07-23 10:15:48.185929081 +0000
+@@ -90,6 +90,29 @@
+ 
+ Il controllo `deep=true` verifica anche Ollama, Qdrant e Neo4j.
+ 
++## Test prima dell'avvio
++
++Installare le dipendenze di sviluppo ed eseguire la suite simulata:
++
++```powershell
++python -m pip install -r requirements-dev.txt
++.\run_tests.ps1
++```
++
++La versione consegnata esegue **76 test simulati** con **98% di copertura**
++sui moduli API, configurazione e orchestrazione. Gli 8 test reali sono
++disabilitati di default.
++
++Prima di avviare Uvicorn è possibile controllare i servizi reali, senza
++reclamare job:
++
++```powershell
++.\run_preflight_real.ps1
++```
++
++Il piano completo, inclusi i test HTTP reali e l'E2E distruttivo esplicitamente
++abilitato, è descritto in [`TESTING.md`](TESTING.md).
++
+ ## Avvio
+ 
+ 1. Creare e attivare il virtual environment.
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/TESTING.md ingestion_api/TESTING.md
+--- ingestion_api_original_compare/ingestion_api/TESTING.md	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/TESTING.md	2026-07-23 10:15:47.653929087 +0000
+@@ -0,0 +1,105 @@
++# Piano di test della Ingestion API
++
++La suite è divisa in livelli, perché i test dell'orchestrazione HTTP non devono
++reclamare job reali né richiedere GPU o database durante il normale sviluppo.
++
++## 1. Test simulati prima dell'avvio
++
++Questi test non aprono connessioni a PostgreSQL, Qdrant, Neo4j o Ollama e non
++importano il motore pesante. Verificano API, configurazione, contratti Pydantic,
++worker seriale, lifecycle, sicurezza, mapping degli errori e contratto statico
++del motore.
++
++PowerShell:
++
++```powershell
++python -m pip install -r requirements-dev.txt
++.\run_tests.ps1
++```
++
++Comando equivalente:
++
++```powershell
++python -m pytest -m "not integration" `
++  --cov=api --cov=core --cov=main --cov-report=term-missing
++```
++
++Esito atteso della versione consegnata:
++
++```text
++76 passed, 8 deselected
++TOTAL coverage: 98%
++```
++
++La copertura riguarda lo strato API e di orchestrazione. Il file monolitico
++`ingestion_engine.py` è verificato staticamente in questa fase e viene provato
++contro i servizi reali nel livello successivo.
++
++## 2. Preflight reale prima dell'avvio dell'API
++
++Questo livello controlla direttamente:
++
++- Database A e firme delle cinque worker function `rag_ingestion`;
++- Database B e tabelle di output;
++- endpoint `/api/tags` di Ollama;
++- connettività Qdrant;
++- connettività Neo4j, quando abilitato.
++
++Non avvia l'API e non reclama job.
++
++```powershell
++.\run_preflight_real.ps1
++```
++
++Le variabili di connessione devono essere già impostate nell'ambiente. Il flag
++`RUN_REAL_SERVICE_TESTS=1` viene impostato dallo script.
++
++## 3. Test HTTP reali dopo l'avvio
++
++Dopo aver avviato l'API su `http://127.0.0.1:8010`:
++
++```powershell
++.\run_api_integration_tests.ps1
++```
++
++Questi test verificano liveness, readiness profonda, request ID e header di
++sicurezza. Non reclamano job.
++
++Per usare un URL diverso:
++
++```powershell
++$env:INGESTION_API_BASE_URL = "http://server:8010"
++```
++
++## 4. E2E con claim reale, solo su ambiente di test
++
++Il test seguente chiama `POST /api/v1/ingestion/runs`, reclama al massimo un job
++`PENDING` e attende la conclusione. Non deve essere eseguito su un Database A di
++produzione o su una coda contenente documenti non predisposti per il test.
++
++```powershell
++$env:RUN_REAL_SERVICE_TESTS = "1"
++$env:RUN_INGESTION_CLAIM_TEST = "1"
++$env:INGESTION_E2E_TIMEOUT_S = "1800"
++python -m pytest tests/integration/test_api_real.py `
++  -m "integration and destructive" -v
++```
++
++Se è configurata l'autenticazione, impostare anche `INGESTION_API_KEY`.
++
++## Aree coperte
++
++La suite simulata include:
++
++- validazione di `max_jobs` e rifiuto di campi tenant/file nel body;
++- API key, request ID e header di sicurezza;
++- risposte 202, 401, 404, 409, 422 e 503;
++- health live/ready e guasti delle dipendenze;
++- serializzazione delle esecuzioni e rifiuto del secondo run concorrente;
++- stati `succeeded`, `partial_failed` e `failed`;
++- occultamento degli errori sensibili;
++- inizializzazione strict/non-strict e shutdown idempotente;
++- limite e ordinamento della cronologia;
++- immutabilità delle snapshot restituite;
++- presenza dell'advisory lock globale e delle worker API protette;
++- assenza di endpoint di upload e di metadati tenant nel contratto HTTP.
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/TEST_SUITE_PATCH.diff ingestion_api/TEST_SUITE_PATCH.diff
+--- ingestion_api_original_compare/ingestion_api/TEST_SUITE_PATCH.diff	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/TEST_SUITE_PATCH.diff	2026-07-23 10:16:10.745928827 +0000
+@@ -0,0 +1,142 @@
++diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/README.md ingestion_api/README.md
++--- ingestion_api_original_compare/ingestion_api/README.md	2026-07-23 09:51:51.000000000 +0000
+++++ ingestion_api/README.md	2026-07-23 10:15:48.185929081 +0000
++@@ -90,6 +90,29 @@
++ 
++ Il controllo `deep=true` verifica anche Ollama, Qdrant e Neo4j.
++ 
+++## Test prima dell'avvio
+++
+++Installare le dipendenze di sviluppo ed eseguire la suite simulata:
+++
+++```powershell
+++python -m pip install -r requirements-dev.txt
+++.\run_tests.ps1
+++```
+++
+++La versione consegnata esegue **76 test simulati** con **98% di copertura**
+++sui moduli API, configurazione e orchestrazione. Gli 8 test reali sono
+++disabilitati di default.
+++
+++Prima di avviare Uvicorn è possibile controllare i servizi reali, senza
+++reclamare job:
+++
+++```powershell
+++.\run_preflight_real.ps1
+++```
+++
+++Il piano completo, inclusi i test HTTP reali e l'E2E distruttivo esplicitamente
+++abilitato, è descritto in [`TESTING.md`](TESTING.md).
+++
++ ## Avvio
++ 
++ 1. Creare e attivare il virtual environment.
++diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/TESTING.md ingestion_api/TESTING.md
++--- ingestion_api_original_compare/ingestion_api/TESTING.md	1970-01-01 00:00:00.000000000 +0000
+++++ ingestion_api/TESTING.md	2026-07-23 10:15:47.653929087 +0000
++@@ -0,0 +1,105 @@
+++# Piano di test della Ingestion API
+++
+++La suite è divisa in livelli, perché i test dell'orchestrazione HTTP non devono
+++reclamare job reali né richiedere GPU o database durante il normale sviluppo.
+++
+++## 1. Test simulati prima dell'avvio
+++
+++Questi test non aprono connessioni a PostgreSQL, Qdrant, Neo4j o Ollama e non
+++importano il motore pesante. Verificano API, configurazione, contratti Pydantic,
+++worker seriale, lifecycle, sicurezza, mapping degli errori e contratto statico
+++del motore.
+++
+++PowerShell:
+++
+++```powershell
+++python -m pip install -r requirements-dev.txt
+++.\run_tests.ps1
+++```
+++
+++Comando equivalente:
+++
+++```powershell
+++python -m pytest -m "not integration" `
+++  --cov=api --cov=core --cov=main --cov-report=term-missing
+++```
+++
+++Esito atteso della versione consegnata:
+++
+++```text
+++76 passed, 8 deselected
+++TOTAL coverage: 98%
+++```
+++
+++La copertura riguarda lo strato API e di orchestrazione. Il file monolitico
+++`ingestion_engine.py` è verificato staticamente in questa fase e viene provato
+++contro i servizi reali nel livello successivo.
+++
+++## 2. Preflight reale prima dell'avvio dell'API
+++
+++Questo livello controlla direttamente:
+++
+++- Database A e firme delle cinque worker function `rag_ingestion`;
+++- Database B e tabelle di output;
+++- endpoint `/api/tags` di Ollama;
+++- connettività Qdrant;
+++- connettività Neo4j, quando abilitato.
+++
+++Non avvia l'API e non reclama job.
+++
+++```powershell
+++.\run_preflight_real.ps1
+++```
+++
+++Le variabili di connessione devono essere già impostate nell'ambiente. Il flag
+++`RUN_REAL_SERVICE_TESTS=1` viene impostato dallo script.
+++
+++## 3. Test HTTP reali dopo l'avvio
+++
+++Dopo aver avviato l'API su `http://127.0.0.1:8010`:
+++
+++```powershell
+++.\run_api_integration_tests.ps1
+++```
+++
+++Questi test verificano liveness, readiness profonda, request ID e header di
+++sicurezza. Non reclamano job.
+++
+++Per usare un URL diverso:
+++
+++```powershell
+++$env:INGESTION_API_BASE_URL = "http://server:8010"
+++```
+++
+++## 4. E2E con claim reale, solo su ambiente di test
+++
+++Il test seguente chiama `POST /api/v1/ingestion/runs`, reclama al massimo un job
+++`PENDING` e attende la conclusione. Non deve essere eseguito su un Database A di
+++produzione o su una coda contenente documenti non predisposti per il test.
+++
+++```powershell
+++$env:RUN_REAL_SERVICE_TESTS = "1"
+++$env:RUN_INGESTION_CLAIM_TEST = "1"
+++$env:INGESTION_E2E_TIMEOUT_S = "1800"
+++python -m pytest tests/integration/test_api_real.py `
+++  -m "integration and destructive" -v
+++```
+++
+++Se è configurata l'autenticazione, impostare anche `INGESTION_API_KEY`.
+++
+++## Aree coperte
+++
+++La suite simulata include:
+++
+++- validazione di `max_jobs` e rifiuto di campi tenant/file nel body;
+++- API key, request ID e header di sicurezza;
+++- risposte 202, 401, 404, 409, 422 e 503;
+++- health live/ready e guasti delle dipendenze;
+++- serializzazione delle esecuzioni e rifiuto del secondo run concorrente;
+++- stati `succeeded`, `partial_failed` e `failed`;
+++- occultamento degli errori sensibili;
+++- inizializzazione strict/non-strict e shutdown idempotente;
+++- limite e ordinamento della cronologia;
+++- immutabilità delle snapshot restituite;
+++- presenza dell'advisory lock globale e delle worker API protette;
+++- assenza di endpoint di upload e di metadati tenant nel contratto HTTP.
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/VALIDATION.md ingestion_api/VALIDATION.md
+--- ingestion_api_original_compare/ingestion_api/VALIDATION.md	2026-07-23 09:53:32.000000000 +0000
++++ ingestion_api/VALIDATION.md	2026-07-23 10:15:48.305929080 +0000
+@@ -2,23 +2,52 @@
+ 
+ Data: 23 luglio 2026
+ 
++## Suite simulata
++
+ Controlli completati:
+ 
+-- compilazione Python di `main.py`, moduli `api`, moduli `core` e
+-  `ingestion_engine.py`;
+-- generazione dello schema OpenAPI;
+-- verifica della presenza degli endpoint previsti;
+-- test del worker seriale e del rifiuto di una seconda esecuzione concorrente;
+-- test della propagazione del risultato del job;
+-- test degli endpoint `POST /api/v1/ingestion/runs` e validazione Pydantic.
++- compilazione Python di `main.py`, moduli `api`, `core` e test;
++- generazione e validazione dello schema OpenAPI;
++- contratto HTTP limitato al solo campo `max_jobs`;
++- endpoint, autenticazione, request ID e header di sicurezza;
++- lifecycle strict/non-strict e shutdown anche su startup fallito;
++- worker seriale e rifiuto di una seconda esecuzione concorrente;
++- mapping degli stati e degli errori del motore;
++- sanitizzazione dei risultati e protezione dei dettagli sensibili;
++- cronologia, snapshot e health check;
++- contratto statico del motore, worker API `rag_ingestion` e advisory lock.
++
++Esito:
++
++```text
++76 passed, 8 deselected
++```
++
++Copertura dello strato API/orchestrazione:
+ 
+-Esito test:
++```text
++TOTAL: 445 statements, 8 missed, 98% coverage
++```
++
++Esecuzione completa con i test reali disabilitati:
+ 
+ ```text
+-4 passed
++76 passed, 8 skipped
+ ```
+ 
+-Non è stato eseguito un test end-to-end contro PostgreSQL, Qdrant, Neo4j,
+-Ollama e il modello embedding reali, perché tali servizi e credenziali non sono
+-disponibili nell'ambiente di generazione. Il controllo reale è esposto da
+-`GET /health/ready?deep=true` e dalla fase di startup/runtime strict.
++## Test reali predisposti
++
++Sono presenti otto test di integrazione, disabilitati per default:
++
++- Database A e firme delle worker function;
++- Database B e tabelle richieste;
++- Ollama;
++- Qdrant;
++- Neo4j;
++- liveness API;
++- readiness profonda;
++- claim ed ingestion di un job, marcato `destructive` e protetto dal flag
++  aggiuntivo `RUN_INGESTION_CLAIM_TEST=1`.
++
++I test reali non sono stati eseguiti nell'ambiente di generazione perché i
++servizi, le credenziali e una coda di test controllata non erano disponibili.
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/core/service.py ingestion_api/core/service.py
+--- ingestion_api_original_compare/ingestion_api/core/service.py	2026-07-23 09:52:54.000000000 +0000
++++ ingestion_api/core/service.py	2026-07-23 10:13:25.513930688 +0000
+@@ -7,6 +7,7 @@
+ from __future__ import annotations
+ 
+ import importlib
++from copy import deepcopy
+ import logging
+ import threading
+ from collections import OrderedDict
+@@ -77,7 +78,7 @@
+             "jobs_failed": self.jobs_failed,
+             "queue_empty": self.queue_empty,
+             "processing_time_ms": self.processing_time_ms,
+-            "jobs": [dict(item) for item in self.jobs],
++            "jobs": [deepcopy(item) for item in self.jobs],
+             "error_code": self.error_code,
+             "error_message": self.error_message,
+         }
+@@ -213,7 +214,7 @@
+             "document_id": str(item.get("document_id") or "") or None,
+             "chunks": max(0, int(item.get("chunks", 0) or 0)),
+             "processing_time_ms": max(0, int(item.get("processing_time_ms", 0) or 0)),
+-            "ontology_codes": [str(v) for v in item.get("ontology_codes", [])],
++            "ontology_codes": [str(v) for v in (item.get("ontology_codes") or [])],
+             "next_status": str(item.get("next_status") or "") or None,
+             "error": None,
+         }
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/main.py ingestion_api/main.py
+--- ingestion_api_original_compare/ingestion_api/main.py	2026-07-23 09:50:34.000000000 +0000
++++ ingestion_api/main.py	2026-07-23 10:14:32.097929938 +0000
+@@ -31,15 +31,20 @@
+ @asynccontextmanager
+ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+     app.state.startup_error = ""
+-    if settings.initialize_on_startup:
+-        try:
+-            await asyncio.to_thread(service.initialize, strict=settings.startup_strict)
+-        except Exception as exc:
+-            app.state.startup_error = f"{type(exc).__name__}: {str(exc)[:1000]}"
+-            logger.exception("Startup ingestion fallito")
+-            if settings.startup_strict:
+-                raise
+     try:
++        if settings.initialize_on_startup:
++            try:
++                await asyncio.to_thread(
++                    service.initialize,
++                    strict=settings.startup_strict,
++                )
++            except Exception as exc:
++                app.state.startup_error = (
++                    f"{type(exc).__name__}: {str(exc)[:1000]}"
++                )
++                logger.exception("Startup ingestion fallito")
++                if settings.startup_strict:
++                    raise
+         yield
+     finally:
+         await asyncio.to_thread(service.close)
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/pytest.ini ingestion_api/pytest.ini
+--- ingestion_api_original_compare/ingestion_api/pytest.ini	2026-07-23 09:50:34.000000000 +0000
++++ ingestion_api/pytest.ini	2026-07-23 10:13:18.953930762 +0000
+@@ -1,4 +1,7 @@
+ [pytest]
+ pythonpath = .
+ testpaths = tests
+-addopts = -q
++addopts = -q --strict-markers
++markers =
++    integration: richiede servizi reali e variabili ambiente configurate
++    destructive: può reclamare ed elaborare un job reale dal Database A
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/requirements-dev.txt ingestion_api/requirements-dev.txt
+--- ingestion_api_original_compare/ingestion_api/requirements-dev.txt	2026-07-23 09:51:51.000000000 +0000
++++ ingestion_api/requirements-dev.txt	2026-07-23 10:13:18.957930762 +0000
+@@ -2,4 +2,5 @@
+ httpx>=0.27,<1.0
+ pytest>=8.0,<10.0
+ pytest-asyncio>=0.24,<2.0
++pytest-cov>=5.0,<8.0
+ ruff>=0.9,<1.0
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/run_api_integration_tests.ps1 ingestion_api/run_api_integration_tests.ps1
+--- ingestion_api_original_compare/ingestion_api/run_api_integration_tests.ps1	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/run_api_integration_tests.ps1	2026-07-23 10:15:47.649929087 +0000
+@@ -0,0 +1,3 @@
++$ErrorActionPreference = "Stop"
++$env:RUN_REAL_SERVICE_TESTS = "1"
++python -m pytest tests/integration/test_api_real.py -m "integration and not destructive" -v
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/run_api_integration_tests.sh ingestion_api/run_api_integration_tests.sh
+--- ingestion_api_original_compare/ingestion_api/run_api_integration_tests.sh	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/run_api_integration_tests.sh	2026-07-23 10:15:47.649929087 +0000
+@@ -0,0 +1,3 @@
++#!/usr/bin/env sh
++set -eu
++RUN_REAL_SERVICE_TESTS=1 python -m pytest tests/integration/test_api_real.py -m "integration and not destructive" -v
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/run_preflight_real.ps1 ingestion_api/run_preflight_real.ps1
+--- ingestion_api_original_compare/ingestion_api/run_preflight_real.ps1	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/run_preflight_real.ps1	2026-07-23 10:15:47.645929088 +0000
+@@ -0,0 +1,3 @@
++$ErrorActionPreference = "Stop"
++$env:RUN_REAL_SERVICE_TESTS = "1"
++python -m pytest tests/integration/test_real_dependencies.py -m integration -v
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/run_preflight_real.sh ingestion_api/run_preflight_real.sh
+--- ingestion_api_original_compare/ingestion_api/run_preflight_real.sh	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/run_preflight_real.sh	2026-07-23 10:15:47.645929088 +0000
+@@ -0,0 +1,3 @@
++#!/usr/bin/env sh
++set -eu
++RUN_REAL_SERVICE_TESTS=1 python -m pytest tests/integration/test_real_dependencies.py -m integration -v
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/run_tests.ps1 ingestion_api/run_tests.ps1
+--- ingestion_api_original_compare/ingestion_api/run_tests.ps1	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/run_tests.ps1	2026-07-23 10:13:18.953930762 +0000
+@@ -0,0 +1,2 @@
++$ErrorActionPreference = "Stop"
++python -m pytest -m "not integration" --cov=api --cov=core --cov=main --cov-report=term-missing
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/run_tests.sh ingestion_api/run_tests.sh
+--- ingestion_api_original_compare/ingestion_api/run_tests.sh	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/run_tests.sh	2026-07-23 10:13:18.953930762 +0000
+@@ -0,0 +1,3 @@
++#!/usr/bin/env sh
++set -eu
++python -m pytest -m "not integration" --cov=api --cov=core --cov=main --cov-report=term-missing
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/conftest.py ingestion_api/tests/conftest.py
+--- ingestion_api_original_compare/ingestion_api/tests/conftest.py	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/tests/conftest.py	2026-07-23 10:13:35.093930580 +0000
+@@ -0,0 +1,130 @@
++from __future__ import annotations
++
++import time
++from datetime import UTC, datetime
++from types import SimpleNamespace
++from typing import Any
++from uuid import UUID, uuid4
++
++import pytest
++from fastapi.testclient import TestClient
++
++import api.routes_ingestion as routes
++import main
++
++
++TERMINAL_STATES = {"succeeded", "partial_failed", "failed"}
++
++
++def wait_for_terminal(service: Any, run_id: UUID, timeout: float = 3.0) -> dict[str, Any]:
++    deadline = time.monotonic() + timeout
++    snapshot = service.get_run(run_id)
++    while snapshot["state"] not in TERMINAL_STATES and time.monotonic() < deadline:
++        time.sleep(0.01)
++        snapshot = service.get_run(run_id)
++    assert snapshot["state"] in TERMINAL_STATES, snapshot
++    return snapshot
++
++
++def sample_record(*, state: str = "queued", run_id: UUID | None = None) -> dict[str, Any]:
++    now = datetime.now(UTC)
++    terminal = state in TERMINAL_STATES
++    return {
++        "run_id": run_id or uuid4(),
++        "state": state,
++        "requested_max_jobs": 1,
++        "created_at": now,
++        "started_at": now if state != "queued" else None,
++        "completed_at": now if terminal else None,
++        "jobs_claimed": 1 if terminal else 0,
++        "jobs_completed": 1 if state == "succeeded" else 0,
++        "jobs_failed": 1 if state in {"partial_failed", "failed"} else 0,
++        "queue_empty": True if terminal else None,
++        "processing_time_ms": 10 if terminal else 0,
++        "jobs": [],
++        "error_code": "ingestion_failed" if state == "failed" else None,
++        "error_message": "errore" if state == "failed" else None,
++    }
++
++
++class RouteServiceStub:
++    def __init__(self) -> None:
++        self.record = sample_record()
++        self.records = [self.record]
++        self.submit_error: Exception | None = None
++        self.get_error: Exception | None = None
++        self.health_snapshot = {
++            "service": "ingestion-api",
++            "state": "ready",
++            "ready": True,
++            "active_run_id": None,
++            "initialized": True,
++            "startup_error": "",
++            "dependencies": {
++                "fake": {"ready": True, "detail": "ok"},
++            },
++            "checked_at": datetime.now(UTC),
++        }
++        self.submitted_max_jobs: list[int] = []
++        self.initialize_calls: list[bool] = []
++        self.closed = False
++
++    def initialize(self, *, strict: bool = False) -> dict[str, Any]:
++        self.initialize_calls.append(strict)
++        return dict(self.health_snapshot)
++
++    def submit(self, *, max_jobs: int) -> dict[str, Any]:
++        self.submitted_max_jobs.append(max_jobs)
++        if self.submit_error:
++            raise self.submit_error
++        return dict(self.record)
++
++    def get_run(self, run_id: UUID) -> dict[str, Any]:
++        if self.get_error:
++            raise self.get_error
++        record = dict(self.record)
++        record["run_id"] = run_id
++        return record
++
++    def list_runs(self) -> list[dict[str, Any]]:
++        return [dict(item) for item in self.records]
++
++    def health(self, *, deep: bool = False) -> dict[str, Any]:
++        snapshot = dict(self.health_snapshot)
++        snapshot["dependencies"] = {
++            key: dict(value)
++            for key, value in self.health_snapshot.get("dependencies", {}).items()
++        }
++        snapshot["checked_at"] = datetime.now(UTC)
++        return snapshot
++
++    def close(self) -> None:
++        self.closed = True
++
++
++@pytest.fixture
++def route_service(monkeypatch: pytest.MonkeyPatch) -> RouteServiceStub:
++    stub = RouteServiceStub()
++    monkeypatch.setattr(routes, "service", stub)
++    monkeypatch.setattr(main, "service", stub)
++    monkeypatch.setattr(
++        main,
++        "settings",
++        SimpleNamespace(initialize_on_startup=False, startup_strict=False),
++    )
++    monkeypatch.setattr(
++        routes,
++        "settings",
++        SimpleNamespace(
++            api_key="",
++            api_key_header="X-Ingestion-Api-Key",
++        ),
++    )
++    return stub
++
++
++@pytest.fixture
++def client(route_service: RouteServiceStub):
++    with TestClient(main.create_app()) as test_client:
++        yield test_client
++    assert route_service.closed is True
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/integration/conftest.py ingestion_api/tests/integration/conftest.py
+--- ingestion_api_original_compare/ingestion_api/tests/integration/conftest.py	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/tests/integration/conftest.py	2026-07-23 10:13:18.945930762 +0000
+@@ -0,0 +1,32 @@
++from __future__ import annotations
++
++import os
++
++import pytest
++
++
++def env_bool(name: str, default: bool = False) -> bool:
++    raw = os.getenv(name)
++    if raw is None:
++        return default
++    return raw.strip().lower() in {"1", "true", "yes", "on"}
++
++
++@pytest.fixture(scope="session", autouse=True)
++def require_real_services_enabled() -> None:
++    if not env_bool("RUN_REAL_SERVICE_TESTS"):
++        pytest.skip(
++            "Test reali disabilitati. Impostare RUN_REAL_SERVICE_TESTS=1 "
++            "solo nell'ambiente di test configurato."
++        )
++
++
++@pytest.fixture(scope="session")
++def api_base_url() -> str:
++    return os.getenv("INGESTION_API_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
++
++
++@pytest.fixture(scope="session")
++def api_headers() -> dict[str, str]:
++    key = os.getenv("INGESTION_API_KEY", "").strip()
++    return {"X-Ingestion-Api-Key": key} if key else {}
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/integration/test_api_real.py ingestion_api/tests/integration/test_api_real.py
+--- ingestion_api_original_compare/ingestion_api/tests/integration/test_api_real.py	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/tests/integration/test_api_real.py	2026-07-23 10:15:47.529929089 +0000
+@@ -0,0 +1,76 @@
++from __future__ import annotations
++
++import os
++import time
++from uuid import UUID, uuid4
++
++import pytest
++import requests
++
++pytestmark = pytest.mark.integration
++
++
++def test_live_endpoint_and_security_headers(api_base_url: str):
++    response = requests.get(
++        api_base_url + "/health/live",
++        headers={"X-Request-ID": str(uuid4())},
++        timeout=15,
++    )
++    response.raise_for_status()
++    payload = response.json()
++    assert payload["service"]
++    assert payload["state"] != "closed"
++    assert response.headers["Cache-Control"] == "no-store"
++    assert response.headers["X-Content-Type-Options"] == "nosniff"
++    assert response.headers["X-Frame-Options"] == "DENY"
++    assert str(UUID(response.headers["X-Request-ID"])) == response.headers["X-Request-ID"]
++
++
++def test_deep_readiness_reports_real_dependencies(api_base_url: str):
++    response = requests.get(api_base_url + "/health/ready", params={"deep": "true"}, timeout=60)
++    assert response.status_code == 200, response.text[:2000]
++    payload = response.json()
++    assert payload["ready"] is True
++    required = {"postgres_source", "postgres_output", "ollama", "qdrant"}
++    assert required.issubset(payload["dependencies"])
++    for name in required:
++        assert payload["dependencies"][name]["ready"] is True
++
++
++@pytest.mark.destructive
++def test_claim_and_ingest_one_job_only_when_explicitly_enabled(
++    api_base_url: str,
++    api_headers: dict[str, str],
++):
++    if os.getenv("RUN_INGESTION_CLAIM_TEST", "0").strip() != "1":
++        pytest.skip(
++            "Test distruttivo disabilitato: impostare RUN_INGESTION_CLAIM_TEST=1 "
++            "solo su Database A di test con un job PENDING predisposto."
++        )
++
++    create = requests.post(
++        api_base_url + "/api/v1/ingestion/runs",
++        headers=api_headers,
++        json={"max_jobs": 1},
++        timeout=30,
++    )
++    assert create.status_code == 202, create.text[:2000]
++    run = create.json()
++    run_id = str(UUID(run["run_id"]))
++
++    deadline = time.monotonic() + int(os.getenv("INGESTION_E2E_TIMEOUT_S", "1800"))
++    final = run
++    while final["state"] in {"queued", "running"} and time.monotonic() < deadline:
++        time.sleep(2)
++        response = requests.get(
++            api_base_url + f"/api/v1/ingestion/runs/{run_id}",
++            headers=api_headers,
++            timeout=30,
++        )
++        response.raise_for_status()
++        final = response.json()
++
++    assert final["state"] in {"succeeded", "partial_failed", "failed"}
++    assert final["completed_at"] is not None
++    assert final["jobs_claimed"] <= 1
++    assert final["state"] == "succeeded", final
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/integration/test_real_dependencies.py ingestion_api/tests/integration/test_real_dependencies.py
+--- ingestion_api_original_compare/ingestion_api/tests/integration/test_real_dependencies.py	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/tests/integration/test_real_dependencies.py	2026-07-23 10:13:18.949930762 +0000
+@@ -0,0 +1,129 @@
++from __future__ import annotations
++
++import os
++
++import pytest
++import requests
++
++pytestmark = pytest.mark.integration
++
++
++def _env(name: str, default: str) -> str:
++    return os.getenv(name, default).strip() or default
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return int(_env(name, str(default)))
++    except ValueError:
++        return default
++
++
++def test_source_postgres_ping_and_worker_contract():
++    import psycopg2
++
++    expected = {
++        "fn_claim_next_ingestion_job": 1,
++        "fn_get_claimed_job_payload": 3,
++        "fn_heartbeat_ingestion_job": 3,
++        "fn_complete_ingestion_job": 6,
++        "fn_fail_ingestion_job": 6,
++    }
++    conn = psycopg2.connect(
++        host=_env("SOURCE_PG_HOST", _env("PG_HOST", "127.0.0.1")),
++        port=_env_int("SOURCE_PG_PORT", _env_int("PG_PORT", 5433)),
++        dbname=_env("SOURCE_PG_DB", "assessment_gestio_tier"),
++        user=_env("SOURCE_PG_USER", _env("PG_USER", "admin")),
++        password=_env("SOURCE_PG_PASS", _env("PG_PASS", "admin_password")),
++        connect_timeout=10,
++        application_name="ingestion-api-integration-contract",
++    )
++    try:
++        with conn.cursor() as cur:
++            cur.execute("SELECT current_database(), current_user")
++            database, user = cur.fetchone()
++            assert database == _env("SOURCE_PG_DB", "assessment_gestio_tier")
++            assert str(user)
++            cur.execute(
++                """
++                SELECT p.proname, p.pronargs
++                FROM pg_catalog.pg_proc p
++                JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
++                WHERE n.nspname = 'rag_ingestion'
++                  AND p.proname = ANY(%s)
++                """,
++                (list(expected),),
++            )
++            found: dict[str, set[int]] = {}
++            for name, count in cur.fetchall():
++                found.setdefault(str(name), set()).add(int(count))
++        for name, count in expected.items():
++            assert count in found.get(name, set()), f"Firma mancante: {name}/{count}"
++    finally:
++        conn.close()
++
++
++def test_output_postgres_ping_and_required_tables():
++    import psycopg2
++
++    conn = psycopg2.connect(
++        host=_env("PG_HOST", "127.0.0.1"),
++        port=_env_int("PG_PORT", 5433),
++        dbname=_env("PG_DB", "assessment_ingestion"),
++        user=_env("PG_USER", "admin"),
++        password=_env("PG_PASS", "admin_password"),
++        connect_timeout=10,
++        application_name="ingestion-api-integration-output",
++    )
++    try:
++        with conn.cursor() as cur:
++            cur.execute(
++                "SELECT to_regclass('public.ingestion_logs'), "
++                "to_regclass('public.document_chunks'), "
++                "to_regclass('public.ingestion_images')"
++            )
++            assert all(value is not None for value in cur.fetchone())
++    finally:
++        conn.close()
++
++
++def test_ollama_is_reachable_and_models_are_listed():
++    base = _env("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
++    response = requests.get(base + "/api/tags", timeout=10)
++    response.raise_for_status()
++    payload = response.json()
++    assert isinstance(payload.get("models"), list)
++
++
++def test_qdrant_is_reachable():
++    from qdrant_client import QdrantClient
++
++    client = QdrantClient(
++        host=_env("QDRANT_HOST", "127.0.0.1"),
++        port=_env_int("QDRANT_PORT", 6334),
++        timeout=20,
++    )
++    try:
++        collections = client.get_collections()
++        assert collections is not None
++    finally:
++        if hasattr(client, "close"):
++            client.close()
++
++
++def test_neo4j_is_reachable_when_enabled():
++    if _env("NEO4J_ENABLED", "1") != "1":
++        pytest.skip("Neo4j disabilitato")
++    from neo4j import GraphDatabase
++
++    driver = GraphDatabase.driver(
++        _env("NEO4J_URI", "bolt://127.0.0.1:7688"),
++        auth=(
++            _env("NEO4J_USER", "neo4j"),
++            _env("NEO4J_PASS", "admin_password"),
++        ),
++    )
++    try:
++        driver.verify_connectivity()
++    finally:
++        driver.close()
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/test_config.py ingestion_api/tests/test_config.py
+--- ingestion_api_original_compare/ingestion_api/tests/test_config.py	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/tests/test_config.py	2026-07-23 10:13:18.941930762 +0000
+@@ -0,0 +1,67 @@
++from __future__ import annotations
++
++import os
++
++import pytest
++
++from core.config import (
++    IngestionApiSettings,
++    _env_bool,
++    _env_int,
++    _env_str,
++    configure_process_environment,
++)
++
++
++@pytest.mark.parametrize("raw", ["1", "true", "YES", "on"])
++def test_env_bool_true_values(monkeypatch, raw: str):
++    monkeypatch.setenv("BOOL_TEST", raw)
++    assert _env_bool("BOOL_TEST", False) is True
++
++
++@pytest.mark.parametrize("raw", ["0", "false", "NO", "off"])
++def test_env_bool_false_values(monkeypatch, raw: str):
++    monkeypatch.setenv("BOOL_TEST", raw)
++    assert _env_bool("BOOL_TEST", True) is False
++
++
++def test_env_bool_rejects_unknown_value(monkeypatch):
++    monkeypatch.setenv("BOOL_TEST", "maybe")
++    with pytest.raises(ValueError, match="deve essere booleano"):
++        _env_bool("BOOL_TEST", False)
++
++
++def test_env_int_and_string(monkeypatch):
++    monkeypatch.setenv("INT_TEST", " 42 ")
++    monkeypatch.setenv("STR_TEST", " value ")
++    assert _env_int("INT_TEST", 0) == 42
++    assert _env_str("STR_TEST", "fallback") == "value"
++
++
++def test_env_int_rejects_non_integer(monkeypatch):
++    monkeypatch.setenv("INT_TEST", "4.2")
++    with pytest.raises(ValueError, match="deve essere un intero"):
++        _env_int("INT_TEST", 0)
++
++
++@pytest.mark.parametrize(
++    ("kwargs", "message"),
++    [
++        ({"api_prefix": "api/v1"}, "deve iniziare con /"),
++        ({"default_max_jobs": 0}, "deve essere > 0"),
++        ({"max_jobs_per_run": 0}, "deve essere > 0"),
++        ({"default_max_jobs": 5, "max_jobs_per_run": 4}, "supera il massimo"),
++        ({"run_history_limit": 0}, "deve essere > 0"),
++    ],
++)
++def test_settings_validation(kwargs, message: str):
++    with pytest.raises(ValueError, match=message):
++        IngestionApiSettings(**kwargs)
++
++
++def test_configure_process_environment_preserves_explicit_values(monkeypatch):
++    monkeypatch.setenv("OMP_NUM_THREADS", "9")
++    monkeypatch.setenv("EMBED_CPU_THREADS", "3")
++    configure_process_environment()
++    assert os.environ["OMP_NUM_THREADS"] == "9"
++    assert os.environ["TOKENIZERS_PARALLELISM"] == "false"
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/test_engine_contract_static.py ingestion_api/tests/test_engine_contract_static.py
+--- ingestion_api_original_compare/ingestion_api/tests/test_engine_contract_static.py	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/tests/test_engine_contract_static.py	2026-07-23 10:13:18.945930762 +0000
+@@ -0,0 +1,76 @@
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++
++
++ENGINE_PATH = Path(__file__).resolve().parents[1] / "ingestion_engine.py"
++ENGINE_SOURCE = ENGINE_PATH.read_text(encoding="utf-8")
++ENGINE_TREE = ast.parse(ENGINE_SOURCE)
++
++
++def _top_level_functions() -> dict[str, ast.FunctionDef]:
++    return {
++        node.name: node
++        for node in ENGINE_TREE.body
++        if isinstance(node, ast.FunctionDef)
++    }
++
++
++def test_engine_exposes_api_runtime_contract():
++    functions = _top_level_functions()
++    expected = {
++        "initialize_ingestion_runtime",
++        "runtime_healthcheck",
++        "run_pending_jobs",
++        "process_next_db_job",
++        "shutdown_ingestion_runtime",
++        "claim_next_db_job",
++        "get_claimed_db_job_payload",
++        "complete_db_job",
++        "fail_db_job",
++    }
++    assert expected.issubset(functions)
++
++
++def test_run_pending_jobs_has_explicit_max_jobs_parameter():
++    node = _top_level_functions()["run_pending_jobs"]
++    assert [arg.arg for arg in node.args.args] == ["max_jobs"]
++    assert len(node.args.defaults) == 1
++    assert isinstance(node.args.defaults[0], ast.Constant)
++    assert node.args.defaults[0].value == 1
++
++
++def test_worker_contract_uses_only_protected_rag_ingestion_functions():
++    required_sql_functions = {
++        "fn_claim_next_ingestion_job",
++        "fn_get_claimed_job_payload",
++        "fn_heartbeat_ingestion_job",
++        "fn_complete_ingestion_job",
++        "fn_fail_ingestion_job",
++    }
++    for function_name in required_sql_functions:
++        assert f"rag_ingestion.{function_name}" in ENGINE_SOURCE
++
++
++def test_global_cross_process_lock_is_present_in_run_loop():
++    node = _top_level_functions()["run_pending_jobs"]
++    source = ast.get_source_segment(ENGINE_SOURCE, node) or ""
++    assert "with ingestion_global_lock()" in source
++    assert "process_next_db_job()" in source
++
++
++def test_engine_does_not_define_http_upload_routes():
++    lowered = ENGINE_SOURCE.lower()
++    assert "uploadfile" not in lowered
++    assert "@app.post" not in lowered
++    assert "@router.post" not in lowered
++
++
++def test_tenant_context_is_derived_from_job_metadata():
++    node = _top_level_functions()["set_output_db_tenant_context"]
++    source = ast.get_source_segment(ENGINE_SOURCE, node) or ""
++    assert "organization_id = meta.get(\"organization_id\")" in source
++    assert "tier = str(meta.get(\"tier\")" in source
++    assert "scope = str(meta.get(\"scope\")" in source
++    assert "expected_tenant_key" in source
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/test_main.py ingestion_api/tests/test_main.py
+--- ingestion_api_original_compare/ingestion_api/tests/test_main.py	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/tests/test_main.py	2026-07-23 10:14:32.205929937 +0000
+@@ -0,0 +1,86 @@
++from __future__ import annotations
++
++from types import SimpleNamespace
++from uuid import UUID, uuid4
++
++import pytest
++from fastapi.testclient import TestClient
++
++import api.routes_ingestion as routes
++import main
++from tests.conftest import RouteServiceStub
++
++
++def test_valid_request_id_helper_preserves_uuid():
++    value = str(uuid4())
++    assert main._valid_request_id(value) == value
++
++
++def test_valid_request_id_helper_replaces_invalid_values():
++    generated = main._valid_request_id("not-a-uuid")
++    assert generated != "not-a-uuid"
++    assert str(UUID(generated)) == generated
++
++
++def test_lifespan_initializes_and_closes_service(monkeypatch):
++    stub = RouteServiceStub()
++    monkeypatch.setattr(main, "service", stub)
++    monkeypatch.setattr(routes, "service", stub)
++    monkeypatch.setattr(
++        main,
++        "settings",
++        SimpleNamespace(initialize_on_startup=True, startup_strict=True),
++    )
++
++    with TestClient(main.create_app()) as client:
++        assert client.get("/health/live").status_code == 200
++
++    assert stub.initialize_calls == [True]
++    assert stub.closed is True
++
++
++def test_non_strict_startup_failure_does_not_abort_app(monkeypatch):
++    class FailingService(RouteServiceStub):
++        def initialize(self, *, strict: bool = False):
++            self.initialize_calls.append(strict)
++            raise RuntimeError("postgres unavailable")
++
++    stub = FailingService()
++    monkeypatch.setattr(main, "service", stub)
++    monkeypatch.setattr(routes, "service", stub)
++    monkeypatch.setattr(
++        main,
++        "settings",
++        SimpleNamespace(initialize_on_startup=True, startup_strict=False),
++    )
++
++    app = main.create_app()
++    with TestClient(app) as client:
++        assert client.get("/health/live").status_code == 200
++        assert "postgres unavailable" in app.state.startup_error
++
++    assert stub.initialize_calls == [False]
++    assert stub.closed is True
++
++
++def test_strict_startup_failure_aborts_and_still_closes_service(monkeypatch):
++    class FailingService(RouteServiceStub):
++        def initialize(self, *, strict: bool = False):
++            self.initialize_calls.append(strict)
++            raise RuntimeError("contract mismatch")
++
++    stub = FailingService()
++    monkeypatch.setattr(main, "service", stub)
++    monkeypatch.setattr(routes, "service", stub)
++    monkeypatch.setattr(
++        main,
++        "settings",
++        SimpleNamespace(initialize_on_startup=True, startup_strict=True),
++    )
++
++    with pytest.raises(RuntimeError, match="contract mismatch"):
++        with TestClient(main.create_app()):
++            pass
++
++    assert stub.initialize_calls == [True]
++    assert stub.closed is True
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/test_routes.py ingestion_api/tests/test_routes.py
+--- ingestion_api_original_compare/ingestion_api/tests/test_routes.py	2026-07-23 09:51:51.000000000 +0000
++++ ingestion_api/tests/test_routes.py	2026-07-23 10:13:18.941930762 +0000
+@@ -1,54 +1,194 @@
+ from __future__ import annotations
+ 
+-from datetime import UTC, datetime
+-from uuid import uuid4
+ from types import SimpleNamespace
++from uuid import UUID, uuid4
+ 
+-from fastapi.testclient import TestClient
++import pytest
+ 
+-import main
+ import api.routes_ingestion as routes
++from core.service import RunNotFoundError, ServiceBusyError, ServiceClosedError
++from tests.conftest import sample_record
+ 
+ 
+-def sample_record():
+-    return {
+-        "run_id": uuid4(),
+-        "state": "queued",
+-        "requested_max_jobs": 1,
+-        "created_at": datetime.now(UTC),
+-        "started_at": None,
+-        "completed_at": None,
+-        "jobs_claimed": 0,
+-        "jobs_completed": 0,
+-        "jobs_failed": 0,
+-        "queue_empty": None,
+-        "processing_time_ms": 0,
+-        "jobs": [],
+-        "error_code": None,
+-        "error_message": None,
+-    }
+-
+-
+-def test_create_run_returns_202(monkeypatch):
+-    record = sample_record()
+-    monkeypatch.setattr(main, "settings", SimpleNamespace(initialize_on_startup=False, startup_strict=False))
+-    monkeypatch.setattr(routes.service, "submit", lambda max_jobs: record)
+-    monkeypatch.setattr(routes.service, "close", lambda: None)
++def test_create_run_returns_202(client, route_service):
++    response = client.post("/api/v1/ingestion/runs", json={"max_jobs": 1})
++
++    assert response.status_code == 202
++    assert response.json()["run_id"] == str(route_service.record["run_id"])
++    assert route_service.submitted_max_jobs == [1]
++    assert str(UUID(response.headers["X-Request-ID"])) == response.headers["X-Request-ID"]
+ 
+-    with TestClient(main.create_app()) as client:
+-        response = client.post("/api/v1/ingestion/runs", json={"max_jobs": 1})
+ 
++def test_create_run_uses_default_max_jobs(client, route_service):
++    response = client.post("/api/v1/ingestion/runs", json={})
+     assert response.status_code == 202
+-    assert response.json()["run_id"] == str(record["run_id"])
+-    assert response.headers["X-Request-ID"]
++    assert route_service.submitted_max_jobs == [1]
+ 
+ 
+-def test_validation_rejects_zero_jobs(monkeypatch):
+-    monkeypatch.setattr(main, "settings", SimpleNamespace(initialize_on_startup=False, startup_strict=False))
+-    monkeypatch.setattr(routes.service, "close", lambda: None)
++@pytest.mark.parametrize("body", [{"max_jobs": 0}, {"max_jobs": 101}, {"max_jobs": 1, "scope": "GLOBAL"}])
++def test_validation_rejects_invalid_body(client, body):
++    response = client.post("/api/v1/ingestion/runs", json=body)
++    assert response.status_code == 422
++    payload = response.json()
++    assert payload["code"] == "validation_error"
++    assert payload["details"]["errors"]
+ 
+-    with TestClient(main.create_app()) as client:
+-        response = client.post("/api/v1/ingestion/runs", json={"max_jobs": 0})
+ 
++def test_validation_rejects_malformed_json(client):
++    response = client.post(
++        "/api/v1/ingestion/runs",
++        content="{",
++        headers={"Content-Type": "application/json"},
++    )
+     assert response.status_code == 422
+     assert response.json()["code"] == "validation_error"
++
++
++def test_busy_service_returns_409(client, route_service):
++    route_service.submit_error = ServiceBusyError("Esecuzione già attiva: abc")
++    response = client.post("/api/v1/ingestion/runs", json={"max_jobs": 1})
++    assert response.status_code == 409
++    assert response.json()["code"] == "service_busy"
++
++
++def test_closed_service_returns_503(client, route_service):
++    route_service.submit_error = ServiceClosedError("closed")
++    response = client.post("/api/v1/ingestion/runs", json={"max_jobs": 1})
++    assert response.status_code == 503
++    assert response.json()["code"] == "service_closed"
++    assert "closed" not in response.json()["message"].lower()
++
++
++def test_get_run_returns_record(client, route_service):
++    run_id = uuid4()
++    response = client.get(f"/api/v1/ingestion/runs/{run_id}")
++    assert response.status_code == 200
++    assert response.json()["run_id"] == str(run_id)
++
++
++def test_get_run_not_found_returns_404(client, route_service):
++    route_service.get_error = RunNotFoundError("missing")
++    response = client.get(f"/api/v1/ingestion/runs/{uuid4()}")
++    assert response.status_code == 404
++    assert response.json()["code"] == "run_not_found"
++
++
++def test_invalid_run_uuid_is_validation_error(client):
++    response = client.get("/api/v1/ingestion/runs/not-a-uuid")
++    assert response.status_code == 422
++    assert response.json()["code"] == "validation_error"
++
++
++def test_list_runs_is_wrapped_in_items(client, route_service):
++    route_service.records = [sample_record(state="succeeded"), sample_record(state="failed")]
++    response = client.get("/api/v1/ingestion/runs")
++    assert response.status_code == 200
++    assert len(response.json()["items"]) == 2
++
++
++def test_api_key_authentication_missing_wrong_and_valid(client, route_service, monkeypatch):
++    monkeypatch.setattr(
++        routes,
++        "settings",
++        SimpleNamespace(api_key="top-secret", api_key_header="X-Ingestion-Api-Key"),
++    )
++
++    missing = client.get("/api/v1/ingestion/runs")
++    wrong = client.get(
++        "/api/v1/ingestion/runs",
++        headers={"X-Ingestion-Api-Key": "wrong"},
++    )
++    valid = client.get(
++        "/api/v1/ingestion/runs",
++        headers={"X-Ingestion-Api-Key": "top-secret"},
++    )
++
++    assert missing.status_code == 401
++    assert wrong.status_code == 401
++    assert valid.status_code == 200
++    assert missing.headers["WWW-Authenticate"] == "ApiKey"
++    assert missing.json()["code"] == "authentication_error"
++
++
++def test_valid_request_id_is_preserved(client):
++    request_id = str(uuid4())
++    response = client.get("/health/live", headers={"X-Request-ID": request_id})
++    assert response.headers["X-Request-ID"] == request_id
++
++
++def test_invalid_request_id_is_replaced(client):
++    response = client.get("/health/live", headers={"X-Request-ID": "invalid"})
++    generated = response.headers["X-Request-ID"]
++    assert generated != "invalid"
++    assert str(UUID(generated)) == generated
++
++
++@pytest.mark.parametrize(
++    "path",
++    [
++        "/health/live",
++        "/health/ready?deep=false",
++        "/api/v1/ingestion/runs",
++    ],
++)
++def test_security_headers_are_always_present(client, path):
++    response = client.get(path)
++    assert response.headers["Cache-Control"] == "no-store"
++    assert response.headers["X-Content-Type-Options"] == "nosniff"
++    assert response.headers["X-Frame-Options"] == "DENY"
++    assert response.headers["Referrer-Policy"] == "no-referrer"
++
++
++def test_live_is_200_even_when_service_not_ready(client, route_service):
++    route_service.health_snapshot.update(
++        {"state": "failed", "ready": False, "initialized": False}
++    )
++    response = client.get("/health/live")
++    assert response.status_code == 200
++    assert response.json()["ready"] is True
++    assert response.json()["state"] == "failed"
++
++
++def test_live_reports_closed_as_not_live(client, route_service):
++    route_service.health_snapshot.update({"state": "closed", "ready": False})
++    response = client.get("/health/live")
++    assert response.status_code == 200
++    assert response.json()["ready"] is False
++
++
++def test_ready_returns_503_when_dependencies_are_not_ready(client, route_service):
++    route_service.health_snapshot.update(
++        {
++            "state": "failed",
++            "ready": False,
++            "dependencies": {
++                "postgres_source": {"ready": False, "detail": "offline"}
++            },
++        }
++    )
++    response = client.get("/health/ready?deep=true")
++    assert response.status_code == 503
++    assert response.json()["dependencies"]["postgres_source"]["ready"] is False
++
++
++def test_ready_returns_200_when_service_ready(client):
++    response = client.get("/health/ready?deep=true")
++    assert response.status_code == 200
++    assert response.json()["ready"] is True
++
++
++def test_openapi_exposes_expected_endpoints_and_safe_request_contract(client):
++    response = client.get("/openapi.json")
++    assert response.status_code == 200
++    schema = response.json()
++    paths = schema["paths"]
++    assert "/api/v1/ingestion/runs" in paths
++    assert "/api/v1/ingestion/runs/{run_id}" in paths
++    assert "/health/live" in paths
++    assert "/health/ready" in paths
++
++    request_schema = schema["components"]["schemas"]["IngestionRunRequest"]
++    assert set(request_schema["properties"]) == {"max_jobs"}
++    serialized = str(request_schema).lower()
++    for forbidden in ("organization_id", "tenant_key", "scope", "tier", "bytea", "file"):
++        assert forbidden not in serialized
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/test_schemas.py ingestion_api/tests/test_schemas.py
+--- ingestion_api_original_compare/ingestion_api/tests/test_schemas.py	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/tests/test_schemas.py	2026-07-23 10:13:18.945930762 +0000
+@@ -0,0 +1,60 @@
++from __future__ import annotations
++
++from datetime import UTC, datetime
++from uuid import uuid4
++
++import pytest
++from pydantic import ValidationError
++
++from api.schemas import HealthResponse, IngestionRunRequest, IngestionRunResponse
++
++
++def test_run_request_forbids_tenant_and_file_fields():
++    for field, value in {
++        "organization_id": 8888,
++        "scope": "ACCOUNT",
++        "tier": "C",
++        "tenant_key": "ORG:8888",
++        "file": "document.pdf",
++    }.items():
++        with pytest.raises(ValidationError):
++            IngestionRunRequest.model_validate({"max_jobs": 1, field: value})
++
++
++def test_run_response_rejects_unknown_state():
++    with pytest.raises(ValidationError):
++        IngestionRunResponse.model_validate(
++            {
++                "run_id": uuid4(),
++                "state": "cancelled",
++                "requested_max_jobs": 1,
++                "created_at": datetime.now(UTC),
++            }
++        )
++
++
++def test_health_response_validates_dependency_contract():
++    model = HealthResponse.model_validate(
++        {
++            "service": "ingestion-api",
++            "state": "ready",
++            "ready": True,
++            "initialized": True,
++            "dependencies": {
++                "postgres_source": {"ready": True, "detail": "ok"}
++            },
++        }
++    )
++    assert model.dependencies["postgres_source"].ready is True
++
++
++def test_models_forbid_extra_output_fields():
++    with pytest.raises(ValidationError):
++        HealthResponse.model_validate(
++            {
++                "service": "ingestion-api",
++                "state": "ready",
++                "ready": True,
++                "secret": "must-not-leak",
++            }
++        )
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/test_service.py ingestion_api/tests/test_service.py
+--- ingestion_api_original_compare/ingestion_api/tests/test_service.py	2026-07-23 09:50:34.000000000 +0000
++++ ingestion_api/tests/test_service.py	2026-07-23 10:13:18.941930762 +0000
+@@ -1,34 +1,36 @@
+ from __future__ import annotations
+ 
+-import time
+ from threading import Event
++from typing import Any
+ 
+ import pytest
+ 
+ from core.config import IngestionApiSettings
+-from core.service import IngestionService, ServiceBusyError
++from core.service import (
++    IngestionService,
++    InternalState,
++    RunNotFoundError,
++    ServiceBusyError,
++    ServiceClosedError,
++)
++from tests.conftest import wait_for_terminal
+ 
+ 
+-class FakeEngine:
+-    def __init__(self) -> None:
+-        self.started = Event()
+-        self.release = Event()
+-        self.closed = False
+-
+-    def initialize_ingestion_runtime(self, *, strict: bool = True):
+-        return {"ready": True}
++class IngestionWorkerBusyError(RuntimeError):
++    pass
+ 
+-    def runtime_healthcheck(self, deep: bool = False):
+-        return {
+-            "ready": True,
+-            "initialized": True,
+-            "dependencies": {"fake": {"ready": True, "detail": "ok"}},
+-        }
+ 
+-    def run_pending_jobs(self, max_jobs: int):
+-        self.started.set()
+-        self.release.wait(timeout=2)
+-        return {
++class FakeEngine:
++    def __init__(
++        self,
++        *,
++        result: dict[str, Any] | None = None,
++        init_error: Exception | None = None,
++        run_error: Exception | None = None,
++        health_error: Exception | None = None,
++        blocking: bool = False,
++    ) -> None:
++        self.result = result or {
+             "status": "DONE",
+             "jobs_claimed": 1,
+             "jobs_completed": 1,
+@@ -47,27 +49,67 @@
+                 }
+             ],
+         }
++        self.init_error = init_error
++        self.run_error = run_error
++        self.health_error = health_error
++        self.blocking = blocking
++        self.started = Event()
++        self.release = Event()
++        self.closed = False
++        self.initialize_calls: list[bool] = []
++        self.run_calls: list[int] = []
++        if not blocking:
++            self.release.set()
++
++    def initialize_ingestion_runtime(self, *, strict: bool = True):
++        self.initialize_calls.append(strict)
++        if self.init_error:
++            raise self.init_error
++        return {"ready": True}
++
++    def runtime_healthcheck(self, deep: bool = False):
++        if self.health_error:
++            raise self.health_error
++        return {
++            "ready": True,
++            "initialized": True,
++            "dependencies": {"fake": {"ready": True, "detail": "ok"}},
++        }
++
++    def run_pending_jobs(self, max_jobs: int):
++        self.run_calls.append(max_jobs)
++        self.started.set()
++        self.release.wait(timeout=3)
++        if self.run_error:
++            raise self.run_error
++        return self.result
+ 
+     def shutdown_ingestion_runtime(self):
+         self.closed = True
+ 
+ 
+-def make_service() -> tuple[IngestionService, FakeEngine]:
++def make_service(
++    engine: FakeEngine | None = None,
++    *,
++    history_limit: int = 20,
++    expose_error_details: bool = False,
++) -> tuple[IngestionService, FakeEngine]:
+     config = IngestionApiSettings(
+         initialize_on_startup=False,
+         startup_strict=False,
+         default_max_jobs=1,
+         max_jobs_per_run=10,
+-        run_history_limit=20,
++        run_history_limit=history_limit,
++        expose_error_details=expose_error_details,
+     )
+     service = IngestionService(config)
+-    engine = FakeEngine()
+-    service._engine = engine
+-    return service, engine
++    resolved_engine = engine or FakeEngine()
++    service._engine = resolved_engine
++    return service, resolved_engine
+ 
+ 
+ def test_submit_is_serialized_and_returns_result():
+-    service, engine = make_service()
++    service, engine = make_service(FakeEngine(blocking=True))
+     try:
+         first = service.submit(max_jobs=1)
+         assert engine.started.wait(timeout=1)
+@@ -76,27 +118,229 @@
+             service.submit(max_jobs=1)
+ 
+         engine.release.set()
+-        deadline = time.time() + 2
+-        current = first
+-        while current["state"] in {"queued", "running"} and time.time() < deadline:
+-            time.sleep(0.01)
+-            current = service.get_run(first["run_id"])
++        current = wait_for_terminal(service, first["run_id"])
+ 
+         assert current["state"] == "succeeded"
+         assert current["jobs_completed"] == 1
+         assert current["jobs"][0]["document_id"] == "doc-1"
++        assert service.active_run_id is None
+     finally:
+         engine.release.set()
+         service.close()
+ 
+ 
+-def test_health_uses_engine_snapshot():
++def test_health_uses_engine_snapshot_and_close_is_idempotent():
+     service, engine = make_service()
++    service.initialize(strict=True)
++    snapshot = service.health(deep=True)
++    assert snapshot["ready"] is True
++    assert snapshot["dependencies"]["fake"]["ready"] is True
++
++    service.close()
++    service.close()
++    assert engine.closed is True
++    assert service.state == InternalState.CLOSED
++
++
++@pytest.mark.parametrize("max_jobs", [0, -1, 11])
++def test_submit_rejects_invalid_limits(max_jobs: int):
++    service, _ = make_service()
+     try:
+-        service.initialize(strict=True)
++        with pytest.raises(ValueError, match="max_jobs fuori intervallo"):
++            service.submit(max_jobs=max_jobs)
++    finally:
++        service.close()
++
++
++def test_initialize_non_strict_records_failure_without_raising():
++    service, _ = make_service(FakeEngine(init_error=RuntimeError("db offline")))
++    try:
++        snapshot = service.initialize(strict=False)
++        assert snapshot["state"] == "failed"
++        assert snapshot["ready"] is False
++        assert "RuntimeError: db offline" in snapshot["startup_error"]
++    finally:
++        service.close()
++
++
++def test_initialize_strict_propagates_and_records_failure():
++    service, _ = make_service(FakeEngine(init_error=RuntimeError("contract mismatch")))
++    try:
++        with pytest.raises(RuntimeError, match="contract mismatch"):
++            service.initialize(strict=True)
++        assert service.state == InternalState.FAILED
++        assert "contract mismatch" in service.health()["startup_error"]
++    finally:
++        service.close()
++
++
++def test_initialize_ready_non_strict_short_circuits_second_initialization():
++    service, engine = make_service()
++    try:
++        service.initialize(strict=False)
++        service.initialize(strict=False)
++        assert engine.initialize_calls == [False]
++    finally:
++        service.close()
++
++
++@pytest.mark.parametrize(
++    ("engine_status", "expected_state", "error_code"),
++    [
++        ("DONE", "succeeded", None),
++        ("PARTIAL_FAILED", "partial_failed", None),
++        ("FAILED", "failed", "ingestion_failed"),
++        ("UNKNOWN", "failed", "ingestion_failed"),
++    ],
++)
++def test_engine_status_mapping(engine_status: str, expected_state: str, error_code: str | None):
++    result = {
++        "status": engine_status,
++        "jobs_claimed": 1,
++        "jobs_completed": 0,
++        "jobs_failed": 1,
++        "queue_empty": False,
++        "jobs": [],
++    }
++    service, _ = make_service(FakeEngine(result=result))
++    try:
++        run = service.submit(max_jobs=1)
++        final = wait_for_terminal(service, run["run_id"])
++        assert final["state"] == expected_state
++        assert final["error_code"] == error_code
++    finally:
++        service.close()
++
++
++def test_worker_busy_exception_is_mapped_to_public_error():
++    service, _ = make_service(FakeEngine(run_error=IngestionWorkerBusyError("lock 123")))
++    try:
++        run = service.submit(max_jobs=1)
++        final = wait_for_terminal(service, run["run_id"])
++        assert final["state"] == "failed"
++        assert final["error_code"] == "worker_busy"
++        assert final["error_message"] == (
++            "Un altro worker sta già eseguendo la pipeline di ingestion."
++        )
++        assert "lock 123" not in final["error_message"]
++    finally:
++        service.close()
++
++
++def test_runtime_exception_details_are_hidden_by_default():
++    service, _ = make_service(FakeEngine(run_error=RuntimeError("password=secret")))
++    try:
++        run = service.submit(max_jobs=1)
++        final = wait_for_terminal(service, run["run_id"])
++        assert final["error_code"] == "runtime_error"
++        assert final["error_message"] == (
++            "Esecuzione non completata; consultare i log applicativi."
++        )
++        assert "secret" not in final["error_message"]
++    finally:
++        service.close()
++
++
++def test_runtime_exception_details_can_be_exposed_explicitly():
++    service, _ = make_service(
++        FakeEngine(run_error=RuntimeError("diagnostic")),
++        expose_error_details=True,
++    )
++    try:
++        run = service.submit(max_jobs=1)
++        final = wait_for_terminal(service, run["run_id"])
++        assert final["error_message"] == "RuntimeError: diagnostic"
++    finally:
++        service.close()
++
++
++def test_job_result_is_sanitized_and_negative_counts_are_clamped():
++    result = {
++        "status": "PARTIAL_FAILED",
++        "jobs_claimed": 1,
++        "jobs_completed": 0,
++        "jobs_failed": 1,
++        "jobs": [
++            {
++                "job_id": 123,
++                "status": "FAILED",
++                "chunks": -5,
++                "processing_time_ms": -9,
++                "ontology_codes": None,
++                "error": "sensitive stack trace",
++            }
++        ],
++    }
++    service, _ = make_service(FakeEngine(result=result))
++    try:
++        run = service.submit(max_jobs=1)
++        final = wait_for_terminal(service, run["run_id"])
++        job = final["jobs"][0]
++        assert job["job_id"] == "123"
++        assert job["chunks"] == 0
++        assert job["processing_time_ms"] == 0
++        assert job["ontology_codes"] == []
++        assert job["error"] == "Elaborazione job fallita; consultare i log applicativi."
++    finally:
++        service.close()
++
++
++def test_get_unknown_run_raises_not_found():
++    service, _ = make_service()
++    try:
++        from uuid import uuid4
++
++        with pytest.raises(RunNotFoundError):
++            service.get_run(uuid4())
++    finally:
++        service.close()
++
++
++def test_history_is_reverse_chronological_and_trimmed():
++    service, _ = make_service(history_limit=2)
++    try:
++        ids = []
++        for _ in range(3):
++            run = service.submit(max_jobs=1)
++            ids.append(run["run_id"])
++            wait_for_terminal(service, run["run_id"])
++
++        listed = service.list_runs()
++        assert [item["run_id"] for item in listed] == [ids[2], ids[1]]
++        with pytest.raises(RunNotFoundError):
++            service.get_run(ids[0])
++    finally:
++        service.close()
++
++
++def test_snapshots_do_not_expose_mutable_internal_job_data():
++    service, _ = make_service()
++    try:
++        run = service.submit(max_jobs=1)
++        final = wait_for_terminal(service, run["run_id"])
++        final["jobs"][0]["ontology_codes"].append("tampered")
++        again = service.get_run(run["run_id"])
++        assert again["jobs"][0]["ontology_codes"] == ["iso27001"]
++    finally:
++        service.close()
++
++
++def test_health_reports_runtime_healthcheck_exception():
++    service, _ = make_service(FakeEngine(health_error=RuntimeError("ping failed")))
++    try:
++        service._state = InternalState.READY
+         snapshot = service.health(deep=True)
+-        assert snapshot["ready"] is True
+-        assert snapshot["dependencies"]["fake"]["ready"] is True
++        assert snapshot["ready"] is False
++        assert snapshot["dependencies"]["runtime"]["ready"] is False
++        assert "ping failed" in snapshot["dependencies"]["runtime"]["detail"]
+     finally:
+         service.close()
+-        assert engine.closed is True
++
++
++def test_closed_service_rejects_initialize_and_submit():
++    service, _ = make_service()
++    service.close()
++    with pytest.raises(ServiceClosedError):
++        service.initialize(strict=False)
++    with pytest.raises(ServiceClosedError):
++        service.submit(max_jobs=1)
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/verify_real_services.py ingestion_api/tests/verify_real_services.py
+--- ingestion_api_original_compare/ingestion_api/tests/verify_real_services.py	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/tests/verify_real_services.py	2026-07-23 10:13:18.949930762 +0000
+@@ -0,0 +1,16 @@
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++
++
++if os.getenv("RUN_REAL_SERVICE_TESTS", "0").strip().lower() not in {"1", "true", "yes", "on"}:
++    print("Impostare RUN_REAL_SERVICE_TESTS=1 per abilitare i test reali.")
++    raise SystemExit(2)
++
++raise SystemExit(
++    subprocess.call(
++        [sys.executable, "-m", "pytest", "tests/integration", "-m", "integration", "-v"]
++    )
++)
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=.coverage' ingestion_api_original_compare/ingestion_api/tests/verify_simulated.py ingestion_api/tests/verify_simulated.py
+--- ingestion_api_original_compare/ingestion_api/tests/verify_simulated.py	1970-01-01 00:00:00.000000000 +0000
++++ ingestion_api/tests/verify_simulated.py	2026-07-23 10:13:18.949930762 +0000
+@@ -0,0 +1,21 @@
++from __future__ import annotations
++
++import subprocess
++import sys
++
++
++raise SystemExit(
++    subprocess.call(
++        [
++            sys.executable,
++            "-m",
++            "pytest",
++            "-m",
++            "not integration",
++            "--cov=api",
++            "--cov=core",
++            "--cov=main",
++            "--cov-report=term-missing",
++        ]
++    )
++)

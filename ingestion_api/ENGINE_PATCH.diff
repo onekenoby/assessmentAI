@@ -1,0 +1,340 @@
+--- /mnt/data/ingestion_DB_BYTEA_MULTI_TENANT_ORIGINAL_FILENAME.py	2026-07-23 09:43:10.257951126 +0000
++++ /mnt/data/ingestion_api/ingestion_engine.py	2026-07-23 09:52:54.301944550 +0000
+@@ -56,6 +56,7 @@
+ import hashlib
+ import base64
+ from typing import List, Dict, Tuple, Optional, Any, Union
++from contextlib import contextmanager
+ from concurrent.futures import ThreadPoolExecutor, as_completed
+ import concurrent.futures as cf
+ import subprocess
+@@ -461,7 +462,7 @@
+     or "15 minutes"
+ )
+ 
+-DB_MAX_JOBS_PER_RUN = os.getenv("DB_MAX_JOBS_PER_RUN", 100)
++DB_MAX_JOBS_PER_RUN = max(0, int(os.getenv("DB_MAX_JOBS_PER_RUN", "100")))
+ 
+ 
+ #DB_MAX_JOBS_PER_RUN = max(
+@@ -524,7 +525,7 @@
+ # Embeddings
+ #EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
+ 
+-EMBEDDING_MODEL_NAME = "E:/Modelli/bge-m3"
++EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "E:/Modelli/bge-m3")
+ 
+ #EMBEDDING_MODEL_NAME = os.getenv(
+ #    "EMBEDDING_MODEL_NAME",
+@@ -6577,6 +6578,18 @@
+ # =========================
+ # Database A / rag_ingestion job helpers
+ # =========================
++class IngestionWorkerBusyError(RuntimeError):
++    """Un altro processo API possiede già il lock globale di ingestion."""
++
++
++INGESTION_GLOBAL_LOCK_KEY = int(
++    os.getenv("INGESTION_GLOBAL_LOCK_KEY", "731904271")
++)
++_RUNTIME_INIT_LOCK = Lock()
++_RUNTIME_INITIALIZED = False
++_RUNTIME_CLOSED = False
++
++
+ def source_pg_get_conn():
+     return source_pg_pool.getconn()
+ 
+@@ -7423,6 +7436,292 @@
+         clear_output_db_tenant_context()
+ 
+ 
++
++@contextmanager
++def ingestion_global_lock():
++    """Serializza l'uso della GPU anche tra processi/istanze API diverse."""
++    conn = source_pg_get_conn()
++    acquired = False
++    try:
++        with conn.cursor() as cur:
++            cur.execute(
++                "SELECT pg_try_advisory_lock(%s)",
++                (INGESTION_GLOBAL_LOCK_KEY,),
++            )
++            row = cur.fetchone()
++            acquired = bool(row and row[0])
++        conn.commit()
++
++        if not acquired:
++            raise IngestionWorkerBusyError(
++                "Un altro worker possiede già il lock globale di ingestion"
++            )
++        yield
++    finally:
++        if acquired:
++            try:
++                with conn.cursor() as cur:
++                    cur.execute(
++                        "SELECT pg_advisory_unlock(%s)",
++                        (INGESTION_GLOBAL_LOCK_KEY,),
++                    )
++                conn.commit()
++            except Exception:
++                try:
++                    conn.rollback()
++                except Exception:
++                    pass
++        source_pg_put_conn(conn)
++
++
++def runtime_healthcheck(deep: bool = False) -> Dict[str, Any]:
++    """Restituisce uno snapshot privo di segreti delle dipendenze runtime."""
++    dependencies: Dict[str, Dict[str, Any]] = {}
++
++    def _record(name: str, check) -> None:
++        try:
++            check()
++        except Exception as exc:
++            dependencies[name] = {
++                "ready": False,
++                "detail": f"{type(exc).__name__}: {str(exc)[:300]}",
++            }
++        else:
++            dependencies[name] = {"ready": True, "detail": "ok"}
++
++    def _check_source_pg() -> None:
++        conn = source_pg_get_conn()
++        try:
++            with conn.cursor() as cur:
++                cur.execute("SELECT 1")
++                cur.fetchone()
++            conn.commit()
++        finally:
++            source_pg_put_conn(conn)
++
++    def _check_output_pg() -> None:
++        conn = pg_pool.getconn()
++        try:
++            with conn.cursor() as cur:
++                cur.execute("SELECT 1")
++                cur.fetchone()
++            conn.commit()
++        finally:
++            pg_pool.putconn(conn)
++
++    _record("postgres_source", _check_source_pg)
++    _record("postgres_output", _check_output_pg)
++
++    if deep:
++        def _check_ollama() -> None:
++            response = requests.get(OLLAMA_API_TAGS, timeout=5)
++            response.raise_for_status()
++
++        def _check_qdrant() -> None:
++            get_qdrant_client().get_collections()
++
++        _record("ollama", _check_ollama)
++        _record("qdrant", _check_qdrant)
++
++        if NEO4J_ENABLED:
++            _record("neo4j", lambda: neo4j_driver.verify_connectivity())
++        else:
++            dependencies["neo4j"] = {
++                "ready": True,
++                "detail": "disabled",
++            }
++
++    ready = all(item["ready"] for item in dependencies.values())
++    return {
++        "ready": ready,
++        "initialized": _RUNTIME_INITIALIZED,
++        "worker_id": INGESTION_WORKER_ID,
++        "source_database": SOURCE_PG_DB,
++        "output_database": PG_DB,
++        "qdrant_collection": QDRANT_COLLECTION,
++        "dependencies": dependencies,
++    }
++
++
++def initialize_ingestion_runtime(*, strict: bool = True) -> Dict[str, Any]:
++    """Inizializza una sola volta il runtime usato dalla API."""
++    global _RUNTIME_INITIALIZED, _RUNTIME_CLOSED
++
++    with _RUNTIME_INIT_LOCK:
++        if _RUNTIME_CLOSED:
++            raise RuntimeError("Runtime ingestion già chiuso")
++        if _RUNTIME_INITIALIZED:
++            snapshot = runtime_healthcheck(deep=strict)
++            if strict and not snapshot["ready"]:
++                failed = [
++                    name
++                    for name, item in snapshot["dependencies"].items()
++                    if not item.get("ready")
++                ]
++                raise RuntimeError(
++                    "Dipendenze ingestion non pronte: " + ", ".join(failed)
++                )
++            return snapshot
++
++        ensure_postgres_security_schema()
++        ensure_neo4j_security_schema()
++        if not PG_SCHEMA_MIGRATION_ONLY:
++            verify_source_db_contract()
++
++        if PG_SCHEMA_MIGRATION_ONLY:
++            _RUNTIME_INITIALIZED = True
++            return runtime_healthcheck(deep=False)
++
++        if not USE_REMOTE_OLLAMA and OLLAMA_AUTOSTART:
++            if os.name == "nt":
++                started = force_restart_ollama(
++                    num_parallel=os.getenv("OLLAMA_NUM_PARALLEL", "1")
++                )
++                if strict and not started:
++                    raise RuntimeError("Impossibile avviare Ollama")
++            else:
++                ensure_ollama_parallel(
++                    os.getenv("OLLAMA_NUM_PARALLEL", "1")
++                )
++
++        snapshot = runtime_healthcheck(deep=strict)
++        if strict and not snapshot["ready"]:
++            failed = [
++                name
++                for name, item in snapshot["dependencies"].items()
++                if not item.get("ready")
++            ]
++            raise RuntimeError(
++                "Dipendenze ingestion non pronte: " + ", ".join(failed)
++            )
++
++        _RUNTIME_INITIALIZED = True
++        return runtime_healthcheck(deep=False)
++
++
++def process_next_db_job() -> Dict[str, Any]:
++    """Claim ed elaborazione completa di un solo job Database A."""
++    job = claim_next_db_job()
++    if not job:
++        return {"status": "EMPTY", "job_id": None}
++
++    heartbeat = JobHeartbeat(job)
++    heartbeat.start()
++    item: Optional[Dict[str, Any]] = None
++    started = time.time()
++
++    try:
++        item = prepare_claimed_job_item(job, heartbeat)
++        result = consume_claimed_job_item(item) or {}
++        return {
++            "status": "DONE",
++            "job_id": str(job.get("job_id") or ""),
++            "job_type": str((item.get("doc_meta") or {}).get("job_type") or ""),
++            "document_id": str(result.get("document_id") or ""),
++            "chunks": int(result.get("chunks", result.get("chunks_updated", 0)) or 0),
++            "processing_time_ms": int(result.get("processing_time_ms", _ms(started)) or 0),
++            "ontology_codes": list(result.get("ontology_codes") or []),
++        }
++    except Exception as exc:
++        if item is None:
++            heartbeat.stop()
++            try:
++                next_status = fail_db_job(
++                    job,
++                    exc,
++                    metrics={"processing_time_ms": _ms(started)},
++                )
++            except Exception:
++                next_status = None
++            clear_output_db_tenant_context()
++        else:
++            next_status = None
++
++        return {
++            "status": "FAILED",
++            "job_id": str(job.get("job_id") or ""),
++            "next_status": next_status,
++            "processing_time_ms": _ms(started),
++            "error": f"{type(exc).__name__}: {str(exc)[:1000]}",
++        }
++
++
++def run_pending_jobs(max_jobs: int = 1) -> Dict[str, Any]:
++    """Elabora fino a ``max_jobs`` job, in modo seriale e tenant-safe."""
++    if isinstance(max_jobs, bool) or int(max_jobs) <= 0:
++        raise ValueError("max_jobs deve essere maggiore di zero")
++
++    max_jobs = int(max_jobs)
++    if PG_SCHEMA_MIGRATION_ONLY:
++        raise RuntimeError(
++            "PG_SCHEMA_MIGRATION_ONLY=1: la API non può eseguire job di ingestion"
++        )
++    started = time.time()
++    initialize_ingestion_runtime(strict=True)
++    os.environ["PRODUCER_CONSUMER_MODE"] = "1"
++
++    results: List[Dict[str, Any]] = []
++    with ingestion_global_lock():
++        for _ in range(max_jobs):
++            result = process_next_db_job()
++            if result.get("status") == "EMPTY":
++                break
++            results.append(result)
++
++    try:
++        if PDF_VISION_ENABLED and VISION_MODEL_NAME:
++            force_unload_ollama(VISION_MODEL_NAME)
++        if LLM_MODEL_NAME:
++            force_unload_ollama(LLM_MODEL_NAME)
++    except Exception:
++        pass
++
++    failed = sum(1 for item in results if item.get("status") == "FAILED")
++    done = sum(1 for item in results if item.get("status") == "DONE")
++    status = "DONE" if failed == 0 else ("PARTIAL_FAILED" if done else "FAILED")
++
++    return {
++        "status": status,
++        "jobs_claimed": len(results),
++        "jobs_completed": done,
++        "jobs_failed": failed,
++        "queue_empty": len(results) < max_jobs,
++        "processing_time_ms": _ms(started),
++        "jobs": results,
++    }
++
++
++def shutdown_ingestion_runtime() -> None:
++    """Chiude in modo idempotente pool e client posseduti dal modulo."""
++    global _RUNTIME_CLOSED, _RUNTIME_INITIALIZED, qdrant_client
++
++    with _RUNTIME_INIT_LOCK:
++        if _RUNTIME_CLOSED:
++            return
++        _RUNTIME_CLOSED = True
++
++        try:
++            if qdrant_client is not None and hasattr(qdrant_client, "close"):
++                qdrant_client.close()
++        except Exception:
++            pass
++        try:
++            if neo4j_driver is not None:
++                neo4j_driver.close()
++        except Exception:
++            pass
++        try:
++            pg_pool.closeall()
++        except Exception:
++            pass
++        try:
++            source_pg_pool.closeall()
++        except Exception:
++            pass
++
++        _RUNTIME_INITIALIZED = False
++
++
+ def main():
+     """
+     Producer/Consumer alimentato esclusivamente dal Database A:
