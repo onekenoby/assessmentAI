@@ -904,7 +904,11 @@ Return ONLY valid JSON (no markdown), EXACT schema:
 
   "what_is_visible_it": "Descrizione in ITALIANO della struttura visuale: matrice rischi, tabella controlli, dashboard KPI, diagramma di rete, flusso di processo, screenshot di evidenza, ecc.",
   
-  "analysis_it": "Sintesi professionale in 3 frasi in ITALIANO. Concentrati su severità del rischio, efficacia dei controlli, gap di conformità, finding aperti/chiusi, asset coinvolti, trend incidenti/vulnerabilità e priorità di remediation.",
+  "analysis_it": "Descrizione professionale e fattuale in ITALIANO del contenuto visuale. "
+               "Se kind=process_flow, descrivi esclusivamente fasi, attività, decisioni, rami, frecce e sequenza del processo. "
+               "Se kind=network_diagram, descrivi esclusivamente nodi, componenti e collegamenti visibili. "
+               "Se kind è un grafico, una matrice, una tabella o una dashboard, descrivi valori, categorie, stati e trend realmente visibili. "
+               "Non inferire rischi, conformità, responsabilità o conclusioni non esplicitamente rappresentate nell'immagine.",
   
   "data_table_md": "| Category | Metric | Value | Status |\n|---|---:|---:|---|\n| Access Control | MFA Coverage | 78% | Partial |\n| Vulnerability Management | Critical Open Findings | 12 | High Risk |",
 
@@ -1501,16 +1505,25 @@ def extract_markdown_chunks(
                         
                         CHART_MIN_CONF = float(os.getenv("CHART_MIN_CONF", "0.55"))
                         c_js = extract_chart_via_vision(img_bytes)
-                        
-                        conf = float((c_js or {}).get("confidence") or 0.0)
+                                              
+                        if is_valid_visual_semantics(c_js):
 
-                        if c_js and c_js.get("kind") != "other" and conf >= CHART_MIN_CONF:
-                            # Salviamo i dati per iniettarli nel primo sub-chunk
+                            visual_semantic = (
+                                c_js.get("semantic_description")
+                                or build_chart_semantic_chunk(1, c_js)
+                            )
+
                             vision_metadata = {
-                                "chart_semantic": build_chart_semantic_chunk(1, c_js),
-                                "metadata_override": c_js
+                                "visual_semantic": visual_semantic,
+                                "metadata_override": c_js,
+                                "visual_toon_type": visual_toon_type(c_js),
                             }
-                            print(f"   📝 Analisi Semantica Chart (conf={conf:.2f})")
+
+                            print(
+                                f"   📝 Analisi Semantica Visual | "
+                                f"kind={c_js.get('kind')}"
+                            )
+                                                    
                         else:
                             # Salvataggio Postgres (Asset Management)
                             conn = pg_get_conn()
@@ -1533,9 +1546,18 @@ def extract_markdown_chunks(
                 current_text_sem = f"Doc: {filename} | Sezione: {txt[:60]}...\n{txt}"
                 current_meta = {}
 
+
                 if sub_i == 0 and vision_metadata:
-                    current_text_sem = vision_metadata["chart_semantic"] + "\n\n" + current_text_sem
-                    current_meta = vision_metadata.get("metadata_override", {})
+                    current_text_sem = (
+                        vision_metadata["visual_semantic"]
+                        + "\n\n"
+                        + current_text_sem
+                    )
+
+                    current_meta = vision_metadata.get(
+                        "metadata_override",
+                        {}
+                    )
 
                 synthetic_page_no = idx + 1
 
@@ -1543,7 +1565,14 @@ def extract_markdown_chunks(
                     "text_raw": txt,
                     "text_sem": current_text_sem,
                     "page_no": synthetic_page_no,
-                    "toon_type": "text" if not (sub_i == 0 and vision_metadata) else "chart_analysis",
+                    "toon_type": (
+                        "text"
+                        if not (sub_i == 0 and vision_metadata)
+                        else vision_metadata.get(
+                            "visual_toon_type",
+                            "image",
+                        )
+                    ),
                     "section_hint": txt[:80] if txt.startswith("#") else f"section_{synthetic_page_no}_part_{sub_i+1}",
                     "metadata": {
                         **current_meta,
@@ -4786,244 +4815,254 @@ def normalize_chart_json_for_semantics(js: Dict[str, Any], page_no: int, context
     return out
 
 
-def extract_chart_via_vision(img_bytes: bytes, context_hint: str = "") -> Optional[Dict[str, Any]]:
+SUPPORTED_VISUAL_KINDS = {
+    "line_chart",
+    "bar_chart",
+    "pie",
+    "table",
+    "heatmap",
+    "risk_matrix",
+    "control_matrix",
+    "network_diagram",
+    "process_flow",
+    "dashboard",
+    "screenshot",
+    "other",
+}
+
+
+def is_valid_visual_semantics(js: Optional[Dict[str, Any]]) -> bool:
     """
-    FIX 3 (definitivo):
-    - prepara immagine in PNG (testo più nitido)
-    - OCR su immagine migliore
-    - 2-pass retry se data_points sono pochi / NOT_READABLE
-    - sceglie automaticamente l'output "migliore" (più categorie, meno NOT_READABLE)
+    Validazione deterministica dell'output Vision.
+
+    Non usa confidence dinamiche.
+    Non usa scoring adattativo.
+    Non dipende dal numero di data_points.
+
+    Un asset è considerato semanticamente interpretato quando:
+    - il JSON è valido;
+    - il kind appartiene allo schema previsto;
+    - esiste almeno un contenuto semantico reale.
     """
+    if not isinstance(js, dict):
+        return False
+
+    kind = str(js.get("kind") or "").strip().lower()
+
+    if kind not in SUPPORTED_VISUAL_KINDS:
+        return False
+
+    semantic_text_fields = (
+        js.get("what_is_visible_it"),
+        js.get("analysis_it"),
+        js.get("data_table_md"),
+    )
+
+    has_semantic_text = any(
+        str(value or "").strip()
+        for value in semantic_text_fields
+    )
+
+    observations = js.get("observations_it") or []
+    has_observations = (
+        isinstance(observations, list)
+        and any(str(value or "").strip() for value in observations)
+    )
+
+    trends = js.get("visual_trends_it") or []
+    has_trends = (
+        isinstance(trends, list)
+        and any(str(value or "").strip() for value in trends)
+    )
+
+    numbers = js.get("numbers") or []
+    has_numbers = (
+        isinstance(numbers, list)
+        and any(isinstance(value, dict) for value in numbers)
+    )
+
+    data_points = js.get("data_points") or []
+    has_data_points = (
+        isinstance(data_points, list)
+        and any(isinstance(value, dict) for value in data_points)
+    )
+
+    return (
+        has_semantic_text
+        or has_observations
+        or has_trends
+        or has_numbers
+        or has_data_points
+    )
+
+
+def visual_toon_type(js: Optional[Dict[str, Any]]) -> str:
+    """
+    Mapping fisso e deterministico tra kind Vision e toon_type.
+    """
+    kind = str((js or {}).get("kind") or "").strip().lower()
+
+    if kind == "table":
+        return "table"
+
+    if kind in {
+        "line_chart",
+        "bar_chart",
+        "pie",
+        "heatmap",
+        "risk_matrix",
+        "control_matrix",
+        "dashboard",
+    }:
+        return "chart"
+
+    return "image"
+
+
+def extract_chart_via_vision(
+    img_bytes: bytes,
+    context_hint: str = ""
+) -> Optional[Dict[str, Any]]:
+    """
+    Analisi visuale universale e deterministica.
+
+    Gestisce:
+    - chart
+    - tabelle visuali
+    - matrici
+    - dashboard
+    - process flow
+    - network diagram
+    - screenshot
+    - immagini generiche
+
+    NON usa:
+    - scoring adattativo
+    - retry basato sul numero di categorie
+    - soglie dinamiche
+    - selezione automatica tra più pass
+    """
+
     if not img_bytes:
         return None
 
-    def _score_chart(js: Dict[str, Any]) -> int:
-        dps = js.get("data_points", [])
-        if not isinstance(dps, list):
-            return -9999
-        n = 0
-        bad = 0
-        for dp in dps:
-            if not isinstance(dp, dict):
-                continue
-            cat = str(dp.get("category", "") or "")
-            val = str(dp.get("value", "") or "")
-            if cat.strip():
-                n += 1
-            if "NOT_READABLE" in cat.upper() or "NOT_READABLE" in val.upper():
-                bad += 1
-        # più categorie = meglio; meno NOT_READABLE = meglio
-        return (n * 10) - (bad * 25)
+    # ------------------------------------------------------------
+    # 1. Normalizzazione immagine
+    # ------------------------------------------------------------
+    vbytes = _downscale_and_compress_for_vision(
+        img_bytes,
+        max_side=1900,
+        output_format="PNG",
+    )
 
-    # PAGE: prova a leggerla da context_hint tipo "... Page 2 ..."
-    page_no = 0
-    if context_hint:
-        m = re.search(r"\bpage\s+(\d+)\b", context_hint, re.I)
-        if m:
-            try:
-                page_no = int(m.group(1))
-            except Exception:
-                page_no = 0
+    # ------------------------------------------------------------
+    # 2. Cache deterministica
+    # ------------------------------------------------------------
+    cache_key = sha256_hex(vbytes) + "::visual_universal_v1"
 
-    # PASS 1 (PNG nitido)
-    vbytes1 = _downscale_and_compress_for_vision(img_bytes, max_side=1900, output_format="PNG")
-    key1 = sha256_hex(vbytes1) + "::chart_grounded_fix3_p1"
-    cached = _vision_cache_get(key1)
+    cached = _vision_cache_get(cache_key)
     if cached:
         return cached
 
-    ocr1 = ocr_extract_text(
-        vbytes1
-    )
+    # ------------------------------------------------------------
+    # 3. OCR di supporto
+    # ------------------------------------------------------------
+    ocr_text = ocr_extract_text(vbytes)
 
-    tesseract_available = bool(
-        TESSERACT_CMD
-        or shutil.which("tesseract")
-    )
+    # ------------------------------------------------------------
+    # 4. Prompt universale
+    # ------------------------------------------------------------
+    prompt = CHART_VISION_PROMPT
 
-    ocr_compact = re.sub(
-        r"\W+",
-        "",
-        ocr1,
-    )
-
-    if (
-        CHART_REQUIRE_OCR_TEXT
-        and tesseract_available
-        and len(ocr_compact) < CHART_MIN_OCR_CHARS
-    ):
-        return None
-
-    prompt1 = CHART_DATA_PROMPT
-    
-    
     if context_hint:
-        prompt1 += f"\n\nCONTEXT HINT: {context_hint[:600]}\n"
-    if ocr1:
-        prompt1 += f"\nVERIFIED OCR TEXT (Use as evidence): \"\"\"{ocr1[:1600]}\"\"\""
-
-
-    raw1 = llm_chat_multimodal(
-        prompt1,
-        vbytes1,
-        VISION_MODEL_NAME,
-        max_tokens=2000,
-        num_ctx=CHART_VISION_NUM_CTX,
-        response_format_json=True,
-        log_label="chart-pass1",
-    )
-    
-    
-    js1 = safe_json_extract(raw1)
-    if not isinstance(js1, dict):
-        js1 = {}
-
-    # Condizione retry: poche categorie o NOT_READABLE presenti
-    
-    # Il secondo passaggio viene eseguito solo
-    # quando il primo ha realmente trovato dati.
-    #
-    # Un logo, una foto o un diagramma privo
-    # di data_points non deve generare
-    # automaticamente una seconda inferenza.
-    need_retry = False
-
-    if (
-        CHART_VISION_RETRY_ENABLED
-        and isinstance(
-            js1.get(
-                "data_points",
-                None,
-            ),
-            list,
-        )
-    ):
-        dps1 = js1.get(
-            "data_points",
-            [],
+        prompt += (
+            "\n\nCONTEXT HINT:\n"
+            f"{context_hint[:600]}\n"
         )
 
-        n1 = sum(
-            1
-            for item in dps1
-            if isinstance(item, dict)
-            and str(
-                item.get(
-                    "category",
-                    "",
-                )
-            ).strip()
+    if ocr_text:
+        prompt += (
+            "\n\nVERIFIED OCR TEXT. "
+            "Usalo solo come evidenza testuale presente nell'immagine:\n"
+            f'"""{ocr_text[:2200]}"""'
         )
 
-        has_bad = any(
-            (
-                "NOT_READABLE"
-                in str(
-                    item.get(
-                        "category",
-                        "",
-                    )
-                ).upper()
-            )
-            or (
-                "NOT_READABLE"
-                in str(
-                    item.get(
-                        "value",
-                        "",
-                    )
-                ).upper()
-            )
-            for item in dps1
-            if isinstance(item, dict)
-        )
-
-        has_first_pass_data = (
-            n1 > 0
-        )
-
-        need_retry = (
-            (
-                has_first_pass_data
-                or CHART_VISION_RETRY_ON_EMPTY
-            )
-            and (
-                n1 < 4
-                or has_bad
-            )
-        )
-
-    # PASS 2 (più grande, istruzioni più “hard”)
-    js2 = {}
-    if need_retry:
-        vbytes2 = _downscale_and_compress_for_vision(img_bytes, max_side=2600, output_format="PNG")
-        ocr2 = ocr_extract_text(vbytes2)
-
-        prompt2 = CHART_DATA_PROMPT + """
-            SECOND PASS (IMPORTANT):
-            - You MUST list ALL categories visible (legend + bars/lines labels), even if some values are only estimates.
-            - If a category label is partially readable, return the best possible label instead of NOT_READABLE.
-            - Prefer OCR evidence for labels (countries/regions) and units.
-            """
-        if context_hint:
-            prompt2 += f"\n\nCONTEXT HINT: {context_hint[:600]}\n"
-        if ocr2:
-            prompt2 += f"\nVERIFIED OCR TEXT (Use as evidence): \"\"\"{ocr2[:2200]}\"\"\""
-
-
-        raw2 = llm_chat_multimodal(
-            prompt2,
-            vbytes2,
+    # ------------------------------------------------------------
+    # 5. UNA sola chiamata Vision
+    # ------------------------------------------------------------
+    try:
+        raw = llm_chat_multimodal(
+            prompt,
+            vbytes,
             VISION_MODEL_NAME,
             max_tokens=2400,
-            num_ctx=CHART_VISION_NUM_CTX,
             response_format_json=True,
-            log_label="chart-pass2",
         )
-        
-        
-        js2 = safe_json_extract(raw2)
-        if not isinstance(js2, dict):
-            js2 = {}
-
-    # scegli output migliore
-    best = js1 if _score_chart(js1) >= _score_chart(js2) else js2
-
-    if not isinstance(best, dict) or not best:
+    except Exception as e:
+        print(f"   ⚠️ Visual Vision Error: {e}")
         return None
 
-    best_score = _score_chart(best)
-    best_title = str(best.get("title") or "").strip()
-    best_points = best.get("data_points") or []
+    # ------------------------------------------------------------
+    # 6. Parsing JSON
+    # ------------------------------------------------------------
+    js = safe_json_extract(raw)
 
-    if best_score <= 0:
+    if not isinstance(js, dict):
+        print("   ⚠️ Visual Vision: JSON non valido")
         return None
 
-    if not best_title and not best_points:
+    # ------------------------------------------------------------
+    # 7. Validazione SEMANTICA, non numerica
+    # ------------------------------------------------------------
+    if not is_valid_visual_semantics(js):
+        print(
+            "   ⚠️ Visual Vision: output privo di contenuto "
+            f"semantico | kind={js.get('kind')}"
+        )
         return None
 
-    # --- CLEANING (anni / geo) ---
-    tf = str(best.get("timeframe", "") or "")
-    years = re.findall(r"\b(19\d{2}|20\d{2})\b", tf)
-    if years:
-        best["timeframe"] = " vs ".join(sorted(set(years)))
+    # ------------------------------------------------------------
+    # 8. Normalizzazione compatibile con il codice esistente
+    # ------------------------------------------------------------
+    js_norm = normalize_chart_json_for_semantics(
+        js,
+        page_no=0,
+        context_hint=context_hint,
+    )
 
-    bad_geo = [" sud", "south", " nord", "north"]
-    for dp in best.get("data_points", []) if isinstance(best.get("data_points", []), list) else []:
-        if not isinstance(dp, dict):
-            continue
-        cat = str(dp.get("category", "") or "")
-        for token in bad_geo:
-            if token in cat.lower():
-                dp["category"] = cat.lower().replace(token, "").capitalize().strip()
+    # Preserva esplicitamente il kind originario.
+    js_norm["kind"] = str(
+        js.get("kind")
+        or js_norm.get("kind")
+        or "other"
+    ).strip().lower()
 
-    js_norm = normalize_chart_json_for_semantics(best, page_no=page_no, context_hint=context_hint)
-    js_norm["semantic_description"] = build_chart_semantic_chunk(page_no, js_norm)
-    js_norm["toon_type"] = "immagine"
+    # ------------------------------------------------------------
+    # 9. Generazione rappresentazione testuale
+    # ------------------------------------------------------------
+    semantic = build_chart_semantic_chunk(
+        0,
+        js_norm,
+    )
 
-    _vision_cache_put(key1, js_norm)
+    if not semantic.strip():
+        return None
+
+    js_norm["semantic_description"] = semantic
+    js_norm["toon_type"] = visual_toon_type(js_norm)
+
+    print(
+        f"   🖼️ Visual semantic OK | "
+        f"kind={js_norm.get('kind')} | "
+        f"chars={len(semantic)}"
+    )
+
+    # ------------------------------------------------------------
+    # 10. Cache
+    # ------------------------------------------------------------
+    _vision_cache_put(cache_key, js_norm)
+
     return js_norm
-
 
 
 
@@ -5043,52 +5082,163 @@ def to_text(x) -> str:
     return str(x)
 
 
-def build_chart_semantic_chunk(page_no: int, chart_json: Dict[str, Any], prefix: str = "VISUAL") -> str:
+def build_chart_semantic_chunk(
+    page_no: int,
+    chart_json: Dict[str, Any],
+    prefix: str = "VISUAL",
+) -> str:
     """
-    Versione V8: Ministral-Ready.
-    Accetta 'value' (singolare) e 'values' (plurale).
+    Serializza in testo semantico qualsiasi asset visuale.
+
+    Mantiene il vecchio nome della funzione per evitare modifiche
+    invasive nei caller esistenti.
     """
-    page_human = page_no
 
     if not isinstance(chart_json, dict):
-        return normalize_ws(f"--- ANALISI VISUALE - Pagina {page_human} ---\n[Dati non validi]")
-    
-    title = to_text(chart_json.get("title", ""))
-    ctype = to_text(chart_json.get("chart_type", "Grafico"))
-    discriminators = to_text(chart_json.get("series_discriminators") or chart_json.get("series_legend", ""))
-    
-    lines = [f"--- ANALISI VISUALE ({ctype}) - Pagina {page_human} ---"]
-    if title: lines.append(f"Titolo: {title}")
-    if discriminators: lines.append(f"Legenda Serie: {discriminators}")
+        return ""
 
-    datap = chart_json.get("data_points") or []
-    if datap:
-        lines.append("\nDati Estratti:")
-        if not isinstance(datap, list): datap = [datap]
-        
-        for d in datap[:40]:
-            if isinstance(d, dict):
-                cat = to_text(d.get("category", ""))
-                
-                # --- FIX CRITICO PER MINISTRAL (Value vs Values) ---
-                # Cerca prima 'value', se vuoto cerca 'values', se vuoto stringa vuota
-                raw_val = d.get("value") or d.get("values") or ""
-                
-                if isinstance(raw_val, list):
-                    # Unisce lista [0.8, 5.5] -> "0.8, 5.5"
-                    val = ", ".join([str(v) for v in raw_val if v is not None])
-                else:
-                    # Pulisce stringa
-                    val = to_text(raw_val).replace("[", "").replace("]", "").replace("'", "")
-                # ---------------------------------------------------
+    kind = to_text(
+        chart_json.get("kind")
+        or chart_json.get("chart_type")
+        or "visual"
+    ).strip()
 
-                vis_check = to_text(d.get("visual_check", ""))
-                check_str = f" ({vis_check})" if (vis_check and len(vis_check) < 80) else ""
+    title = to_text(chart_json.get("title")).strip()
+    subtitle = to_text(chart_json.get("subtitle")).strip()
+    source = to_text(chart_json.get("source")).strip()
+    timeframe = to_text(chart_json.get("timeframe")).strip()
 
-                if cat or val:
-                    lines.append(f" - {cat}: {val}{check_str}")
+    visible = to_text(
+        chart_json.get("what_is_visible_it")
+    ).strip()
 
-    return normalize_ws("\n".join(lines))
+    analysis = to_text(
+        chart_json.get("analysis_it")
+    ).strip()
+
+    data_table = to_text(
+        chart_json.get("data_table_md")
+    ).strip()
+
+    observations = chart_json.get("observations_it") or []
+    trends = chart_json.get("visual_trends_it") or []
+    numbers = chart_json.get("numbers") or []
+    data_points = chart_json.get("data_points") or []
+
+    lines = [
+        f"--- ANALISI VISUALE ({kind}) - Pagina {page_no} ---"
+    ]
+
+    if title:
+        lines.append(f"Titolo: {title}")
+
+    if subtitle:
+        lines.append(f"Sottotitolo: {subtitle}")
+
+    if source and source.upper() != "NOT READABLE":
+        lines.append(f"Fonte visuale: {source}")
+
+    if timeframe and timeframe.upper() != "NOT READABLE":
+        lines.append(f"Periodo: {timeframe}")
+
+    if visible:
+        lines.append("")
+        lines.append("Contenuto visibile:")
+        lines.append(visible)
+
+    if analysis:
+        lines.append("")
+        lines.append("Descrizione semantica:")
+        lines.append(analysis)
+
+    if isinstance(observations, list):
+        clean_observations = [
+            to_text(item).strip()
+            for item in observations
+            if to_text(item).strip()
+        ]
+
+        if clean_observations:
+            lines.append("")
+            lines.append("Osservazioni:")
+
+            for item in clean_observations:
+                lines.append(f"- {item}")
+
+    if isinstance(trends, list):
+        clean_trends = [
+            to_text(item).strip()
+            for item in trends
+            if to_text(item).strip()
+        ]
+
+        if clean_trends:
+            lines.append("")
+            lines.append("Trend / relazioni visuali:")
+
+            for item in clean_trends:
+                lines.append(f"- {item}")
+
+    if data_table:
+        lines.append("")
+        lines.append("Dati strutturati:")
+        lines.append(data_table)
+
+    if isinstance(numbers, list) and numbers:
+        lines.append("")
+        lines.append("Valori rilevati:")
+
+        for item in numbers:
+            if not isinstance(item, dict):
+                continue
+
+            label = to_text(item.get("label")).strip()
+            value = to_text(item.get("value")).strip()
+            unit = to_text(item.get("unit")).strip()
+            period = to_text(item.get("period")).strip()
+
+            parts = []
+
+            if label:
+                parts.append(label)
+
+            if value:
+                parts.append(value)
+
+            if unit:
+                parts.append(unit)
+
+            if period:
+                parts.append(period)
+
+            if parts:
+                lines.append("- " + " | ".join(parts))
+
+    # Compatibilità con i vecchi chart quantitativi
+    if isinstance(data_points, list) and data_points:
+        lines.append("")
+        lines.append("Data points:")
+
+        for item in data_points:
+            if not isinstance(item, dict):
+                continue
+
+            category = to_text(
+                item.get("category")
+                or item.get("label")
+            ).strip()
+
+            value = to_text(
+                item.get("value")
+                or item.get("values")
+            ).strip()
+
+            if category or value:
+                lines.append(
+                    f"- {category}: {value}".strip()
+                )
+
+    return "\n".join(lines).strip()
 
 
 # =========================
@@ -6332,32 +6482,45 @@ def extract_pdf_as_markdown_assets(
                                     c_js = None
 
                             # costruisci semantica (anche fallback)
-                            conf = float((c_js or {}).get("confidence") or 0.0)
-                            kind = (c_js or {}).get("kind")
+                            kind = str(
+                                (c_js or {}).get("kind")
+                                or "unknown"
+                            ).strip().lower()
 
-                            if c_js and isinstance(c_js, dict):
-                                # FIX: uniforma tipo (evita 'imagine' typo)
-                                c_js["toon_type"] = "immagine"
+                            if is_valid_visual_semantics(c_js):
 
-                            CHART_MIN_CONF = float(os.getenv("CHART_MIN_CONF", "0.55"))
-
-                            if c_js and kind != "other" and conf >= CHART_MIN_CONF:
-                                sem = build_chart_semantic_chunk(page_no, c_js)
-                                meta = c_js
-                            else:
-                                sem = normalize_ws(
-                                    f"--- CONTENUTO VISIVO (immagine) - Pagina {page_no} ---\n"
-                                    f"Asset: {img_name}\n"
-                                    f"Nota: immagine estratta dal PDF (grafico/tabella possibile).\n"
-                                    f"Stato: non interpretata automaticamente oppure conf bassa.\n"
-                                    f"Hint: prova ad aumentare VISION_DPI o abbassare CHART_MIN_CONF.\n"
+                                sem = (
+                                    c_js.get("semantic_description")
+                                    or build_chart_semantic_chunk(
+                                        page_no,
+                                        c_js,
+                                    )
                                 )
+
+                                meta = dict(c_js)
+
+                                meta["toon_type"] = visual_toon_type(c_js)
+
+                            else:
+
+                                sem = normalize_ws(
+                                    f"--- CONTENUTO VISIVO NON INTERPRETATO "
+                                    f"- Pagina {page_no} ---\n"
+                                    f"Asset: {img_name}\n"
+                                    f"Stato: asset estratto correttamente, "
+                                    f"ma il VLM non ha restituito una "
+                                    f"descrizione semantica valida.\n"
+                                )
+
                                 meta = {
                                     "asset_name": img_name,
-                                    "confidence": conf,
-                                    "kind": kind or "unknown",
-                                    "toon_type": "immagine"
+                                    "kind": kind,
+                                    "toon_type": "image",
                                 }
+
+
+
+
 
                             # crea chunk IMMAGE dedicato (questo è il FIX chiave)
                             img_chunk = {
@@ -6450,6 +6613,49 @@ def normalize_toon_type(ch: dict) -> str:
     return "text"
 
 
+MD_IMAGE_RE = re.compile(
+    r'!\[[^\]]*\]\(([^)\r\n]+?\.(?:png|jpg|jpeg|webp|bmp|gif))\)',
+    re.IGNORECASE,
+)
+
+
+def get_markdown_asset_bytes(
+    asset_park: Dict[str, bytes],
+    asset_ref: str,
+) -> Optional[bytes]:
+    """
+    Risoluzione deterministica di un asset Markdown.
+
+    Prova:
+    1. reference completa;
+    2. basename.
+
+    Nessuna euristica o ricerca fuzzy.
+    """
+
+    if not asset_park or not asset_ref:
+        return None
+
+    normalized_ref = (
+        asset_ref
+        .strip()
+        .replace("\\", "/")
+    )
+
+    candidates = (
+        normalized_ref,
+        os.path.basename(normalized_ref),
+    )
+
+    for key in candidates:
+        value = asset_park.get(key)
+
+        if value:
+            return value
+
+    return None
+
+
 def process_virtual_md_chunks(content: str, asset_park: dict, filename: str, log_id: int) -> List[Dict[str, Any]]:
     """
     Versione 2.9.2 (Optimized):
@@ -6490,10 +6696,18 @@ def process_virtual_md_chunks(content: str, asset_park: dict, filename: str, log
             }
 
             # --- LOGICA ASSET VISUALI ---
-            img_match = re.search(r'!\[.*?\]\(((?:img_|fig_).*?\.jpg)\)', clean_sub_p)
+            img_match = MD_IMAGE_RE.search(clean_sub_p)
+
             if img_match and PDF_VISION_ENABLED:
-                asset_id = img_match.group(1)
-                img_bytes = asset_park.get(asset_id)
+                asset_id = img_match.group(1).strip()
+
+                img_bytes = get_markdown_asset_bytes(
+                    asset_park,
+                    asset_id,
+                )
+
+
+
 
                 if img_bytes and len(img_bytes) >= MIN_ASSET_SIZE and ai_vision_gatekeeper(img_bytes):
                     if vision_done >= VISION_MAX_ASSETS_PER_DOC:
@@ -6536,9 +6750,18 @@ def process_virtual_md_chunks(content: str, asset_park: dict, filename: str, log
                         md_only = (chunk_data.get("text_raw") or "").strip()
 
                         toon_type = (chunk_data.get("toon_type") or "").strip().lower()
+                        
+                        
                         # accetta anche il vecchio typo "imagine"
-                        if toon_type == "imagine":
+                        if toon_type in {
+                            "immagine",
+                            "imagine",
+                            "visual",
+                            "screenshot",
+                        }:
                             toon_type = "image"
+                            
+                            
                         chunk_data["toon_type"] = toon_type  # normalizza per downstream
 
                         is_image_only = (toon_type == "image") or (
@@ -7104,11 +7327,29 @@ def process_ai_and_db(
 
                 processed_kg_chunks.add(global_idx)
 
+                normalized_chunk_type = normalize_toon_type(ch)
+
+                if normalized_chunk_type in {
+                    "image",
+                    "chart",
+                }:
+                    kg_source_text = (
+                        ch.get("text_sem")
+                        or ch.get("text_raw")
+                        or ""
+                    )
+                else:
+                    kg_source_text = (
+                        ch.get("text_raw")
+                        or ch.get("text_sem")
+                        or ""
+                    )
+
                 text_full = safe_normalize_text(
-                    ch.get("text_raw")
-                    or ch.get("text_sem")
-                    or ""
-                )
+                    kg_source_text
+                )               
+                                
+                
                 page_no = int(ch.get("page_no") or 1)
                 page_chunk_index = int(ch.get("page_chunk_index") or 0)
 
