@@ -22,7 +22,6 @@ Ingestion Engine - v2.5 DATABASE BYTEA
 
 
 import os
-
 import sys
 
 # Output immediato nel terminale/container.
@@ -7348,7 +7347,6 @@ def process_ai_and_db(
                 text_full = safe_normalize_text(
                     kg_source_text
                 )               
-                                
                 
                 page_no = int(ch.get("page_no") or 1)
                 page_chunk_index = int(ch.get("page_chunk_index") or 0)
