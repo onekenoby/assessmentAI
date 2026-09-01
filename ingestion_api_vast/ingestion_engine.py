@@ -219,6 +219,53 @@ VISION_MAX_FORMULAS_PER_PAGE = int(
     os.getenv("VISION_MAX_FORMULAS_PER_PAGE", "10")
 )
 
+
+
+# ============================================================
+# PDF TEXT RECOVERY - deterministic selective fallback
+# ============================================================
+
+PDF_TEXT_RECOVERY_ENABLED = (
+    os.getenv("PDF_TEXT_RECOVERY_ENABLED", "1") == "1"
+)
+
+# Rendering eseguito SOLO per pagine rilevate come degradate.
+PDF_TEXT_RECOVERY_DPI = int(
+    os.getenv("PDF_TEXT_RECOVERY_DPI", "200")
+)
+
+# Lunghezza minima accettabile per un testo recuperato.
+PDF_TEXT_RECOVERY_MIN_CHARS = int(
+    os.getenv("PDF_TEXT_RECOVERY_MIN_CHARS", "40")
+)
+
+# Output massimo del VLM quando viene usato come ultima risorsa.
+PDF_TEXT_RECOVERY_VLM_MAX_TOKENS = int(
+    os.getenv("PDF_TEXT_RECOVERY_VLM_MAX_TOKENS", "3000")
+)
+
+
+PDF_TEXT_RECOVERY_PROMPT = """
+TASK:
+Transcribe faithfully the textual content visible on this PDF page.
+
+STRICT RULES:
+- Output only the reconstructed text.
+- Do not summarize.
+- Do not explain the document.
+- Do not add information that is not visible.
+- Preserve headings, paragraphs and bullet lists when identifiable.
+- Preserve table rows and columns in Markdown when clearly identifiable.
+- Preserve numbers, dates, percentages, codes and identifiers exactly.
+- Do not semantically describe charts, diagrams or images:
+  those are processed separately by the visual pipeline.
+- You may transcribe labels or textual content visibly contained inside them.
+- If a portion is unreadable, write [ILLEGIBILE].
+- Do not invent missing words.
+- Use Markdown only when it helps preserve the visible structure.
+"""
+
+
 # ---------------------------------------------------------
 # Profilo Vision configurabile
 # Default iniziali consigliati per RTX 5090 32 GB.
@@ -6385,6 +6432,419 @@ def extract_file_chunks(
     return final_chunks
 
 
+def pdf_page_has_renderable_content(page: fitz.Page) -> bool:
+    """
+    Verifica deterministica se una pagina apparentemente senza testo
+    contiene comunque elementi visuali.
+
+    Viene usata SOLO quando il layer testuale è vuoto o quasi vuoto.
+    """
+
+    try:
+        images = page.get_images(full=True) or []
+
+        if images:
+            return True
+
+    except Exception:
+        pass
+
+    try:
+        drawings = page.get_drawings() or []
+
+        if drawings:
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def get_pdf_text_degradation_reason(
+    raw_text: str,
+    page: Optional[fitz.Page] = None,
+) -> Optional[str]:
+    """
+    Quality gate deterministico per il testo estratto dal PDF.
+
+    Ritorna:
+        None      -> testo accettabile
+        <reason>  -> testo degradato
+
+    IMPORTANTE:
+    - nessun LLM;
+    - nessuna soglia dinamica;
+    - nessun comportamento adattativo;
+    - nessuna analisi semantica.
+    """
+
+    text = raw_text or ""
+
+    # --------------------------------------------------------
+    # 1. Normalizzazione SOLO per l'analisi del quality gate
+    # --------------------------------------------------------
+    probe = unicodedata.normalize("NFKC", text).strip()
+
+    # --------------------------------------------------------
+    # 2. Nessun testo, ma pagina con contenuto renderizzabile
+    #    tipico dei PDF scannerizzati.
+    # --------------------------------------------------------
+    if not probe:
+
+        if page is not None and pdf_page_has_renderable_content(page):
+            return "empty_text_with_visual_content"
+
+        # Pagina realmente vuota: NON eseguire fallback.
+        return None
+
+    text_len = len(probe)
+
+    # --------------------------------------------------------
+    # 3. Artefatti CID
+    # --------------------------------------------------------
+    if probe.count("(cid:") >= 2:
+        return "cid_artifacts"
+
+    # --------------------------------------------------------
+    # 4. Unicode replacement character
+    # --------------------------------------------------------
+    replacement_count = probe.count("\ufffd")
+
+    if (
+        text_len >= 40
+        and replacement_count / text_len >= 0.01
+    ):
+        return "replacement_characters"
+
+    # --------------------------------------------------------
+    # 5. Caratteri di controllo / private-use Unicode
+    # --------------------------------------------------------
+    bad_unicode = 0
+
+    for char in probe:
+
+        if char in "\n\r\t":
+            continue
+
+        category = unicodedata.category(char)
+
+        if category in {
+            "Cc",   # control
+            "Cs",   # surrogate
+            "Co",   # private use
+        }:
+            bad_unicode += 1
+
+    if (
+        text_len >= 40
+        and bad_unicode / text_len >= 0.02
+    ):
+        return "invalid_unicode_density"
+
+    # --------------------------------------------------------
+    # 6. Rapporto caratteri alfanumerici / caratteri visibili
+    # --------------------------------------------------------
+    if text_len >= 80:
+
+        visible_chars = [
+            char
+            for char in probe
+            if not char.isspace()
+        ]
+
+        if visible_chars:
+
+            alnum_count = sum(
+                1
+                for char in visible_chars
+                if char.isalnum()
+            )
+
+            alnum_ratio = (
+                alnum_count
+                / len(visible_chars)
+            )
+
+            if alnum_ratio < 0.30:
+                return "low_alphanumeric_ratio"
+
+    # --------------------------------------------------------
+    # 7. Token estremamente frammentati
+    #
+    # Es:
+    # P r o c e d u r a  d i  C h a n g e
+    # --------------------------------------------------------
+    tokens = re.findall(r"\S+", probe)
+
+    alpha_tokens = [
+        token
+        for token in tokens
+        if any(char.isalpha() for char in token)
+    ]
+
+    if len(alpha_tokens) >= 30:
+
+        one_char_tokens = sum(
+            1
+            for token in alpha_tokens
+            if len(token) == 1
+        )
+
+        fragmentation_ratio = (
+            one_char_tokens
+            / len(alpha_tokens)
+        )
+
+        if fragmentation_ratio >= 0.50:
+            return "fragmented_text"
+
+    return None
+
+
+def recover_pdf_page_text(
+    page: fitz.Page,
+    native_text: str,
+    page_no: int,
+    filename: str,
+) -> Tuple[str, str, Optional[str]]:
+    """
+    Recupero selettivo e deterministico del testo PDF.
+
+    Ordine FISSO:
+
+        Native PDF text
+            ↓
+        quality gate
+            ↓
+        OCR
+            ↓
+        quality gate
+            ↓
+        VLM
+            ↓
+        quality gate
+
+    Ritorna:
+
+        (
+            final_text,
+            text_source,
+            degradation_reason
+        )
+
+    text_source:
+        native
+        ocr
+        vlm
+        native_degraded_unrecovered
+    """
+
+    native_clean = (
+        safe_normalize_text(native_text)
+        or ""
+    )
+
+    # ========================================================
+    # 1. QUALITY GATE TESTO NATIVO
+    # ========================================================
+
+    native_reason = get_pdf_text_degradation_reason(
+        native_text,
+        page,
+    )
+
+    # Testo nativo valido.
+    if native_reason is None:
+        return (
+            native_clean,
+            "native",
+            None,
+        )
+
+    # Recovery disabilitato:
+    # manteniamo comportamento corrente.
+    if not PDF_TEXT_RECOVERY_ENABLED:
+
+        return (
+            native_clean,
+            "native_degraded_unrecovered",
+            native_reason,
+        )
+
+    print(
+        f"   ⚠️ PDF TEXT DEGRADED | "
+        f"file={filename} | "
+        f"page={page_no} | "
+        f"reason={native_reason}"
+    )
+
+    # ========================================================
+    # 2. RENDER PAGINA
+    #
+    # Viene fatto UNA sola volta.
+    # Lo stesso PNG viene usato prima da OCR e poi,
+    # eventualmente, da Ministral.
+    # ========================================================
+
+    try:
+
+        page_image = render_full_page_png(
+            page,
+            dpi=PDF_TEXT_RECOVERY_DPI,
+        )
+
+    except Exception as exc:
+
+        print(
+            f"   ⚠️ PDF TEXT RENDER FAILED | "
+            f"page={page_no} | {exc}"
+        )
+
+        return (
+            native_clean,
+            "native_degraded_unrecovered",
+            native_reason,
+        )
+
+    # ========================================================
+    # 3. FALLBACK OCR
+    # ========================================================
+
+    try:
+
+        ocr_text = (
+            ocr_extract_text(page_image)
+            or ""
+        )
+
+        ocr_clean = (
+            safe_normalize_text(ocr_text)
+            or ""
+        )
+
+    except Exception:
+
+        ocr_text = ""
+        ocr_clean = ""
+
+    ocr_reason = get_pdf_text_degradation_reason(
+        ocr_text,
+        page,
+    )
+
+    if (
+        len(ocr_clean)
+        >= PDF_TEXT_RECOVERY_MIN_CHARS
+        and ocr_reason is None
+    ):
+
+        print(
+            f"   ✅ PDF OCR RECOVERED | "
+            f"file={filename} | "
+            f"page={page_no} | "
+            f"chars={len(ocr_clean)}"
+        )
+
+        return (
+            ocr_clean,
+            "ocr",
+            native_reason,
+        )
+
+    print(
+        f"   ⚠️ PDF OCR INSUFFICIENT | "
+        f"file={filename} | "
+        f"page={page_no} | "
+        f"reason={ocr_reason or 'too_short'}"
+    )
+
+    # ========================================================
+    # 4. FALLBACK VLM
+    #
+    # Solo se:
+    # - il testo nativo era degradato;
+    # - OCR non ha superato il gate;
+    # - Vision è abilitata.
+    # ========================================================
+
+    if (
+        PDF_VISION_ENABLED
+        and VISION_MODEL_NAME
+    ):
+
+        try:
+
+            vision_text = llm_chat_multimodal(
+                prompt=PDF_TEXT_RECOVERY_PROMPT,
+                image_bytes=page_image,
+                model=VISION_MODEL_NAME,
+                max_tokens=PDF_TEXT_RECOVERY_VLM_MAX_TOKENS,
+            )
+
+            vision_clean = (
+                safe_normalize_text(vision_text)
+                or ""
+            )
+
+            vision_reason = (
+                get_pdf_text_degradation_reason(
+                    vision_text,
+                    page,
+                )
+            )
+
+            if (
+                len(vision_clean)
+                >= PDF_TEXT_RECOVERY_MIN_CHARS
+                and vision_reason is None
+            ):
+
+                print(
+                    f"   ✅ PDF VLM RECOVERED | "
+                    f"file={filename} | "
+                    f"page={page_no} | "
+                    f"chars={len(vision_clean)}"
+                )
+
+                return (
+                    vision_clean,
+                    "vlm",
+                    native_reason,
+                )
+
+        except Exception as exc:
+
+            print(
+                f"   ⚠️ PDF VLM RECOVERY FAILED | "
+                f"file={filename} | "
+                f"page={page_no} | "
+                f"{exc}"
+            )
+
+    # ========================================================
+    # 5. FALLBACK CONSERVATIVO
+    #
+    # Se OCR e VLM non danno un risultato valido:
+    # NON sostituiamo il testo con qualcosa di incerto.
+    #
+    # Manteniamo il layer PDF originale.
+    # ========================================================
+
+    print(
+        f"   ⚠️ PDF TEXT UNRECOVERED | "
+        f"file={filename} | "
+        f"page={page_no} | "
+        f"keeping=native"
+    )
+
+    return (
+        native_clean,
+        "native_degraded_unrecovered",
+        native_reason,
+    )
+
+
 
 def extract_pdf_as_markdown_assets(
     file_path: str,
@@ -6397,7 +6857,15 @@ def extract_pdf_as_markdown_assets(
     - Crea SEMPRE un chunk 'immagine' per ogni asset embedded (anche se Vision fallisce o ritorna kind=other)
     - Evita che tutto finisca come 'testo' quando il PDF contiene grafici.
     """
+    
     chunks_payload: List[Dict[str, Any]] = []
+
+    pdf_text_stats = {
+        "native": 0,
+        "ocr": 0,
+        "vlm": 0,
+        "unrecovered": 0,
+    }
 
     try:
         doc = fitz.open(file_path)
@@ -6423,24 +6891,99 @@ def extract_pdf_as_markdown_assets(
             # ------------------------------------------------------------
             # 1) Chunk TESTO pagina
             # ------------------------------------------------------------
-            page_text = page.get_text()
-            text_sem = safe_normalize_text(page_text) or ""
 
-            # se vuoi, puoi mantenere lo skip condizionale; qui lo lasciamo conservativo
-            if len(text_sem) < 50 and not PDF_VISION_ENABLED:
+            # Estrazione nativa PyMuPDF.
+            #
+            # sort=True migliora l'ordine di lettura quando il layout
+            # del PDF lo consente, senza introdurre costo AI.
+            page_text_native = page.get_text(
+                "text",
+                sort=True,
+            )
+
+            # ------------------------------------------------------------
+            # Selective deterministic recovery
+            # ------------------------------------------------------------
+
+            text_sem, text_source, degradation_reason = (
+                recover_pdf_page_text(
+                    page=page,
+                    native_text=page_text_native,
+                    page_no=page_no,
+                    filename=filename,
+                )
+            )
+
+
+            if text_source == "native":
+
+                pdf_text_stats["native"] += 1
+
+            elif text_source == "ocr":
+
+                pdf_text_stats["ocr"] += 1
+
+            elif text_source == "vlm":
+
+                pdf_text_stats["vlm"] += 1
+
+            else:
+
+                pdf_text_stats["unrecovered"] += 1
+
+
+
+            # ------------------------------------------------------------
+            # Pagina realmente senza contenuto testuale utile.
+            # ------------------------------------------------------------
+
+            if (
+                len(text_sem) < PDF_TEXT_RECOVERY_MIN_CHARS
+                and not PDF_VISION_ENABLED
+            ):
                 continue
 
+
             page_chunk = {
+
                 "text_raw": text_sem,
-                "text_sem": f"Page {page_no} content: {text_sem[:250]}...\n{text_sem}",
+
+                "text_sem": (
+                    f"Page {page_no} content: "
+                    f"{text_sem[:250]}...\n"
+                    f"{text_sem}"
+                ),
+
                 "page_no": page_no,
+
                 "toon_type": "testo",
+
                 "metadata": {
+
                     "source": filename,
+
                     "page": page_no,
+
                     "doc_id": doc_id,
-                }
+
+                    # -----------------------------------------
+                    # Provenienza del testo
+                    # -----------------------------------------
+                    "pdf_text_source": text_source,
+
+                    "pdf_text_recovery_used": (
+                        text_source in {
+                            "ocr",
+                            "vlm",
+                        }
+                    ),
+
+                    "pdf_text_degradation_reason": (
+                        degradation_reason
+                    ),
+                },
             }
+
             chunks_payload.append(page_chunk)
 
             # ------------------------------------------------------------
@@ -6556,6 +7099,15 @@ def extract_pdf_as_markdown_assets(
         doc.close()
     except Exception:
         pass
+
+    print(
+        "   📄 PDF TEXT RECOVERY SUMMARY | "
+        f"file={filename} | "
+        f"native={pdf_text_stats['native']} | "
+        f"ocr={pdf_text_stats['ocr']} | "
+        f"vlm={pdf_text_stats['vlm']} | "
+        f"unrecovered={pdf_text_stats['unrecovered']}"
+    )
 
     return chunks_payload
 
