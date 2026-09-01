@@ -1,0 +1,113 @@
+{
+  "batch": 13,
+  "status": "FAIL",
+  "generated_at_utc": "2026-07-15T12:13:50.055877+00:00",
+  "exit_code": 1,
+  "base_url": "http://127.0.0.1:8013",
+  "api_started_by_runner": true,
+  "capacity_stress_enabled": false,
+  "second_organization_required": true,
+  "junit": {
+    "tests": 184,
+    "failures": 2,
+    "errors": 0,
+    "skipped": 1,
+    "time_seconds": 314.324,
+    "passed": 181,
+    "successful": false
+  },
+  "runtime": {
+    "python": "3.11.9",
+    "platform": "Windows-10-10.0.26200-SP0"
+  },
+  "safe_environment": {
+    "EMBEDDING_MODEL_NAME": "E:/Modelli/bge-m3",
+    "RERANKER_MODEL_NAME": "E:/Modelli/ms-marco-reranker",
+    "RAG_API_BASE_URL": "http://127.0.0.1:8013"
+  },
+  "command": [
+    "E:\\Dev\\assessmentAI\\venv\\Scripts\\python.exe",
+    "-m",
+    "pytest",
+    "-v",
+    "-s",
+    "--junitxml=E:\\Dev\\assessmentAI\\rag_api\\reports\\batch13_4_org\\batch13_junit.xml",
+    "tests/test_rag_reflex_alignment_batch13_4.py",
+    "tests/test_rag_reflex_alignment_batch13_3.py",
+    "tests/test_rag_reflex_alignment_batch12.py",
+    "tests/test_rag_reflex_alignment_batch11.py",
+    "tests/test_rag_reflex_alignment_batch10.py",
+    "tests/test_rag_reflex_alignment_batch9.py",
+    "tests/test_rag_reflex_alignment_batch8.py",
+    "tests/test_rag_reflex_alignment_batch7.py",
+    "tests/test_rag_reflex_alignment_batch6.py",
+    "tests/test_rag_reflex_alignment_batch5.py",
+    "tests/test_retrieval_reflex_alignment_batch4.py",
+    "tests/test_retrieval_reflex_alignment_batch3.py",
+    "tests/test_retrieval_reflex_alignment_batch2.py",
+    "tests/test_rag_reflex_alignment.py",
+    "tests/test_retrieval_simulated.py",
+    "tests/test_rag_service_simulated.py",
+    "tests/test_validation.py",
+    "tests/test_reranking.py",
+    "tests/test_models.py",
+    "tests/test_prompting.py",
+    "tests/test_generation_simulated.py",
+    "tests/test_routes_rag_simulated.py",
+    "tests/test_resources_simulated.py",
+    "tests/test_batch13_e2e_support.py",
+    "tests/integration/test_postgres_real.py",
+    "tests/integration/test_qdrant_real.py",
+    "tests/integration/test_neo4j_real.py",
+    "tests/integration/test_ollama_real.py",
+    "tests/integration/test_organization_isolation_real.py",
+    "tests/integration/test_rag_api_e2e_real.py"
+  ],
+  "alignment_matrix": [
+    {
+      "area": "PostgreSQL schema, RLS and organization visibility",
+      "evidence": "real service integration tests",
+      "status": "covered"
+    },
+    {
+      "area": "Qdrant collection, vector query and payload filtering",
+      "evidence": "real service integration tests",
+      "status": "covered"
+    },
+    {
+      "area": "Neo4j connectivity, graph invariants and relationship whitelist",
+      "evidence": "real service integration tests",
+      "status": "covered"
+    },
+    {
+      "area": "Ollama configured model and native /api/chat response",
+      "evidence": "real service integration tests",
+      "status": "covered"
+    },
+    {
+      "area": "Live API health, readiness, deterministic and RAG query contracts",
+      "evidence": "HTTP end-to-end tests",
+      "status": "covered"
+    },
+    {
+      "area": "Document/page scope and public source provenance",
+      "evidence": "HTTP end-to-end tests with a real PostgreSQL chunk",
+      "status": "covered"
+    },
+    {
+      "area": "Cross-organization leakage checks",
+      "evidence": "real-store isolation tests",
+      "status": "required"
+    },
+    {
+      "area": "Generation timeout/empty response fallback",
+      "evidence": "Batch 10 deterministic fault simulation",
+      "status": "covered"
+    },
+    {
+      "area": "Bounded capacity and service_busy",
+      "evidence": "Batch 12 unit tests",
+      "status": "covered"
+    }
+  ]
+}

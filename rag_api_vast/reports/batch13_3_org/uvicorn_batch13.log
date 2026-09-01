@@ -1,0 +1,15 @@
+INFO:     Started server process [14428]
+INFO:     Waiting for application startup.
+POC_MODE: ruolo PostgreSQL privilegiato consentito (user=admin, superuser=True, bypassrls=True)
+Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]Loading weights: 100%|##########| 391/391 [00:00<00:00, 19387.77it/s]
+Loading weights:   0%|          | 0/105 [00:00<?, ?it/s]Loading weights: 100%|##########| 105/105 [00:00<00:00, 3555.38it/s]
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8013 (Press CTRL+C to quit)
+INFO:     127.0.0.1:54891 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60323 - "GET /health/ready?deep=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62306 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62306 - "GET /health/ready?deep=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62306 - "POST /api/v1/rag/query HTTP/1.1" 200 OK
+E:\Dev\assessmentAI\venv\Lib\site-packages\starlette\_exception_handler.py:59: StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated. Use 'HTTP_422_UNPROCESSABLE_CONTENT' instead.
+  response = await handler(conn, exc)  # type: ignore[arg-type]
+INFO:     127.0.0.1:54209 - "POST /api/v1/rag/query HTTP/1.1" 422 Unprocessable Entity

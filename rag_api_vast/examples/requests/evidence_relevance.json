@@ -1,0 +1,11 @@
+{
+  "query": "Valuta la rilevanza delle evidenze disponibili rispetto al controllo descritto.",
+  "conversation_id": "vast-evidence-test-001",
+  "history": [],
+  "options": {
+    "include_sources": true,
+    "include_debug": true,
+    "include_evaluation": false,
+    "max_sources": 8
+  }
+}

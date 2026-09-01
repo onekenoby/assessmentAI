@@ -1,0 +1,48 @@
+INFO:     Started server process [6372]
+INFO:     Waiting for application startup.
+POC_MODE: ruolo PostgreSQL privilegiato consentito (user=admin, superuser=True, bypassrls=True)
+Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]Loading weights: 100%|##########| 391/391 [00:00<00:00, 20497.87it/s]
+Loading weights:   0%|          | 0/105 [00:00<?, ?it/s]Loading weights: 100%|##########| 105/105 [00:00<00:00, 2618.98it/s]
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8013 (Press CTRL+C to quit)
+INFO:     127.0.0.1:55692 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55693 - "GET /health/ready?deep=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50413 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50413 - "GET /health/ready?deep=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50413 - "POST /api/v1/rag/query HTTP/1.1" 200 OK
+Ollama generation error | request_id=64ca2ff0-582b-4224-9151-40fe68af79c4 model=gemma4:12b attempt=1 retryable=True error=Errore di connessione verso Ollama: HTTPConnectionPool(host='127.0.0.1', port=11434): Read timed out. (read timeout=60)
+E:\Dev\assessmentAI\rag_api\api\routes_rag.py:681: StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated. Use 'HTTP_422_UNPROCESSABLE_CONTENT' instead.
+  mapped = _map_service_exception(exc, request_id)
+RAG request rejected | request_id=64ca2ff0-582b-4224-9151-40fe68af79c4 | error=ValidationError
+INFO:     127.0.0.1:50413 - "POST /api/v1/rag/query HTTP/1.1" 422 Unprocessable Entity
+E:\Dev\assessmentAI\venv\Lib\site-packages\starlette\_exception_handler.py:59: StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated. Use 'HTTP_422_UNPROCESSABLE_CONTENT' instead.
+  response = await handler(conn, exc)  # type: ignore[arg-type]
+INFO:     127.0.0.1:50413 - "POST /api/v1/rag/query HTTP/1.1" 422 Unprocessable Entity
+RAG request failed | request_id=b0dc981b-eab5-4dd9-a428-527c55fbe431 | error=CapacityRejectedError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 673, in query_rag
+    async with limiter.slot():
+  File "C:\python311\Lib\contextlib.py", line 210, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 146, in slot
+    await self.acquire()
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 116, in acquire
+    raise CapacityRejectedError("queue_full")
+core.capacity.CapacityRejectedError: queue_full
+RAG request failed | request_id=2c4f9930-9adc-49d7-975d-1495d543bd0e | error=CapacityRejectedError
+Traceback (most recent call last):
+  File "E:\Dev\assessmentAI\rag_api\api\routes_rag.py", line 673, in query_rag
+    async with limiter.slot():
+  File "C:\python311\Lib\contextlib.py", line 210, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 146, in slot
+    await self.acquire()
+  File "E:\Dev\assessmentAI\rag_api\core\capacity.py", line 116, in acquire
+    raise CapacityRejectedError("queue_full")
+core.capacity.CapacityRejectedError: queue_full
+INFO:     127.0.0.1:58113 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable
+INFO:     127.0.0.1:58112 - "POST /api/v1/rag/query HTTP/1.1" 503 Service Unavailable
+Ollama generation error | request_id=56e02e82-10a5-4de6-a744-7ab3e1d83e7a model=gemma4:12b attempt=1 retryable=True error=Errore di connessione verso Ollama: HTTPConnectionPool(host='127.0.0.1', port=11434): Read timed out. (read timeout=60)
+INFO:     127.0.0.1:58114 - "POST /api/v1/rag/query HTTP/1.1" 200 OK

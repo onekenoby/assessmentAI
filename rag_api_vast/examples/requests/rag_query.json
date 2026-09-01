@@ -1,0 +1,11 @@
+{
+  "query": "Quali controlli sono richiesti per la gestione degli accessi?",
+  "conversation_id": "vast-rag-test-001",
+  "history": [],
+  "options": {
+    "include_sources": true,
+    "include_debug": true,
+    "include_evaluation": false,
+    "max_sources": 8
+  }
+}

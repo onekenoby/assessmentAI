@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Any, Optional
 
-ALLOWED_EXTENSIONS = {".pdf", ".md", ".markdown"}
 ALLOWED_TIERS = {"A", "B", "C"}
 ALLOWED_CLASSIFICATIONS = {"public", "internal", "confidential", "restricted"}
 
@@ -121,34 +120,68 @@ def sanitize_filename(value: str) -> str:
 
 
 def detect_mime_type(filename: str, override: Optional[str]) -> str:
+    """Determina il MIME type senza limitare i formati caricabili.
+
+    Il valore dichiarato dal client ha precedenza; in sua assenza viene usato
+    ``mimetypes`` con fallback neutro a ``application/octet-stream``.
+    """
     if override and override.strip():
         return override.strip().lower()
+
     suffix = Path(filename).suffix.lower()
     if suffix == ".pdf":
         return "application/pdf"
     if suffix in {".md", ".markdown"}:
         return "text/markdown"
+
     guessed, _ = mimetypes.guess_type(filename)
     return (guessed or "application/octet-stream").lower()
 
 
+def detect_source_format(filename: str, mime_type: str) -> str:
+    """Restituisce un formato sorgente breve da salvare in rag_document.
+
+    L'estensione, quando presente, resta la fonte primaria. Per file privi di
+    estensione viene usato il sottotipo MIME; se non è significativo viene
+    restituito ``binary``. La funzione non decide se il file sia ingestibile.
+    """
+    suffix = Path(filename).suffix.lower().lstrip(".").strip()
+    if suffix:
+        return suffix[:64]
+
+    normalized_mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+    if not normalized_mime or normalized_mime == "application/octet-stream":
+        return "binary"
+
+    if "/" in normalized_mime:
+        subtype = normalized_mime.split("/", 1)[1].strip()
+        if subtype:
+            return subtype[:64]
+
+    return "binary"
+
+
 def prepare_file(file: UploadFileData, *, max_file_bytes: int) -> PreparedFile:
+    """Valida gli aspetti generali del file senza whitelist di formato."""
     filename = sanitize_filename(file.filename)
     suffix = Path(filename).suffix.lower()
-    if suffix not in ALLOWED_EXTENSIONS:
-        raise UploadError("Sono ammessi soltanto file PDF o Markdown (.pdf, .md, .markdown)")
     data = bytes(file.data or b"")
+
     if not data:
         raise UploadError("Il file è vuoto")
+
     if len(data) > int(max_file_bytes):
         raise UploadError(
             f"File troppo grande: limite {int(max_file_bytes)} byte"
         )
+
+    mime_type = detect_mime_type(filename, file.mime_type)
+
     return PreparedFile(
         filename=filename,
         suffix=suffix,
         data=data,
-        mime_type=detect_mime_type(filename, file.mime_type),
+        mime_type=mime_type,
         sha256=hashlib.sha256(data).hexdigest(),
         size=len(data),
     )
@@ -620,7 +653,10 @@ def upload_corpus(payload: CorpusUpload, *, max_file_bytes: int) -> dict[str, An
                 scope=scope,
                 organization_id=organization_id,
                 classification=classification,
-                source_format=prepared.suffix.lstrip("."),
+                source_format=detect_source_format(
+                    prepared.filename,
+                    prepared.mime_type,
+                ),
                 pipeline_version=pipeline_version,
                 corpus_version=corpus_version,
                 embedding_model=payload.embedding_model,

@@ -1,0 +1,19 @@
+# API
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.8,<3.0
+
+# Motore di ingestion originale
+requests>=2.32,<3.0
+PyMuPDF>=1.24,<2.0
+python-docx>=1.1,<2.0
+psycopg2-binary>=2.9,<3.0
+sentence-transformers>=3.0,<6.0
+qdrant-client>=1.11,<2.0
+neo4j>=5.23,<7.0
+openai>=1.40,<3.0
+ollama>=0.4,<1.0
+pdfminer.six>=20231228
+Pillow>=10.0,<13.0
+pytesseract>=0.3.13,<1.0
+torch>=2.2

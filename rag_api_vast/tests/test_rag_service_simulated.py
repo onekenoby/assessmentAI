@@ -1,0 +1,625 @@
+from __future__ import annotations
+
+from hashlib import sha256
+
+import pytest
+
+from core.audit import AuditSink, AuditSinkOutcome, AuditWriteResult
+from core.config import settings
+from core.generation import GenerationMetrics, GenerationResult
+from core.models import RagAnswerMode, RagExecutionMode, RagIntent, RetrievalDebug
+from core.rag_service import (
+    RagQueryCommand,
+    RagQueryRouter,
+    RagService,
+    RagServiceGenerationError,
+)
+from core.validation import RagEvalResult
+
+
+class FakeResources:
+    def __init__(self, reranker=None):
+        self.reranker = reranker
+
+    def get_reranker(self):
+        return self.reranker
+
+
+class FakeRetriever:
+    def __init__(self, candidates=(), debug=None, glossary=None):
+        self.candidates = tuple(candidates)
+        self.debug = debug or RetrievalDebug()
+        self.glossary = glossary
+        self.calls = 0
+
+    async def retrieve_candidates(self, **kwargs):
+        self.calls += 1
+        return self.candidates, self.debug
+
+    async def lookup_glossary(self, **kwargs):
+        return self.glossary
+
+
+class FakeGenerator:
+    def __init__(self, content=None, error=None):
+        self.content = content or (
+            "**A) Risposta**\n\nLa procedura è formalizzata.\n\n"
+            "**B) Evidenze**\n\nEvidenza disponibile.\n\n"
+            "**C) Limiti / Conflitti**\n\nNessuno.\n\n"
+            "**D) Fonti**\n\n- placeholder"
+        )
+        self.error = error
+        self.calls = 0
+
+    async def generate_async(self, prompt):
+        self.calls += 1
+        if self.error:
+            raise self.error
+        return GenerationResult(
+            content=self.content,
+            model="gemma4:12b",
+            request_id="",
+            attempts=1,
+            elapsed_ms=5,
+            response_sha256=sha256(self.content.encode()).hexdigest(),
+            metrics=GenerationMetrics(),
+        )
+
+
+class FakeAuditor:
+    def __init__(self):
+        self.calls = 0
+        self.last_audit = None
+
+    async def persist_query_audit_async(self, audit, **kwargs):
+        self.calls += 1
+        self.last_audit = audit
+
+        return AuditWriteResult(
+            request_id=str(audit.request_id),
+            outcomes=(AuditSinkOutcome(
+                sink=AuditSink.QUERY_JSONL,
+                attempted=False,
+                success=True,
+                skipped=True,
+            ),),
+        )
+
+
+class FakeEvaluator:
+    async def evaluate_async(self, **kwargs):
+        return RagEvalResult.disabled()
+
+
+def _service(*, retriever, generator, auditor=None, config_updates=None):
+    updates = {
+        "audit_enabled": False,
+        "evaluation_enabled": False,
+        **dict(config_updates or {}),
+    }
+    return RagService(
+        config=settings.model_copy(update=updates),
+        resource_manager=FakeResources(),
+        retriever=retriever,
+        llm_generator=generator,
+        evaluator=FakeEvaluator(),
+        auditor=auditor or FakeAuditor(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_math_direct_bypasses_retrieval_and_generation(tenant_context):
+    retriever = FakeRetriever()
+    
+    generator = FakeGenerator()
+    auditor = FakeAuditor()
+
+    service = _service(
+        retriever=retriever,
+        generator=generator,
+        auditor=auditor,
+    )
+
+    result = await service.query(
+        RagQueryCommand(
+            query="Calcola la copertura di una checklist di 100 controlli: 70 implementati e 20 parziali che valgono al 50%.",
+        ),
+        tenant_context=tenant_context,
+    )
+
+    assert result.execution_mode == RagExecutionMode.MATH_DIRECT
+    assert result.deterministic is True
+    assert retriever.calls == 0
+    assert generator.calls == 0
+    assert auditor.last_audit is not None
+    assert auditor.last_audit.deterministic is True
+    assert auditor.last_audit is not None
+    assert auditor.last_audit.deterministic is True
+    assert "80.00%" in result.answer
+
+
+
+@pytest.mark.asyncio
+async def test_math_with_document_context_bypasses_generation(
+    tenant_context,
+    candidate_factory,
+):
+    candidate = candidate_factory(
+        "math-context-1",
+        filename="risk-assessment.pdf",
+        tier="A",
+        scope="GLOBAL",
+        organization_id=None,
+        score_vec=0.9,
+        content=(
+            "Il risk assessment collega i risultati quantitativi "
+            "alle decisioni di trattamento e ai controlli."
+        ),
+    )
+
+    retriever = FakeRetriever(
+        candidates=(candidate,),
+        debug=RetrievalDebug(
+            qdrant_hits=1,
+            kept_after_quality_filters=1,
+        ),
+    )
+
+    generator = FakeGenerator()
+
+    service = _service(
+        retriever=retriever,
+        generator=generator,
+    )
+
+    result = await service.query(
+        RagQueryCommand(
+            query=(
+                "Calcola la copertura di una checklist di 100 controlli: "
+                "70 implementati e 20 parziali che valgono al 50%. "
+                "Usa le fonti recuperate per contestualizzare il risultato."
+            ),
+        ),
+        tenant_context=tenant_context,
+    )
+
+    assert result.execution_mode == RagExecutionMode.MATH_DIRECT
+    assert result.deterministic is True
+
+    # Il retrieval è necessario per il contesto.
+    assert retriever.calls == 1
+
+    # Ollama non deve essere chiamato.
+    assert generator.calls == 0
+
+    assert "80.00%" in result.answer
+    assert "Collegamento documentale" in result.answer
+    assert "risk-assessment.pdf" in result.answer
+
+
+
+
+
+
+@pytest.mark.asyncio
+async def test_documental_query_runs_retrieval_generation_validation_and_audit(
+    tenant_context, candidate_factory
+):
+    candidate = candidate_factory(
+        "c1",
+        filename="policy.pdf",
+        tier="B",
+        score_vec=0.8,
+        content="La policy definisce una procedura formalizzata.",
+    )
+    debug = RetrievalDebug(qdrant_hits=1, kept_after_quality_filters=1)
+    retriever = FakeRetriever(candidates=(candidate,), debug=debug)
+    generator = FakeGenerator()
+    auditor = FakeAuditor()
+    service = _service(retriever=retriever, generator=generator, auditor=auditor)
+
+    result = await service.query(
+        RagQueryCommand(query="Esiste una procedura formalizzata?", max_sources=4),
+        tenant_context=tenant_context,
+    )
+
+    assert result.execution_mode == RagExecutionMode.RAG_GENERATION
+    assert result.sources[0].filename == "policy.pdf"
+    assert "policy.pdf" in result.answer
+    assert retriever.calls == 1
+    assert generator.calls == 1
+    assert auditor.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_no_sources_returns_safe_fallback_without_llm(tenant_context):
+    retriever = FakeRetriever(candidates=(), debug=RetrievalDebug())
+    generator = FakeGenerator()
+    service = _service(retriever=retriever, generator=generator)
+
+    result = await service.query(
+        RagQueryCommand(query="Descrivi il controllo documentale"),
+        tenant_context=tenant_context,
+    )
+
+    assert generator.calls == 0
+    assert result.sources == ()
+    assert "Non ho trovato evidenze sufficienti" in result.answer
+
+
+@pytest.mark.asyncio
+async def test_generation_error_is_wrapped_and_failed_request_is_audited(
+    tenant_context, candidate_factory
+):
+    from core.generation import GenerationTransportError
+
+    candidate = candidate_factory("c1", tier="B", score_vec=0.7)
+    retriever = FakeRetriever(candidates=(candidate,), debug=RetrievalDebug(qdrant_hits=1))
+    auditor = FakeAuditor()
+    generator = FakeGenerator(error=GenerationTransportError("timeout", retryable=True))
+    service = _service(
+        retriever=retriever,
+        generator=generator,
+        auditor=auditor,
+        config_updates={"generation_failure_fallback_enabled": False},
+    )
+
+    with pytest.raises(RagServiceGenerationError):
+        await service.query(
+            RagQueryCommand(query="Valuta la policy"),
+            tenant_context=tenant_context,
+        )
+
+    assert auditor.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_foreign_candidate_is_rejected_by_service_guard(
+    tenant_context, candidate_factory
+):
+    foreign = candidate_factory("foreign", tier="C", organization_id=9999)
+    retriever = FakeRetriever(candidates=(foreign,), debug=RetrievalDebug(qdrant_hits=1))
+    service = _service(retriever=retriever, generator=FakeGenerator())
+
+    with pytest.raises(Exception) as exc_info:
+        await service.query(
+            RagQueryCommand(query="Valuta evidenza"),
+            tenant_context=tenant_context,
+        )
+
+    assert "fuori dal perimetro tenant" in str(exc_info.value)
+
+@pytest.mark.asyncio
+async def test_graph_relation_strict_bypasses_generation(
+    tenant_context,
+    candidate_factory,
+):
+    graph_candidate = candidate_factory(
+        "graph-relation-1",
+        filename="knowledge-graph.md",
+        page=12,
+        tier="C",
+        score_graph=1.0,
+        source_type="graph_relations",
+        content=(
+            "| Entità sorgente | Relazione | Entità target | Documento | Pagina |\n"
+            "|---|---|---|---|---|\n"
+            "| GDPR | NOTIFIES | CSIRT | incident-response.pdf | 12 |"
+        ),
+    )
+
+    retriever = FakeRetriever(
+        candidates=(graph_candidate,),
+        debug=RetrievalDebug(
+            neo4j_direct_hits=1,
+            kept_after_quality_filters=1,
+        ),
+    )
+
+    generator = FakeGenerator()
+
+    service = _service(
+        retriever=retriever,
+        generator=generator,
+    )
+
+    result = await service.query(
+        RagQueryCommand(
+            query=(
+                "Usando Neo4j, traccia le relazioni tra "
+                "«GDPR» e «CSIRT»."
+            ),
+        ),
+        tenant_context=tenant_context,
+    )
+
+    assert result.execution_mode == RagExecutionMode.GRAPH_RELATION_STRICT
+    assert retriever.calls == 1
+    assert generator.calls == 0
+
+    assert "| Entità sorgente | Relazione | Entità target |" in result.answer
+    assert "GDPR" in result.answer
+    assert "CSIRT" in result.answer
+    assert "NOTIFIES" in result.answer
+    assert "esplicita nel grafo" in result.answer
+
+
+@pytest.mark.asyncio
+async def test_graph_relation_strict_exposes_only_sources_used_in_answer(
+    tenant_context,
+    candidate_factory,
+):
+    graph_candidate = candidate_factory(
+        "graph-used",
+        filename="knowledge-graph.md",
+        page=12,
+        tier="C",
+        score_graph=1.0,
+        source_type="graph_relations",
+        content=(
+            "| Entità sorgente | Relazione | Entità target | "
+            "Documento | Pagina |\n"
+            "|---|---|---|---|---|\n"
+            "| GDPR | NOTIFIES | CSIRT | "
+            "incident-response.pdf | 12 |"
+        ),
+    )
+
+    irrelevant_candidate = candidate_factory(
+        "graph-unused",
+        filename="note-generiche.md",
+        page=3,
+        tier="B",
+        score_vec=0.9,
+        source_type="text",
+        content=(
+            "Introduzione generale alla governance senza riferimenti "
+            "alle entità richieste nella query."
+        ),
+    )
+
+    retriever = FakeRetriever(
+        candidates=(
+            graph_candidate,
+            irrelevant_candidate,
+        ),
+        debug=RetrievalDebug(
+            neo4j_direct_hits=1,
+            qdrant_hits=1,
+            kept_after_quality_filters=2,
+        ),
+    )
+
+    auditor = FakeAuditor()
+
+    service = _service(
+        retriever=retriever,
+        generator=FakeGenerator(),
+        auditor=auditor,
+    )
+
+    result = await service.query(
+        RagQueryCommand(
+            query=(
+                "Usando Neo4j, traccia le relazioni tra "
+                "«GDPR» e «CSIRT»."
+            ),
+        ),
+        tenant_context=tenant_context,
+    )
+
+    assert (
+        result.execution_mode
+        == RagExecutionMode.GRAPH_RELATION_STRICT
+    )
+
+    assert "note-generiche.md" not in result.answer
+
+    assert [
+        source.id
+        for source in result.sources
+    ] == ["graph-used"]
+
+    assert "GDPR" in result.answer
+    assert "CSIRT" in result.answer
+    assert "NOTIFIES" in result.answer
+    assert "note-generiche.md" not in result.answer
+
+    assert auditor.last_audit is not None
+
+    # L'audit conserva entrambe le fonti recuperate.
+    assert len(
+        auditor.last_audit.retrieved_sources
+    ) == 2
+
+
+@pytest.mark.asyncio
+async def test_formula_strict_bypasses_generation(
+    tenant_context,
+    candidate_factory,
+):
+    formula_candidate = candidate_factory(
+        "formula-strict-1",
+        filename="metriche.md",
+        page=7,
+        tier="B",
+        score_bm25=1.0,
+        source_type="text",
+        content=(
+            "Copertura = "
+            "(implementati + 0.5 * parziali) / totale * 100"
+        ),
+    )
+
+    retriever = FakeRetriever(
+        candidates=(formula_candidate,),
+        debug=RetrievalDebug(
+            postgres_bm25_hits=1,
+            kept_after_quality_filters=1,
+        ),
+    )
+
+    generator = FakeGenerator()
+
+    service = _service(
+        retriever=retriever,
+        generator=generator,
+    )
+
+    result = await service.query(
+        RagQueryCommand(
+            query="Quali formule sono presenti nel corpus?"
+        ),
+        tenant_context=tenant_context,
+    )
+
+    assert result.execution_mode == RagExecutionMode.FORMULA_STRICT
+    assert result.deterministic is True
+
+    assert retriever.calls == 1
+    assert generator.calls == 0
+
+    assert "Formule computazionali recuperate" in result.answer
+    assert "Copertura" in result.answer
+    assert "implementati" in result.answer
+    assert "parziali" in result.answer
+    assert "metriche.md" in result.answer
+    assert "La risposta non inventa formule mancanti" in result.answer
+
+@pytest.mark.asyncio
+async def test_formula_strict_exposes_only_sources_used_in_answer(
+    tenant_context,
+    candidate_factory,
+):
+    formula_candidate = candidate_factory(
+        "formula-used",
+        filename="metriche.md",
+        page=7,
+        tier="B",
+        score_bm25=1.0,
+        content=(
+            "Copertura = "
+            "(implementati + 0.5 * parziali) "
+            "/ totale * 100"
+        ),
+    )
+
+    irrelevant_candidate = candidate_factory(
+        "formula-unused",
+        filename="note-generiche.md",
+        page=3,
+        tier="B",
+        score_vec=0.9,
+        content=(
+            "Introduzione generale alla governance "
+            "senza formule, metriche o soglie esplicite."
+        ),
+    )
+
+    retriever = FakeRetriever(
+        candidates=(
+            formula_candidate,
+            irrelevant_candidate,
+        ),
+        debug=RetrievalDebug(
+            qdrant_hits=1,
+            postgres_bm25_hits=1,
+            kept_after_quality_filters=2,
+        ),
+    )
+
+    auditor = FakeAuditor()
+
+    service = _service(
+        retriever=retriever,
+        generator=FakeGenerator(),
+        auditor=auditor,
+    )
+
+    result = await service.query(
+        RagQueryCommand(
+            query=(
+                "Quali formule sono presenti "
+                "nel corpus?"
+            )
+        ),
+        tenant_context=tenant_context,
+    )
+
+    assert [
+        source.id
+        for source in result.sources
+    ] == ["formula-used"]
+
+    assert "metriche.md" in result.answer
+    assert "note-generiche.md" not in result.answer
+
+    assert auditor.last_audit is not None
+
+    # L'audit deve continuare a conservare
+    # entrambe le fonti recuperate.
+    assert len(
+        auditor.last_audit.retrieved_sources
+    ) == 2
+
+
+
+@pytest.mark.asyncio
+async def test_english_follow_up_terms_are_not_concatenated():
+    router = RagQueryRouter()
+
+    history = (
+        {
+            "role": "user",
+            "content": "Analizza il documento «Guida_operativa.pdf»",
+        },
+        {
+            "role": "assistant",
+            "content": "Risposta precedente.",
+        },
+    )
+
+    go_deeper = router.route(
+        RagQueryCommand(
+            query="Go deeper on this point",
+            history=history,
+        )
+    )
+
+    explore = router.route(
+        RagQueryCommand(
+            query="Explore this aspect",
+            history=history,
+        )
+    )
+
+    assert go_deeper.requested_document == "Guida_operativa.pdf"
+    assert explore.requested_document == "Guida_operativa.pdf"
+    
+    
+@pytest.mark.asyncio
+async def test_graph_strict_ignores_corrupted_travers4j_term():
+    router = RagQueryRouter()
+
+    valid = router.route(
+        RagQueryCommand(
+            query=(
+                "Esegui un traversamento tra "
+                "Asset e Incident"
+            )
+        )
+    )
+
+    corrupted = router.route(
+        RagQueryCommand(
+            query="Descrivi travers4j"
+        )
+    )
+
+    assert valid.graph_search_mode is True
+    assert valid.graph_relation_mode is True
+    assert valid.execution_mode == RagExecutionMode.GRAPH_RELATION_STRICT
+
+    assert corrupted.graph_search_mode is False
+    assert corrupted.graph_relation_mode is False
+    assert corrupted.execution_mode == RagExecutionMode.RAG_GENERATION

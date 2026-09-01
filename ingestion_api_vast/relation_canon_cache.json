@@ -1,0 +1,1237 @@
+{
+  "ASSIGNS_RESPONSIBILITY_TO": {
+    "verb": "ASSIGNS_RESPONSIBILITY_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "CONTAINS_INCIDENT": {
+    "verb": "CONTAINS_INCIDENT",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_COMPONENT": {
+    "verb": "HAS_COMPONENT",
+    "object": "",
+    "qualifier": ""
+  },
+  "APPLIES_TO": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "CLASSIFIES": {
+    "verb": "CLASSIFIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "GOVERNS": {
+    "verb": "GOVERNS",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_A": {
+    "verb": "IS_A",
+    "object": "",
+    "qualifier": ""
+  },
+  "NON_COMPLIANT_WITH": {
+    "verb": "NON_COMPLIANT_WITH",
+    "object": "",
+    "qualifier": ""
+  },
+  "TRIGGERS": {
+    "verb": "TRIGGERS",
+    "object": "",
+    "qualifier": ""
+  },
+  "CONTAINS": {
+    "verb": "CONTAINS",
+    "object": "",
+    "qualifier": ""
+  },
+  "DEFINES": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "NOTIFIES": {
+    "verb": "NOTIFIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "PART_OF": {
+    "verb": "PART_OF",
+    "object": "",
+    "qualifier": ""
+  },
+  "REPORTS_TO": {
+    "verb": "REPORTS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SUPPORTS": {
+    "verb": "SUPPORTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "ACTIVATES": {
+    "verb": "ACTIVATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "LEADS_TO": {
+    "verb": "LEADS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "STARTS": {
+    "verb": "STARTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_DEADLINE": {
+    "verb": "HAS_DEADLINE",
+    "object": "",
+    "qualifier": ""
+  },
+  "MANDATES": {
+    "verb": "MANDATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "ERADICATES": {
+    "verb": "ERADICATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "FOLLOWS": {
+    "verb": "FOLLOWS",
+    "object": "",
+    "qualifier": ""
+  },
+  "IMPLEMENTES": {
+    "verb": "IMPLEMENTES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IMPROVES": {
+    "verb": "IMPROVES",
+    "object": "",
+    "qualifier": ""
+  },
+  "MITIGATES": {
+    "verb": "MITIGATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "RECOVERS": {
+    "verb": "RECOVERS",
+    "object": "",
+    "qualifier": ""
+  },
+  "REDUCES": {
+    "verb": "REDUCES",
+    "object": "",
+    "qualifier": ""
+  },
+  "VULNERABLE_TO": {
+    "verb": "VULNERABLE_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "COMPLIES_WITH": {
+    "verb": "COMPLIES_WITH",
+    "object": "",
+    "qualifier": ""
+  },
+  "RECEIVES_NOTIFICATION": {
+    "verb": "RECEIVES_NOTIFICATION",
+    "object": "",
+    "qualifier": ""
+  },
+  "IMPLEMENTATION": {
+    "verb": "IMPLEMENTES",
+    "object": "",
+    "qualifier": ""
+  },
+  "REQUIRES_REMEDIATION": {
+    "verb": "REQUIRES_REMEDIATION",
+    "object": "",
+    "qualifier": ""
+  },
+  "REQUIRES": {
+    "verb": "REQUIRES",
+    "object": "",
+    "qualifier": ""
+  },
+  "MANAGES": {
+    "verb": "MANAGES",
+    "object": "",
+    "qualifier": ""
+  },
+  "ANTICIPATES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "ANTICIPATES"
+  },
+  "GENERATES": {
+    "verb": "GENERATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IMPLEMENTED_BY": {
+    "verb": "IMPLEMENTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "REFERENCES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SUBMITS": {
+    "verb": "REPORTS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "THREATENS": {
+    "verb": "THREATENS",
+    "object": "",
+    "qualifier": ""
+  },
+  "MAPS_TO": {
+    "verb": "MAPS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "UPDATE": {
+    "verb": "UPDATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_FORMULA": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": "FORMULA"
+  },
+  "EXPOSES": {
+    "verb": "EXPOSES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IMPACTS": {
+    "verb": "IMPACTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "PROTECTS": {
+    "verb": "PROTECTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_ACCESS_TO": {
+    "verb": "HAS_ACCESS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "VIOLATES": {
+    "verb": "NON_COMPLIANT_WITH",
+    "object": "",
+    "qualifier": ""
+  },
+  "BELONGS_TO": {
+    "verb": "BELONGS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "PROTECTS_AGAINST": {
+    "verb": "PROTECTS",
+    "object": "",
+    "qualifier": "AGAINST"
+  },
+  "APPROVED_BY": {
+    "verb": "APPROVES",
+    "object": "",
+    "qualifier": ""
+  },
+  "RAFFORZA": {
+    "verb": "SUPPORTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "ALIGNS_WITH": {
+    "verb": "ALIGNS_WITH",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_GAP": {
+    "verb": "HAS_GAP",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_COMPLIANCE_STATUS": {
+    "verb": "HAS_COMPLIANCE_STATUS",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_ASSET": {
+    "verb": "HAS_COMPONENT",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_NOT": {
+    "verb": "DOES_NOT",
+    "object": "",
+    "qualifier": ""
+  },
+  "NON_APPLIES_TO": {
+    "verb": "DOES_NOT_APPLY_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "NON_HAS_COMPONENT": {
+    "verb": "HAS_NO_COMPONENT",
+    "object": "",
+    "qualifier": ""
+  },
+  "CONTROLS": {
+    "verb": "CONTROLS",
+    "object": "",
+    "qualifier": ""
+  },
+  "PURPOSE": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "USES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "TRANSFER_TO": {
+    "verb": "TRANSFER_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_ACCESS": {
+    "verb": "HAS_ACCESS",
+    "object": "",
+    "qualifier": ""
+  },
+  "PRECEDES": {
+    "verb": "PRECEDES",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_VIEWED": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "HAS_VIEWED"
+  },
+  "RECEIVES": {
+    "verb": "RECEIVES_NOTIFICATION",
+    "object": "",
+    "qualifier": ""
+  },
+  "ACCESSES": {
+    "verb": "ACCESS",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_OPPONENT_OF": {
+    "verb": "BELONGS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SUPPORTS_EVIDENCE_FOR": {
+    "verb": "SUPPORTS_EVIDENCE_FOR",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_RESPONSIBILITY_TO": {
+    "verb": "ASSIGNS_RESPONSIBILITY_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "AVOIDS": {
+    "verb": "AVOIDS",
+    "object": "",
+    "qualifier": ""
+  },
+  "MAINTAINS": {
+    "verb": "MANAGES",
+    "object": "",
+    "qualifier": ""
+  },
+  "ENABLES": {
+    "verb": "ENABLES",
+    "object": "",
+    "qualifier": ""
+  },
+  "CONTRIBUTES_TO": {
+    "verb": "CONTRIBUTES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "AFFECTS": {
+    "verb": "AFFECTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "MEASURES": {
+    "verb": "MEASURES",
+    "object": "",
+    "qualifier": ""
+  },
+  "MONITORS": {
+    "verb": "MONITORS",
+    "object": "",
+    "qualifier": ""
+  },
+  "COMMUNICATES_TO": {
+    "verb": "COMMUNICATES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "DEPENDS_ON": {
+    "verb": "DEPENDS_ON",
+    "object": "",
+    "qualifier": ""
+  },
+  "APPROVES": {
+    "verb": "APPROVES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IMPLEMENTS": {
+    "verb": "IMPLEMENTES",
+    "object": "",
+    "qualifier": ""
+  },
+  "SELECTS": {
+    "verb": "SELECTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "UPDATES": {
+    "verb": "UPDATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "ALLIGNS_WITH": {
+    "verb": "ALIGNS_WITH",
+    "object": "",
+    "qualifier": ""
+  },
+  "COORDINATES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "COORDINATES"
+  },
+  "VERIFIES": {
+    "verb": "VERIFIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "ASSOCIATED_WITH": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "ASSOCIATED_WITH"
+  },
+  "COLLABORATES_WITH": {
+    "verb": "COLLABORATES_WITH",
+    "object": "",
+    "qualifier": ""
+  },
+  "IDENTIFIES": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "FORMS": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "FORMS"
+  },
+  "PERFORMS": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "PUBLISHED_BY": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "PUBLISHED_BY"
+  },
+  "VALUATES": {
+    "verb": "EVALUATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "SEPARATES": {
+    "verb": "SEPARATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "DECREASES": {
+    "verb": "REDUCES",
+    "object": "",
+    "qualifier": ""
+  },
+  "INCREASES": {
+    "verb": "INCREASES",
+    "object": "",
+    "qualifier": ""
+  },
+  "INTEGRATES": {
+    "verb": "SUPPORTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "PROMOTES": {
+    "verb": "ENABLES",
+    "object": "",
+    "qualifier": ""
+  },
+  "EVIDENCES": {
+    "verb": "GENERATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "INFORMS": {
+    "verb": "NOTIFIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "CENTRALIZES": {
+    "verb": "MANAGES",
+    "object": "",
+    "qualifier": ""
+  },
+  "DOCUMENTS": {
+    "verb": "GENERATES",
+    "object": "AUDIT/EVIDENCE",
+    "qualifier": ""
+  },
+  "REVIEW": {
+    "verb": "REVIEWS",
+    "object": "",
+    "qualifier": ""
+  },
+  "INCLUDES": {
+    "verb": "CONTAINS",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_BASED_ON": {
+    "verb": "BASED_ON",
+    "object": "",
+    "qualifier": ""
+  },
+  "SELECTED_BY": {
+    "verb": "SELECTED_BY",
+    "object": "",
+    "qualifier": ""
+  },
+  "SHARED_WITH": {
+    "verb": "SHARED_WITH",
+    "object": "",
+    "qualifier": ""
+  },
+  "NON_APPLICABLE_TO": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "NON_APPLICABLE"
+  },
+  "REQUIRES_REVISION": {
+    "verb": "REQUIRES",
+    "object": "",
+    "qualifier": "REVISION"
+  },
+  "VERIFIED_BY": {
+    "verb": "VERIFIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "AMENDS": {
+    "verb": "MODIFIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "REPEALS": {
+    "verb": "ABOLISHES",
+    "object": "",
+    "qualifier": ""
+  },
+  "OPERATES_IN": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SUBJECT_TO": {
+    "verb": "GOVERNS",
+    "object": "",
+    "qualifier": ""
+  },
+  "COOPERATES_WITH": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "RELEVANT_TO": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "CONNECTED_TO": {
+    "verb": "PART_OF",
+    "object": "",
+    "qualifier": ""
+  },
+  "CAN_REGISTER_IN": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "REGISTER"
+  },
+  "BASED_ON": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "DEMONSTRATES": {
+    "verb": "SUPPORTS_EVIDENCE_FOR",
+    "object": "",
+    "qualifier": ""
+  },
+  "INTERACTS_WITH": {
+    "verb": "INTERACTS_WITH",
+    "object": "",
+    "qualifier": ""
+  },
+  "EXPLOITS": {
+    "verb": "EXPLOITS",
+    "object": "",
+    "qualifier": ""
+  },
+  "GUIDES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "GUIDES"
+  },
+  "SUPERVISES": {
+    "verb": "MANAGES",
+    "object": "",
+    "qualifier": "SUPERVISES"
+  },
+  "REQUIRES_ACCESS_TO": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "REQUIRES_NOTIFICATION_TO": {
+    "verb": "NOTIFIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "OVERRIES": {
+    "verb": "OVERRIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "PROVIDES": {
+    "verb": "PROVIDES",
+    "object": "",
+    "qualifier": ""
+  },
+  "DATED": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "ASSISTS": {
+    "verb": "SUPPORTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "HANDLES": {
+    "verb": "HANDLES",
+    "object": "",
+    "qualifier": ""
+  },
+  "COVERS": {
+    "verb": "CONTAINS",
+    "object": "",
+    "qualifier": ""
+  },
+  "PARTICIPATES_IN": {
+    "verb": "BELONGS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "ANALYSES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "ANALYSIS"
+  },
+  "PROVIDES_ASSISTANCE_TO": {
+    "verb": "SUPPORTS",
+    "object": "ASSISTANCE",
+    "qualifier": ""
+  },
+  "REQUIRES_ASSISTANCE_FROM": {
+    "verb": "DEPENDS_ON",
+    "object": "ASSISTANCE",
+    "qualifier": ""
+  },
+  "RESPONDS_TO": {
+    "verb": "RESPONSIBLE_FOR",
+    "object": "",
+    "qualifier": "RESPONSE"
+  },
+  "DETECTS": {
+    "verb": "DETECTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "COMPOSED_OF": {
+    "verb": "PART_OF",
+    "object": "",
+    "qualifier": ""
+  },
+  "MEETS_WITH": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "PROVIDES_SECRETARIAT": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "SUBMITS_REPORT_TO": {
+    "verb": "REPORTS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "ASSESSES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SUBMITTED_TO": {
+    "verb": "REPORTS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "FORWARDS_NOTIFICATION": {
+    "verb": "NOTIFIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "INFORMS_ABOUT_THREAT": {
+    "verb": "REPORTS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "COLLECTS": {
+    "verb": "COLLECTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_RESPONSIBILITY_FOR": {
+    "verb": "ASSIGNS_RESPONSIBILITY_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "APPOINTS": {
+    "verb": "ASSIGNS_RESPONSIBILITY_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "IMPOSES": {
+    "verb": "MANDATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "PREVENTS": {
+    "verb": "MITIGATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "REPORTED_BY": {
+    "verb": "REPORTS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_DELETED": {
+    "verb": "ERADICATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_REPEALED": {
+    "verb": "RECOVERS",
+    "object": "",
+    "qualifier": ""
+  },
+  "REFERS_TO": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "CAN_USE": {
+    "verb": "SUPPORTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_PART_OF": {
+    "verb": "PART_OF",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_RELATED_TO": {
+    "verb": "MAPS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_INPUT": {
+    "verb": "HAS_COMPONENT",
+    "object": "",
+    "qualifier": ""
+  },
+  "RECOGNIZES": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_APPROVED_BY": {
+    "verb": "APPROVES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_AWARE_OF": {
+    "verb": "AWARE_OF",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_INCLUDED_IN": {
+    "verb": "INCLUDED_IN",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_PROVIDED_TO": {
+    "verb": "PROVIDES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_REVIEWED": {
+    "verb": "REVIEWS",
+    "object": "",
+    "qualifier": ""
+  },
+  "TESTS": {
+    "verb": "TESTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "INFLUENCES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "INFLUENCES"
+  },
+  "COMPARES_TO": {
+    "verb": "COMPARIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "PRODUCES": {
+    "verb": "GENERATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "DEVELOPS": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_CAUSE": {
+    "verb": "TRIGGERS",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_OBLIGATION": {
+    "verb": "MANDATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_RIGHT": {
+    "verb": "REQUIRES",
+    "object": "",
+    "qualifier": ""
+  },
+  "ADAPTS_TO": {
+    "verb": "ADAPTS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "ENTERS_IN_CONFLICT_WITH": {
+    "verb": "CONFLICTS_WITH",
+    "object": "",
+    "qualifier": ""
+  },
+  "AVOVA_LA_CREAZIONE": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": "CREAZIONE"
+  },
+  "COMBINES_WITH": {
+    "verb": "PART_OF",
+    "object": "",
+    "qualifier": ""
+  },
+  "TRANSMITS_TO": {
+    "verb": "NOTIFIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_RESPONSIBILITY": {
+    "verb": "ASSIGNS_RESPONSIBILITY_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "AUTHORED_BY": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "PUBLISHED": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "PUBLISHED"
+  },
+  "APART_FROM": {
+    "verb": "IS_A",
+    "object": "",
+    "qualifier": ""
+  },
+  "COLLIDED_WITH": {
+    "verb": "THREATENS",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_KNOWLEDGE_OF": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "HAS_KNOWLEDGE_OF"
+  },
+  "MODIFIES": {
+    "verb": "MODIFIES",
+    "object": "",
+    "qualifier": ""
+  },
+  "SEPARATES_FROM": {
+    "verb": "SEPARATES_FROM",
+    "object": "",
+    "qualifier": ""
+  },
+  "RECOMMENDS": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": "RECOMMENDS"
+  },
+  "ISOLATES": {
+    "verb": "ISOLATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_PROTECTED_BY": {
+    "verb": "PROTECTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "AVOIDS_CREATION_OF": {
+    "verb": "AVOIDS",
+    "object": "",
+    "qualifier": "CREATION_OF"
+  },
+  "GUARANTEES": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "TRACKS": {
+    "verb": "MONITORS",
+    "object": "",
+    "qualifier": ""
+  },
+  "CREATES": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_REQUIRED_TO_CHANGE": {
+    "verb": "REQUIRES_REMEDIATION",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_EQUAL_TO": {
+    "verb": "EQUALS",
+    "object": "",
+    "qualifier": ""
+  },
+  "LOCATED_ON": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "EMPLOYS": {
+    "verb": "BELONGS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "ASSIGN_TO": {
+    "verb": "APPROVES",
+    "object": "",
+    "qualifier": ""
+  },
+  "CONTROLS_ACCESS_TO": {
+    "verb": "CONTROLS_ACCESS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "REPEATS": {
+    "verb": "FOLLOWS",
+    "object": "",
+    "qualifier": ""
+  },
+  "ENSURES": {
+    "verb": "ENSURES",
+    "object": "",
+    "qualifier": ""
+  },
+  "SHARES_INFORMATION_WITH": {
+    "verb": "COMMUNICATES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SHARES": {
+    "verb": "PART_OF",
+    "object": "",
+    "qualifier": ""
+  },
+  "RE-EVALUATES": {
+    "verb": "EVALUATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "COMPROMISES": {
+    "verb": "COMPROMISES",
+    "object": "",
+    "qualifier": ""
+  },
+  "COINVOLVES": {
+    "verb": "PART_OF",
+    "object": "",
+    "qualifier": ""
+  },
+  "COMMUNICATES_WITH": {
+    "verb": "COMMUNICATES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "DISABILITA": {
+    "verb": "MITIGATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "MITIGA": {
+    "verb": "MITIGATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "TRANSFERRED_TO": {
+    "verb": "TRANSFERRED_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_LOCATED_IN": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "ACQUIRES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "DELETES": {
+    "verb": "ERADICATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "DISABLES": {
+    "verb": "HANDLES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_LOCATED_AT": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "LOCATED_IN": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "ACCESS_TO": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_IMPACT": {
+    "verb": "IMPACTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "EVALUATES": {
+    "verb": "EVALUATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "POSSESSES": {
+    "verb": "HAS_COMPONENT",
+    "object": "",
+    "qualifier": ""
+  },
+  "PREPARES_AND_SENDS": {
+    "verb": "NOTIFIES",
+    "object": "",
+    "qualifier": "PREPARES_AND_SENDS"
+  },
+  "MEETS": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SERVES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_DELETED_WITH": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "IS_DELETED_WITH"
+  },
+  "REQUIRES_APPROVAL_FROM": {
+    "verb": "APPROVES",
+    "object": "",
+    "qualifier": ""
+  },
+  "MASQUERADES_AS": {
+    "verb": "MASKS_AS",
+    "object": "",
+    "qualifier": ""
+  },
+  "DELIVERS": {
+    "verb": "DELIVERS",
+    "object": "",
+    "qualifier": ""
+  },
+  "INFECTS": {
+    "verb": "EXPLOITS",
+    "object": "",
+    "qualifier": ""
+  },
+  "INSTALLS": {
+    "verb": "IMPLEMENTES",
+    "object": "",
+    "qualifier": ""
+  },
+  "APPEARS_AS": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "TARGETS": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_ROLE": {
+    "verb": "ASSIGNS_RESPONSIBILITY_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "CAN_ACCESS": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_CONNECTED_TO": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "EVENT": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IMPOSES_REQUIREMENT": {
+    "verb": "MANDATES",
+    "object": "",
+    "qualifier": ""
+  },
+  "SECURED_BY": {
+    "verb": "PROTECTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "RESPONSIBLE_FOR": {
+    "verb": "ASSIGNS_RESPONSIBILITY_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SHOULD_FOLLOW": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SHOULD_MAINTAIN": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SHOULD_PERFORM": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "SHOULD_USE": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "LOCATED_AT": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "REGISTERED_IN": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "ASSOCIATES_WITH": {
+    "verb": "PART_OF",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_CONTRACT_WITH": {
+    "verb": "APPLIES_TO",
+    "object": "CONTRACT",
+    "qualifier": ""
+  }
+}

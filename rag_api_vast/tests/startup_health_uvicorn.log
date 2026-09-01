@@ -1,0 +1,10 @@
+INFO:     Started server process [200812]
+INFO:     Waiting for application startup.
+POC_MODE: ruolo PostgreSQL privilegiato consentito (user=admin, superuser=True, bypassrls=True)
+Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]Loading weights: 100%|##########| 391/391 [00:00<00:00, 27797.56it/s]
+Loading weights:   0%|          | 0/105 [00:00<?, ?it/s]Loading weights: 100%|##########| 105/105 [00:00<00:00, 5987.71it/s]
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:49327 - "GET /health/live HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49328 - "GET /health/ready HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49329 - "GET /health/ready?deep=true HTTP/1.1" 200 OK

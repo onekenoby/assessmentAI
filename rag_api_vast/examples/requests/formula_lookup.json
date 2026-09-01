@@ -1,0 +1,11 @@
+{
+  "query": "Individua e spiega la formula relativa alla soglia indicata nei documenti.",
+  "conversation_id": "vast-formula-test-001",
+  "history": [],
+  "options": {
+    "include_sources": true,
+    "include_debug": true,
+    "include_evaluation": false,
+    "max_sources": 8
+  }
+}

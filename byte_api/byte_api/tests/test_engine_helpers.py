@@ -33,6 +33,14 @@ def test_sanitize_filename_rejects_invalid(value):
         ("a.pdf", None, "application/pdf"),
         ("a.md", None, "text/markdown"),
         ("a.markdown", None, "text/markdown"),
+        ("a.txt", None, "text/plain"),
+        (
+            "a.docx",
+            None,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        ("archive.zip", None, "application/zip"),
+        ("file.custom", None, "application/octet-stream"),
         ("a.pdf", " APPLICATION/X-PDF ", "application/x-pdf"),
     ],
 )
@@ -51,9 +59,72 @@ def test_prepare_file_calculates_hash_and_size():
 
 
 @pytest.mark.parametrize(
+    "filename,data,expected_suffix,expected_mime",
+    [
+        ("document.txt", b"testo", ".txt", "text/plain"),
+        (
+            "document.docx",
+            b"PK\x03\x04test",
+            ".docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        ("archive.zip", b"PK\x03\x04archive", ".zip", "application/zip"),
+        ("image.png", b"\x89PNG\r\n\x1a\n", ".png", "image/png"),
+        (
+            "file.custom",
+            b"custom content",
+            ".custom",
+            "application/octet-stream",
+        ),
+    ],
+)
+def test_prepare_file_accepts_arbitrary_extensions(
+    filename, data, expected_suffix, expected_mime
+):
+    prepared = engine.prepare_file(
+        engine.UploadFileData(filename, data),
+        max_file_bytes=1024,
+    )
+    assert prepared.filename == filename
+    assert prepared.suffix == expected_suffix
+    assert prepared.data == data
+    assert prepared.size == len(data)
+    assert prepared.mime_type == expected_mime
+    assert prepared.sha256 == hashlib.sha256(data).hexdigest()
+
+
+def test_prepare_file_accepts_file_without_extension():
+    prepared = engine.prepare_file(
+        engine.UploadFileData("LICENSE", b"license content"),
+        max_file_bytes=100,
+    )
+    assert prepared.filename == "LICENSE"
+    assert prepared.suffix == ""
+    assert prepared.mime_type == "application/octet-stream"
+
+
+@pytest.mark.parametrize(
+    "filename,mime_type,expected",
+    [
+        ("document.pdf", "application/pdf", "pdf"),
+        (
+            "document.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "docx",
+        ),
+        ("archive.zip", "application/zip", "zip"),
+        ("file.custom", "application/octet-stream", "custom"),
+        ("LICENSE", "application/octet-stream", "binary"),
+        ("README", "text/plain", "plain"),
+    ],
+)
+def test_detect_source_format(filename, mime_type, expected):
+    assert engine.detect_source_format(filename, mime_type) == expected
+
+
+@pytest.mark.parametrize(
     "file, limit, message",
     [
-        (engine.UploadFileData("a.txt", b"x"), 10, "PDF o Markdown"),
         (engine.UploadFileData("a.pdf", b""), 10, "vuoto"),
         (engine.UploadFileData("a.pdf", b"123"), 2, "troppo grande"),
     ],
