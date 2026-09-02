@@ -545,7 +545,7 @@ CROP_DPI = int(
 )
 
 KG_WORKERS = int(
-    os.getenv("KG_WORKERS", "1")
+    os.getenv("KG_WORKERS", "4") #1
 )
 
 kg_executor = ThreadPoolExecutor(
@@ -4317,11 +4317,11 @@ def llm_chat(prompt: str, text: str, model: str, max_tokens: int = LLM_MAX_TOKEN
 # - massimo 2 chiamate testuali concorrenti;
 # - massimo 1 chiamata Vision concorrente.
 OLLAMA_TEXT_PARALLELISM = max(
-    1,
+    4,
     int(
         os.getenv(
             "OLLAMA_TEXT_PARALLELISM",
-            "2",
+            "4",
         )
     ),
 )
