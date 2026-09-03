@@ -1233,5 +1233,325 @@
     "verb": "APPLIES_TO",
     "object": "CONTRACT",
     "qualifier": ""
+  },
+  "HAS_VERSION": {
+    "verb": "HAS_VERSION",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_ASSOCIATED_WITH": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "IS_ASSOCIATED_WITH"
+  },
+  "HAS": {
+    "verb": "HAS_COMPONENT",
+    "object": "",
+    "qualifier": ""
+  },
+  "PREPARES": {
+    "verb": "PREPARES",
+    "object": "",
+    "qualifier": ""
+  },
+  "PROPOSES": {
+    "verb": "PROPOSES",
+    "object": "",
+    "qualifier": ""
+  },
+  "APPLIES": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "ASSIGNS": {
+    "verb": "ASSIGNS_RESPONSIBILITY_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "COMMUNICATES": {
+    "verb": "COMMUNICATES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "CONTROLS_ACCESS": {
+    "verb": "CONTROLS_ACCESS",
+    "object": "",
+    "qualifier": ""
+  },
+  "RESIDES_ON": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "RESIDES_ON"
+  },
+  "REMOVES": {
+    "verb": "REMOVES",
+    "object": "",
+    "qualifier": ""
+  },
+  "MONITORED_BY": {
+    "verb": "MONITORS",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_STORED_IN": {
+    "verb": "CONTAINS",
+    "object": "",
+    "qualifier": "IS_STORED_IN"
+  },
+  "CLOSES": {
+    "verb": "CLOSES",
+    "object": "",
+    "qualifier": ""
+  },
+  "HAS_REQUIREMENT": {
+    "verb": "REQUIRES",
+    "object": "",
+    "qualifier": ""
+  },
+  "PROTECT": {
+    "verb": "PROTECTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_RESPONSIBLE_FOR": {
+    "verb": "ASSIGNS_RESPONSIBILITY_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "DISCOVERS": {
+    "verb": "DISCOVERS",
+    "object": "",
+    "qualifier": ""
+  },
+  "REQUIRES_NOTIFICATION": {
+    "verb": "REQUIRES_NOTIFICATION",
+    "object": "",
+    "qualifier": ""
+  },
+  "CAUSES": {
+    "verb": "TRIGGERS",
+    "object": "",
+    "qualifier": ""
+  },
+  "EXCLUDES": {
+    "verb": "EXCLUDES",
+    "object": "",
+    "qualifier": ""
+  },
+  "APPROVA": {
+    "verb": "APPROVES",
+    "object": "",
+    "qualifier": ""
+  },
+  "SUPERVISIONA": {
+    "verb": "SUPERVISIONA",
+    "object": "",
+    "qualifier": ""
+  },
+  "IMPLEMENT": {
+    "verb": "IMPLEMENT",
+    "object": "",
+    "qualifier": ""
+  },
+  "CONSIDERS": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "CONSIDERS"
+  },
+  "INTERVIEWS": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": "INTERVIEWS"
+  },
+  "UNDERGOES": {
+    "verb": "UNDERGOES",
+    "object": "",
+    "qualifier": ""
+  },
+  "INTERESSA": {
+    "verb": "INTERESTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "AUTHORIZES": {
+    "verb": "APPROVES",
+    "object": "",
+    "qualifier": ""
+  },
+  "OWNS": {
+    "verb": "BELONGS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "THREAT": {
+    "verb": "THREATENS",
+    "object": "",
+    "qualifier": ""
+  },
+  "MUST_RETURN": {
+    "verb": "REQUIRES",
+    "object": "",
+    "qualifier": "RETURN"
+  },
+  "IS_AFFECTED_BY": {
+    "verb": "AFFECTS",
+    "object": "",
+    "qualifier": "IS_AFFECTED_BY"
+  },
+  "STORED_IN": {
+    "verb": "CONTAINS",
+    "object": "",
+    "qualifier": "STORED_IN"
+  },
+  "ACCESS": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "ACCESS"
+  },
+  "DEFENDS": {
+    "verb": "DEFENDS",
+    "object": "",
+    "qualifier": ""
+  },
+  "DISTRIBUTES": {
+    "verb": "DISTRIBUTES",
+    "object": "",
+    "qualifier": ""
+  },
+  "CRIPTOGRAPHIA": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": "CRIPTOGRAPHIA"
+  },
+  "ALLOWS_ACCESS": {
+    "verb": "ALLOWS_ACCESS",
+    "object": "",
+    "qualifier": ""
+  },
+  "MASQUERADES": {
+    "verb": "MASQUERADES",
+    "object": "",
+    "qualifier": ""
+  },
+  "REGISTERS": {
+    "verb": "REGISTERS",
+    "object": "",
+    "qualifier": ""
+  },
+  "CONNECTS_TO": {
+    "verb": "CONNECTS_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "EXECUTED_IN": {
+    "verb": "EXECUTED_IN",
+    "object": "",
+    "qualifier": ""
+  },
+  "DEVELOPED_BY": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": "DEVELOPED_BY"
+  },
+  "BACKED_UP_BY": {
+    "verb": "SUPPORTS",
+    "object": "",
+    "qualifier": "BACKED_UP_BY"
+  },
+  "GRANTS_ACCESS": {
+    "verb": "GRANTS_ACCESS",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_USED_BY": {
+    "verb": "IS_USED_BY",
+    "object": "",
+    "qualifier": ""
+  },
+  "ESCALATES_TO": {
+    "verb": "ESCALATES_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "IS_EXPOSED_TO": {
+    "verb": "EXPOSED_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "CREATED": {
+    "verb": "DEFINES",
+    "object": "",
+    "qualifier": "CREATED"
+  },
+  "REQUIRES_CHANGE": {
+    "verb": "REQUIRES",
+    "object": "",
+    "qualifier": "CHANGE"
+  },
+  "VISIT": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "VISIT"
+  },
+  "REALIZES": {
+    "verb": "REALIZES",
+    "object": "",
+    "qualifier": ""
+  },
+  "IMPLEMENTED": {
+    "verb": "IMPLEMENTED",
+    "object": "",
+    "qualifier": ""
+  },
+  "RISK_ASSESSMENT": {
+    "verb": "DEFINES",
+    "object": "RISK_ASSESSMENT",
+    "qualifier": ""
+  },
+  "USED_BY": {
+    "verb": "APPLIES_TO",
+    "object": "",
+    "qualifier": "USED_BY"
+  },
+  "INTERESTED_IN": {
+    "verb": "INTERESTED_IN",
+    "object": "",
+    "qualifier": ""
+  },
+  "SIMILAR_TO": {
+    "verb": "SIMILAR_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "EXPOSED_TO": {
+    "verb": "EXPOSED_TO",
+    "object": "",
+    "qualifier": ""
+  },
+  "REQUIRES_AUTHORIZATION": {
+    "verb": "REQUIRES",
+    "object": "",
+    "qualifier": "AUTHORIZATION"
+  },
+  "DISABILITA_ACCESSO": {
+    "verb": "COMPLIES_WITH",
+    "object": "",
+    "qualifier": "DISABILITA_ACCESSO"
+  },
+  "HAS_CLIENTS": {
+    "verb": "HAS_CLIENTS",
+    "object": "",
+    "qualifier": ""
+  },
+  "VISITS": {
+    "verb": "VISITS",
+    "object": "",
+    "qualifier": ""
+  },
+  "BLOCKS": {
+    "verb": "BLOCKS",
+    "object": "",
+    "qualifier": ""
   }
 }

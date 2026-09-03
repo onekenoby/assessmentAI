@@ -60,10 +60,59 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import concurrent.futures as cf
 import subprocess
 import requests
+from requests.adapters import HTTPAdapter
 from threading import Lock
 import gc
 import queue
 import threading
+# ============================================================
+# HTTP CONNECTION POOL
+# ============================================================
+# Una Session per thread.
+# Mantiene aperte le connessioni HTTP verso Vast
+# senza condividere la stessa Session tra i worker KG.
+#
+# Configurazione fissa e non adattativa.
+# ============================================================
+
+_HTTP_LOCAL = threading.local()
+
+
+def get_http_session() -> requests.Session:
+
+    session = getattr(
+        _HTTP_LOCAL,
+        "session",
+        None,
+    )
+
+    if session is None:
+
+        session = requests.Session()
+
+        adapter = HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=4,
+            pool_block=True,
+        )
+
+        session.mount(
+            "http://",
+            adapter,
+        )
+
+        session.mount(
+            "https://",
+            adapter,
+        )
+
+        _HTTP_LOCAL.session = session
+
+    return session
+
+
+
+
 import tempfile
 from pathlib import Path
 
@@ -90,10 +139,13 @@ from psycopg2.extras import Json, execute_values, RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2 import errors as pg_errors
 
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer,util
 from qdrant_client import QdrantClient, models
 from neo4j import GraphDatabase
 from openai import OpenAI
+import numpy as np
+
+
 
 # OLLAMA
 #from ollama import chat
@@ -465,6 +517,12 @@ PG_COMMIT_EVERY_N_PAGES = int(os.getenv("PG_COMMIT_EVERY_N_PAGES", "25"))
 
 # KG extraction (solo dove serve)
 KG_ENABLED = os.getenv("KG_ENABLED", "1") == "1"
+INGESTION_VERBOSE_CHUNKS = (
+    os.getenv(
+        "INGESTION_VERBOSE_CHUNKS",
+        "0",
+    ) == "1"
+)
 KG_MIN_LEN = int(os.getenv("KG_MIN_LEN", "100")) #
 MAX_KG_CHUNKS_PER_DOC = int(os.getenv("MAX_KG_CHUNKS_PER_DOC", "0"))
 # Il limite KG è disabilitato di default. Viene applicato soltanto se
@@ -512,7 +570,7 @@ KG_NUM_CTX = int(
 KG_MAX_OUTPUT_TOKENS = int(
     os.getenv(
         "KG_MAX_OUTPUT_TOKENS",
-        "1400",
+        "1800",
     )
 )
 
@@ -698,22 +756,108 @@ def ai_gatekeeper_decision_from_vec(vec, threshold: float = 0.38) -> bool:
     if _GK_ANCHOR_EMBEDDINGS is None:
         _GK_ANCHOR_EMBEDDINGS = embedder.encode(GATEKEEPER_CONCEPTS, convert_to_tensor=True)
 
+
+
+
     # vec -> torch tensor (1, dim)
     if not isinstance(vec, torch.Tensor):
-        vec_t = torch.tensor(vec, dtype=torch.float32)
+        vec_t = torch.tensor(
+            vec,
+            dtype=torch.float32,
+        )
     else:
         vec_t = vec.float()
 
-    if vec_t.dim() == 1:
-        vec_t = vec_t.unsqueeze(0)
+    # Le anchor sono sullo stesso device dell'embedder.
+    # Spostiamo deterministicamente il vettore chunk sul loro device.
+    if isinstance(
+        _GK_ANCHOR_EMBEDDINGS,
+        torch.Tensor,
+    ):
+        vec_t = vec_t.to(
+            _GK_ANCHOR_EMBEDDINGS.device
+        )
 
-    scores = util.cos_sim(vec_t, _GK_ANCHOR_EMBEDDINGS)
+    scores = util.cos_sim(
+        vec_t,
+        _GK_ANCHOR_EMBEDDINGS,
+    )
+    
+    
+    
     max_score = float(torch.max(scores))
 
-    if max_score > 0.3:
-        print(f"   [GK] Score(vec): {max_score:.3f}")
+    if (
+        INGESTION_VERBOSE_CHUNKS
+        and max_score > 0.3
+    ):
+        print(
+            f"   [GK] Score(vec): "
+            f"{max_score:.3f}"
+        )
 
     return max_score >= threshold
+
+
+def warmup_embedding_runtime() -> None:
+    """
+    Warm-up deterministico embeddings +
+    anchor Gatekeeper.
+
+    Funziona sia con provider remote
+    sia con provider local.
+    """
+
+    global _GK_ANCHOR_EMBEDDINGS
+
+    t0 = time.time()
+
+    model = get_embedder()
+
+
+    # --------------------------------------------------------
+    # 1. Warm-up embedding runtime
+    # --------------------------------------------------------
+
+    _ = model.encode(
+        [
+            "warmup embedding runtime"
+        ],
+        batch_size=1,
+        show_progress_bar=False,
+    )
+
+
+    # --------------------------------------------------------
+    # 2. Anchor Gatekeeper
+    # --------------------------------------------------------
+
+    if _GK_ANCHOR_EMBEDDINGS is None:
+
+        _GK_ANCHOR_EMBEDDINGS = (
+            model.encode(
+                GATEKEEPER_CONCEPTS,
+                batch_size=8,
+                convert_to_tensor=True,
+                show_progress_bar=False,
+            )
+        )
+
+
+    elapsed_ms = int(
+        (time.time() - t0)
+        * 1000
+    )
+
+
+    print(
+        f"   🔥 Embedding runtime warmed | "
+        f"provider={EMBEDDING_PROVIDER} | "
+        f"model={EMBEDDING_MODEL_NAME} | "
+        f"dimension={EMBEDDING_DIMENSION} | "
+        f"anchors={len(GATEKEEPER_CONCEPTS)} | "
+        f"time={elapsed_ms}ms"
+    )
 
 
 
@@ -823,12 +967,170 @@ USE_REMOTE_OLLAMA = os.getenv("USE_REMOTE_OLLAMA", "0") == "1"
 OLLAMA_AUTOSTART = os.getenv("OLLAMA_AUTOSTART", "1") == "1"
 
 
+OLLAMA_TEXT_WARMUP_SLOTS = 4
 
+
+def warmup_ollama_text_model() -> None:
+    """
+    Warm-up deterministico dei 4 slot testuali Ollama.
+
+    - stesso modello del KG;
+    - stesso num_ctx del KG;
+    - 4 richieste fisse;
+    - num_predict=1;
+    - nessun effetto sulla Knowledge Base.
+    """
+
+    if not LLM_MODEL_NAME:
+        return
+
+    t0 = time.time()
+
+
+    def _warmup_slot() -> None:
+
+        payload = {
+            "model": LLM_MODEL_NAME,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "OK",
+                }
+            ],
+            "stream": False,
+            "keep_alive": (
+                OLLAMA_REQUEST_KEEP_ALIVE
+            ),
+            "options": {
+                "temperature": 0,
+                "num_predict": 1,
+                "num_ctx": KG_NUM_CTX,
+            },
+        }
+
+        response = (
+            get_http_session().post(
+                OLLAMA_API_CHAT,
+                json=payload,
+                timeout=120,
+            )
+        )
+
+        response.raise_for_status()
+
+
+    with ThreadPoolExecutor(
+        max_workers=OLLAMA_TEXT_WARMUP_SLOTS
+    ) as executor:
+
+        futures = [
+            executor.submit(
+                _warmup_slot
+            )
+            for _ in range(
+                OLLAMA_TEXT_WARMUP_SLOTS
+            )
+        ]
+
+        for future in futures:
+            future.result()
+
+
+    elapsed_ms = int(
+        (time.time() - t0) * 1000
+    )
+
+    print(
+        f"   🔥 Ollama text model warmed | "
+        f"model={LLM_MODEL_NAME} | "
+        f"slots={OLLAMA_TEXT_WARMUP_SLOTS} | "
+        f"num_ctx={KG_NUM_CTX} | "
+        f"time={elapsed_ms}ms"
+    )
 
 # Embeddings
-#EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
 
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "E:/Modelli/bge-m3")
+#EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "E:/Modelli/bge-m3")
+
+# ============================================================
+# EMBEDDINGS
+# ============================================================
+
+# Provider selezionato esplicitamente.
+#
+# remote = BGE-M3 eseguito sul server Vast.
+# local  = SentenceTransformer eseguito sul processo locale.
+#
+# Nessun fallback automatico:
+# se remote è configurato e non risponde, l'ingestion fallisce.
+EMBEDDING_PROVIDER = (
+    os.getenv(
+        "EMBEDDING_PROVIDER",
+        "remote",
+    )
+    .strip()
+    .lower()
+)
+
+if EMBEDDING_PROVIDER not in {
+    "remote",
+    "local",
+}:
+    raise ValueError(
+        "EMBEDDING_PROVIDER deve essere "
+        "'remote' oppure 'local'"
+    )
+
+
+# Nome canonico memorizzato nei metadati
+# PostgreSQL / Qdrant / Neo4j.
+EMBEDDING_MODEL_NAME = os.getenv(
+    "EMBEDDING_MODEL_NAME",
+    "BAAI/bge-m3",
+).strip()
+
+
+# ------------------------------------------------------------
+# Remote BGE-M3
+# ------------------------------------------------------------
+
+EMBEDDING_BASE_URL = (
+    os.getenv(
+        "EMBEDDING_BASE_URL",
+        "http://127.0.0.1:18002",
+    )
+    .strip()
+    .rstrip("/")
+)
+
+EMBEDDING_TIMEOUT_S = int(
+    os.getenv(
+        "EMBEDDING_TIMEOUT_S",
+        "120",
+    )
+)
+
+EMBEDDING_DIMENSION = int(
+    os.getenv(
+        "EMBEDDING_DIMENSION",
+        "1024",
+    )
+)
+
+
+# ------------------------------------------------------------
+# Local provider
+# Usato SOLO se EMBEDDING_PROVIDER=local.
+# ------------------------------------------------------------
+
+EMBED_DEVICE = (
+    os.getenv(
+        "EMBED_DEVICE",
+        "cpu",
+    )
+    .strip()
+)
+
 
 #EMBEDDING_MODEL_NAME = os.getenv(
 #    "EMBEDDING_MODEL_NAME",
@@ -854,12 +1156,318 @@ openai_client = None
 embedder = None
 qdrant_client = None
 
+# Qdrant schema viene verificato una sola volta per processo.
+_QDRANT_SCHEMA_READY = False
+_QDRANT_SCHEMA_LOCK = Lock()
+
+
+class RemoteEmbedder:
+    """
+    Adapter HTTP che mantiene l'interfaccia minima
+    di SentenceTransformer utilizzata dall'ingestion.
+
+    Non esegue fallback locale.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        model_name: str,
+        dimension: int,
+        timeout_s: int,
+    ):
+        self.base_url = (
+            str(base_url)
+            .strip()
+            .rstrip("/")
+        )
+
+        self.model_name = str(
+            model_name
+        ).strip()
+
+        self.dimension = int(
+            dimension
+        )
+
+        self.timeout_s = int(
+            timeout_s
+        )
+
+
+    def health(self) -> Dict[str, Any]:
+
+        response = get_http_session().get(
+            f"{self.base_url}/health",
+            timeout=min(
+                self.timeout_s,
+                10,
+            ),
+        )
+
+        response.raise_for_status()
+
+        data = response.json() or {}
+
+        if not data.get("ready"):
+            raise RuntimeError(
+                "Remote embedding service "
+                "non ready"
+            )
+
+        remote_dimension = int(
+            data.get("dimension") or 0
+        )
+
+        if (
+            remote_dimension
+            != self.dimension
+        ):
+            raise RuntimeError(
+                "Remote embedding dimension "
+                f"mismatch: "
+                f"{remote_dimension} != "
+                f"{self.dimension}"
+            )
+
+        remote_model = str(
+            data.get("model") or ""
+        ).strip()
+
+        if (
+            remote_model
+            and remote_model
+            != self.model_name
+        ):
+            raise RuntimeError(
+                "Remote embedding model "
+                f"mismatch: "
+                f"{remote_model!r} != "
+                f"{self.model_name!r}"
+            )
+
+        if not bool(
+            data.get("cuda_available")
+        ):
+            raise RuntimeError(
+                "Remote BGE service non sta "
+                "usando CUDA"
+            )
+
+        return data
+
+
+    def encode(
+        self,
+        sentences,
+        batch_size: Optional[int] = None,
+        show_progress_bar: bool = False,
+        convert_to_tensor: bool = False,
+        **kwargs,
+    ):
+        """
+        Compatibilità con SentenceTransformer.encode()
+        per i parametri usati dall'ingestion corrente.
+        """
+
+        single_input = isinstance(
+            sentences,
+            str,
+        )
+
+        if single_input:
+            texts = [sentences]
+        else:
+            texts = [
+                str(value or "")
+                for value in sentences
+            ]
+
+        if not texts:
+            empty = np.empty(
+                (
+                    0,
+                    self.dimension,
+                ),
+                dtype=np.float32,
+            )
+
+            if convert_to_tensor:
+                return torch.tensor(
+                    empty,
+                    dtype=torch.float32,
+                )
+
+            return empty
+
+
+        effective_batch_size = int(
+            batch_size
+            or EMBED_BATCH_SIZE
+        )
+
+
+        t0 = time.time()
+
+        response = get_http_session().post(
+            f"{self.base_url}/embed",
+            json={
+                "texts": texts,
+                "batch_size": (
+                    effective_batch_size
+                ),
+            },
+            timeout=self.timeout_s,
+        )
+
+        response.raise_for_status()
+
+        data = response.json() or {}
+
+        remote_dimension = int(
+            data.get("dimension") or 0
+        )
+
+        if (
+            remote_dimension
+            != self.dimension
+        ):
+            raise RuntimeError(
+                "Remote embedding dimension "
+                f"mismatch: "
+                f"{remote_dimension} != "
+                f"{self.dimension}"
+            )
+
+
+        vectors = np.asarray(
+            data.get("vectors") or [],
+            dtype=np.float32,
+        )
+
+
+        if vectors.ndim != 2:
+            raise RuntimeError(
+                "Remote embeddings shape "
+                f"non valida: "
+                f"{vectors.shape}"
+            )
+
+
+        if (
+            vectors.shape[0]
+            != len(texts)
+        ):
+            raise RuntimeError(
+                "Remote embedding count "
+                f"mismatch: "
+                f"{vectors.shape[0]} != "
+                f"{len(texts)}"
+            )
+
+
+        if (
+            vectors.shape[1]
+            != self.dimension
+        ):
+            raise RuntimeError(
+                "Remote embedding vector "
+                f"dimension mismatch: "
+                f"{vectors.shape[1]} != "
+                f"{self.dimension}"
+            )
+
+
+        elapsed_ms = int(
+            (time.time() - t0)
+            * 1000
+        )
+
+        server_ms = int(
+            data.get("elapsed_ms") or 0
+        )
+
+        print(
+            f"   📡 Remote BGE | "
+            f"texts={len(texts)} | "
+            f"batch={effective_batch_size} | "
+            f"server={server_ms}ms | "
+            f"roundtrip={elapsed_ms}ms"
+        )
+
+
+        if single_input:
+            vectors = vectors[0]
+
+
+        if convert_to_tensor:
+            return torch.tensor(
+                vectors,
+                dtype=torch.float32,
+            )
+
+
+        return vectors
+
+
+    def get_embedding_dimension(
+        self,
+    ) -> int:
+        return self.dimension
+
+
+    def get_sentence_embedding_dimension(
+        self,
+    ) -> int:
+        return self.dimension
+
+
+
 def get_embedder():
     global embedder
-    if embedder is None:
-        # device="cpu" evita conflitti di memoria con Ollama
-        embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
+
+    if embedder is not None:
+        return embedder
+
+
+    if EMBEDDING_PROVIDER == "remote":
+
+        print(
+            f"   🔧 Remote embedding client | "
+            f"model={EMBEDDING_MODEL_NAME} | "
+            f"url={EMBEDDING_BASE_URL} | "
+            f"dimension={EMBEDDING_DIMENSION}"
+        )
+
+        embedder = RemoteEmbedder(
+            base_url=EMBEDDING_BASE_URL,
+            model_name=EMBEDDING_MODEL_NAME,
+            dimension=EMBEDDING_DIMENSION,
+            timeout_s=EMBEDDING_TIMEOUT_S,
+        )
+
+        # Fail-fast:
+        # se Vast/tunnel/BGE non sono disponibili
+        # NON passa automaticamente alla CPU.
+        embedder.health()
+
+        return embedder
+
+
+    print(
+        f"   🔧 Local embedding model | "
+        f"model={EMBEDDING_MODEL_NAME} | "
+        f"device={EMBED_DEVICE}"
+    )
+
+    embedder = SentenceTransformer(
+        EMBEDDING_MODEL_NAME,
+        device=EMBED_DEVICE,
+    )
+
     return embedder
+
+
 
 def get_qdrant_client():
     global qdrant_client
@@ -3433,6 +4041,34 @@ def ensure_qdrant_collection():
             if "already exists" not in message and "already indexed" not in message:
                 raise
 
+def ensure_qdrant_collection_once() -> None:
+    """
+    Verifica/crea collection e payload index
+    una sola volta per processo.
+
+    Thread-safe e deterministico.
+    """
+
+    global _QDRANT_SCHEMA_READY
+
+    if _QDRANT_SCHEMA_READY:
+        return
+
+    with _QDRANT_SCHEMA_LOCK:
+
+        if _QDRANT_SCHEMA_READY:
+            return
+
+        ensure_qdrant_collection()
+
+        _QDRANT_SCHEMA_READY = True
+
+        print(
+            f"   ✅ Qdrant schema ready | "
+            f"collection={QDRANT_COLLECTION}"
+        )
+
+
 NEO4J_STRUCTURE_QUERY = """
 UNWIND $rows AS r
 
@@ -4317,7 +4953,7 @@ def llm_chat(prompt: str, text: str, model: str, max_tokens: int = LLM_MAX_TOKEN
 # - massimo 2 chiamate testuali concorrenti;
 # - massimo 1 chiamata Vision concorrente.
 OLLAMA_TEXT_PARALLELISM = max(
-    4,
+    1,
     int(
         os.getenv(
             "OLLAMA_TEXT_PARALLELISM",
@@ -4347,6 +4983,90 @@ OLLAMA_VISION_SEMAPHORE = (
         OLLAMA_VISION_PARALLELISM
     )
 )
+
+
+# ============================================================
+# OLLAMA WORKLOAD COORDINATOR
+# ============================================================
+# Regola deterministica:
+#
+# - le chiamate TEXT/KG possono lavorare in parallelo
+#   fino a OLLAMA_TEXT_PARALLELISM;
+#
+# - una chiamata Vision può partire solo quando
+#   NON ci sono chiamate TEXT/KG attive;
+#
+# - mentre Vision è in attesa o attiva,
+#   non vengono avviate nuove chiamate TEXT/KG.
+#
+# Non modifica prompt, modelli, token, temperature
+# o contenuto della Knowledge Base.
+# ============================================================
+
+_OLLAMA_WORKLOAD_CONDITION = threading.Condition()
+
+_OLLAMA_ACTIVE_TEXT = 0
+_OLLAMA_VISION_ACTIVE = False
+_OLLAMA_VISION_WAITING = 0
+
+
+@contextmanager
+def ollama_text_workload():
+    global _OLLAMA_ACTIVE_TEXT
+
+    with _OLLAMA_WORKLOAD_CONDITION:
+
+        while (
+            _OLLAMA_VISION_ACTIVE
+            or _OLLAMA_VISION_WAITING > 0
+        ):
+            _OLLAMA_WORKLOAD_CONDITION.wait()
+
+        _OLLAMA_ACTIVE_TEXT += 1
+
+    try:
+        yield
+
+    finally:
+        with _OLLAMA_WORKLOAD_CONDITION:
+
+            _OLLAMA_ACTIVE_TEXT -= 1
+
+            _OLLAMA_WORKLOAD_CONDITION.notify_all()
+
+
+@contextmanager
+def ollama_vision_workload():
+    global _OLLAMA_VISION_ACTIVE
+    global _OLLAMA_VISION_WAITING
+
+    with _OLLAMA_WORKLOAD_CONDITION:
+
+        _OLLAMA_VISION_WAITING += 1
+
+        try:
+
+            while (
+                _OLLAMA_VISION_ACTIVE
+                or _OLLAMA_ACTIVE_TEXT > 0
+            ):
+                _OLLAMA_WORKLOAD_CONDITION.wait()
+
+            _OLLAMA_VISION_ACTIVE = True
+
+        finally:
+
+            _OLLAMA_VISION_WAITING -= 1
+
+    try:
+        yield
+
+    finally:
+        with _OLLAMA_WORKLOAD_CONDITION:
+
+            _OLLAMA_VISION_ACTIVE = False
+
+            _OLLAMA_WORKLOAD_CONDITION.notify_all()
 
 
 
@@ -4471,40 +5191,41 @@ def ollama_chat_http(
     last_err = None
 
     with OLLAMA_TEXT_SEMAPHORE:
-        for attempt in range(
-            OLLAMA_RETRIES + 1
-        ):
-            
-            
-            try:
-                r = requests.post(
-                    OLLAMA_API_CHAT,
-                    json=payload,
-                    timeout=effective_timeout,
-                )
-                r.raise_for_status()
+        with ollama_text_workload():
+            for attempt in range(
+                OLLAMA_RETRIES + 1
+            ):
+                
+                
+                try:
+                    r = get_http_session().post(
+                        OLLAMA_API_CHAT,
+                        json=payload,
+                        timeout=effective_timeout,
+                    )
+                    r.raise_for_status()
 
-                data = r.json() or {}
+                    data = r.json() or {}
 
-                _log_ollama_timings(
-                    "chat",
-                    model,
-                    data,
-                )
-                msg = data.get("message") or {}
+                    _log_ollama_timings(
+                        "chat",
+                        model,
+                        data,
+                    )
+                    msg = data.get("message") or {}
 
-                return (
-                    msg.get("content") or ""
-                ).strip()
+                    return (
+                        msg.get("content") or ""
+                    ).strip()
 
-            except Exception as e:
-                last_err = e
-                sleep_s = min(3.0, 0.75 * (attempt + 1))
-                print(
-                    f"   ⚠️ Ollama chat retry {attempt + 1}/{OLLAMA_RETRIES + 1} "
-                    f"| model={model} | err={e}"
-                )
-                time.sleep(sleep_s)
+                except Exception as e:
+                    last_err = e
+                    sleep_s = min(3.0, 0.75 * (attempt + 1))
+                    print(
+                        f"   ⚠️ Ollama chat retry {attempt + 1}/{OLLAMA_RETRIES + 1} "
+                        f"| model={model} | err={e}"
+                    )
+                    time.sleep(sleep_s)
 
     print(f"   ❌ Ollama chat failed | model={model} | err={last_err}")
     return ""
@@ -4563,29 +5284,30 @@ def llm_chat_multimodal(
         payload["format"] = "json"
 
     with OLLAMA_VISION_SEMAPHORE:
-        last_err = None
+        with ollama_vision_workload():
+            last_err = None
 
-        for attempt in range(OLLAMA_RETRIES + 1):
-            try:
-                r = requests.post(
-                    OLLAMA_API_GENERATE,
-                    json=payload,
-                    timeout=OLLAMA_VISION_TIMEOUT_S,
-                )
-                r.raise_for_status()
+            for attempt in range(OLLAMA_RETRIES + 1):
+                try:
+                    r = get_http_session().post(
+                        OLLAMA_API_GENERATE,
+                        json=payload,
+                        timeout=OLLAMA_VISION_TIMEOUT_S,
+                    )
+                    r.raise_for_status()
 
-                data = r.json() or {}
-                _log_ollama_timings(
-                    log_label,
-                    model,
-                    data,
-                )
-                return data.get("response", "") or ""
+                    data = r.json() or {}
+                    _log_ollama_timings(
+                        log_label,
+                        model,
+                        data,
+                    )
+                    return data.get("response", "") or ""
 
-            except Exception as e:
-                last_err = e
-                sleep_s = min(3.0, 0.75 * (attempt + 1))
-                time.sleep(sleep_s)
+                except Exception as e:
+                    last_err = e
+                    sleep_s = min(3.0, 0.75 * (attempt + 1))
+                    time.sleep(sleep_s)
 
         print(f"   ⚠️ Vision generate failed (model={model}): {last_err}")
         return ""
@@ -7776,10 +8498,12 @@ def process_ai_and_db(
         raise ValueError("document_id assente nel payload del job Database A")
 
     global embedder, qdrant_client
+
     embedder = get_embedder()
     qdrant_client = get_qdrant_client()
-    ensure_qdrant_collection()
+    ensure_qdrant_collection_once()
 
+    
     if not chunks:
         pg_close_log(log_id, "FAILED", 0, _ms(t0), "No chunks extracted")
         raise RuntimeError("No chunks extracted")
@@ -7822,20 +8546,46 @@ def process_ai_and_db(
     processed_kg_chunks = set()
     submitted_kg_chunks = 0
 
-    if file_path.lower().endswith(".pdf"):
-        pdf_batch = int(os.environ.get("PDF_EMBED_BATCH_SIZE", "8"))
-        if pdf_batch > 0:
-            global EMBED_BATCH_SIZE
-            EMBED_BATCH_SIZE = pdf_batch
+    # ========================================================
+    # Batch embedding locale per documento
+    # ========================================================
 
-    print(
-        f"   🚀 Inizio elaborazione: {num_chunks_totali} chunks "
-        f"(Batch: {EMBED_BATCH_SIZE})"
+    effective_embed_batch_size = int(
+        EMBED_BATCH_SIZE
     )
 
-    for i in range(0, num_chunks_totali, EMBED_BATCH_SIZE):
+    if file_path.lower().endswith(".pdf"):
+
+        pdf_batch = int(
+            os.environ.get(
+                "PDF_EMBED_BATCH_SIZE",
+                "16",
+            )
+        )
+
+        if pdf_batch > 0:
+            effective_embed_batch_size = (
+                pdf_batch
+            )
+
+    print(
+        f"   🚀 Inizio elaborazione: "
+        f"{num_chunks_totali} chunks "
+        f"(Batch: {effective_embed_batch_size})"
+    )
+
+    for i in range(
+        0,
+        num_chunks_totali,
+        effective_embed_batch_size,
+    ):
+
         batch_t0 = time.time()
-        batch = chunks[i:i + EMBED_BATCH_SIZE]
+
+        batch = chunks[
+            i:i + effective_embed_batch_size
+        ]
+
 
         pdf_embed_max_chars = int(
             os.environ.get("PDF_EMBED_MAX_CHARS", "1800")
@@ -7848,19 +8598,25 @@ def process_ai_and_db(
             for ch in batch
         ]
 
+
+
         print(
             f"   [DEBUG] Calcolo embeddings batch "
-            f"{i // EMBED_BATCH_SIZE + 1}..."
+            f"{i // effective_embed_batch_size + 1}..."
         )
 
         try:
             vecs = embedder.encode(
                 texts,
-                batch_size=EMBED_BATCH_SIZE,
+                batch_size=effective_embed_batch_size,
                 show_progress_bar=True,
             )
+            
+
+
         except Exception as e:
             raise RuntimeError(f"Errore embeddings: {e}") from e
+            
 
         # ------------------------------------------------------------
         # KG PER CHUNK: nessuna aggregazione a livello Page.
@@ -7904,11 +8660,19 @@ def process_ai_and_db(
                 page_chunk_index = int(ch.get("page_chunk_index") or 0)
 
                 if len(text_full) < KG_MIN_LEN:
-                    print(
-                        f"   [KG_GATEKEEPER] file={filename} | page={page_no} | "
-                        f"chunk={page_chunk_index} | text_len={len(text_full)} | "
-                        "kg=False (testo corto)"
-                    )
+
+                    if INGESTION_VERBOSE_CHUNKS:
+
+                        print(
+                            f"   [KG_GATEKEEPER] "
+                            f"file={filename} | "
+                            f"page={page_no} | "
+                            f"chunk={page_chunk_index} | "
+                            f"text_len={len(text_full)} | "
+                            f"semantic={semantic_ok} | "
+                            f"keyword={keyword_ok} | "
+                            f"kg={ok_kg}"
+                        )
                     continue
 
                 semantic_ok = ai_gatekeeper_decision_from_vec(
@@ -8399,8 +9163,10 @@ def process_ai_and_db(
             int((i + len(batch)) / num_chunks_totali * 100),
         )
         print(
-            f"   📦 Batch {int(i / EMBED_BATCH_SIZE) + 1} | "
-            f"{percentage}% completato | Tempo Batch: {_ms(batch_t0)}ms"
+            f"   📦 Batch "
+            f"{int(i / effective_embed_batch_size) + 1} | "
+            f"{percentage}% completato | "
+            f"Tempo Batch: {_ms(batch_t0)}ms"
         )
 
     total_ms = _ms(t0)
@@ -9386,11 +10152,52 @@ def runtime_healthcheck(deep: bool = False) -> Dict[str, Any]:
             response = requests.get(OLLAMA_API_TAGS, timeout=5)
             response.raise_for_status()
 
+
+
+
         def _check_qdrant() -> None:
             get_qdrant_client().get_collections()
 
-        _record("ollama", _check_ollama)
-        _record("qdrant", _check_qdrant)
+
+        def _check_embedding() -> None:
+
+            current_embedder = (
+                get_embedder()
+            )
+
+            if (
+                EMBEDDING_PROVIDER
+                == "remote"
+            ):
+                current_embedder.health()
+            else:
+                dim = (
+                    get_embedding_dimension_safe(
+                        current_embedder
+                    )
+                )
+
+                if dim <= 0:
+                    raise RuntimeError(
+                        "Embedding dimension "
+                        "non valida"
+                    )
+
+
+        _record(
+            "ollama",
+            _check_ollama,
+        )
+
+        _record(
+            "embedding",
+            _check_embedding,
+        )
+
+        _record(
+            "qdrant",
+            _check_qdrant,
+        )
 
         if NEO4J_ENABLED:
             _record("neo4j", lambda: neo4j_driver.verify_connectivity())
@@ -9437,6 +10244,8 @@ def initialize_ingestion_runtime(*, strict: bool = True) -> Dict[str, Any]:
         if not PG_SCHEMA_MIGRATION_ONLY:
             verify_source_db_contract()
 
+
+
         if PG_SCHEMA_MIGRATION_ONLY:
             _RUNTIME_INITIALIZED = True
             return runtime_healthcheck(deep=False)
@@ -9444,28 +10253,72 @@ def initialize_ingestion_runtime(*, strict: bool = True) -> Dict[str, Any]:
         if not USE_REMOTE_OLLAMA and OLLAMA_AUTOSTART:
             if os.name == "nt":
                 started = force_restart_ollama(
-                    num_parallel=os.getenv("OLLAMA_NUM_PARALLEL", "1")
+                    num_parallel=os.getenv(
+                        "OLLAMA_NUM_PARALLEL",
+                        "4",
+                    )
                 )
+
                 if strict and not started:
-                    raise RuntimeError("Impossibile avviare Ollama")
+                    raise RuntimeError(
+                        "Impossibile avviare Ollama"
+                    )
+
             else:
                 ensure_ollama_parallel(
-                    os.getenv("OLLAMA_NUM_PARALLEL", "1")
+                    os.getenv(
+                        "OLLAMA_NUM_PARALLEL",
+                        "4",
+                    )
                 )
 
-        snapshot = runtime_healthcheck(deep=strict)
+        # ====================================================
+        # Verifica dipendenze PRIMA dei warm-up
+        # ====================================================
+
+        snapshot = runtime_healthcheck(
+            deep=strict
+        )
+
         if strict and not snapshot["ready"]:
+
             failed = [
                 name
-                for name, item in snapshot["dependencies"].items()
+                for name, item
+                in snapshot["dependencies"].items()
                 if not item.get("ready")
             ]
+
             raise RuntimeError(
-                "Dipendenze ingestion non pronte: " + ", ".join(failed)
+                "Dipendenze ingestion non pronte: "
+                + ", ".join(failed)
             )
 
+        # ====================================================
+        # Runtime performance initialization
+        # UNA SOLA VOLTA PER PROCESSO
+        # ====================================================
+
+        global embedder, qdrant_client
+
+        # 1. BGE-M3 + Gatekeeper anchors
+        warmup_embedding_runtime()
+
+        # 2. Qdrant client + collection/index
+        embedder = get_embedder()
+        qdrant_client = get_qdrant_client()
+
+        ensure_qdrant_collection_once()
+
+        # 3. Modello KG Ollama
+        warmup_ollama_text_model()
+
+        # Solo dopo aver completato l'intera inizializzazione.
         _RUNTIME_INITIALIZED = True
-        return runtime_healthcheck(deep=False)
+
+        return runtime_healthcheck(
+            deep=False
+        )
 
 
 def process_next_db_job() -> Dict[str, Any]:

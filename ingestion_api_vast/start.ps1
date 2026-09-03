@@ -6,6 +6,13 @@ $env:PYTHONUNBUFFERED = "1"
 # ------------------------------------------------------------
 $env:OLLAMA_BASE_URL = "http://127.0.0.1:11435"
 
+$env:EMBEDDING_PROVIDER = "remote"
+$env:EMBEDDING_BASE_URL = "http://127.0.0.1:18002"
+$env:EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
+$env:EMBEDDING_DIMENSION = "1024"
+$env:EMBEDDING_TIMEOUT_S = "120"
+
+
 $env:USE_REMOTE_OLLAMA = "1"
 $env:OLLAMA_AUTOSTART = "0"
 
@@ -76,8 +83,9 @@ $env:VISION_PARALLEL_WORKERS = "1"
 $env:OLLAMA_VISION_PARALLELISM = "1"
 
 # Due task KG e due richieste testuali Ollama concorrenti.
-$env:KG_WORKERS = "3"
-$env:OLLAMA_TEXT_PARALLELISM = "3"
+$env:KG_WORKERS = "4"
+$env:OLLAMA_TEXT_PARALLELISM = "4"
+$env:OLLAMA_NUM_PARALLEL = "4"
 
 # Embeddings BGE-M3 locali.
 # Il PDF non forza più il batch a 8.
@@ -87,7 +95,7 @@ $env:PDF_EMBED_BATCH_SIZE = "16"
 # una sola chiamata JSON per finestra.
 $env:KG_INPUT_MAX_CHARS = "2600"
 $env:KG_NUM_CTX = "8192"
-$env:KG_MAX_OUTPUT_TOKENS = "1400"
+$env:KG_MAX_OUTPUT_TOKENS = "1800"
 $env:KG_MAX_NODES_PER_WINDOW = "20"
 $env:KG_MAX_EDGES_PER_WINDOW = "30"
 
@@ -98,7 +106,10 @@ $env:DOC_QUEUE_MAXSIZE = "1"
 # Batch embeddings DOCX/Markdown.
 $env:EMBED_BATCH_SIZE = "32"
 
+$env:INGESTION_VERBOSE_CHUNKS = "0"
 
+# $env:EMBED_DEVICE = "cuda:0"
+# $env:EMBED_DEVICE = "cpu"
 
 Write-Host ""
 Write-Host "=== Configurazione ingestion ===" -ForegroundColor Cyan
@@ -128,6 +139,9 @@ Write-Host "OLLAMA_VISION_PARALLELISM:     $env:OLLAMA_VISION_PARALLELISM"
 
 Write-Host "KG_WORKERS:                    $env:KG_WORKERS"
 Write-Host "OLLAMA_TEXT_PARALLELISM:       $env:OLLAMA_TEXT_PARALLELISM"
+Write-Host "OLLAMA_NUM_PARALLEL:           $env:OLLAMA_NUM_PARALLEL"
+
+
 
 Write-Host "PDF_EMBED_BATCH_SIZE:          $env:PDF_EMBED_BATCH_SIZE"
 Write-Host "EMBED_BATCH_SIZE:              $env:EMBED_BATCH_SIZE"
@@ -137,6 +151,7 @@ Write-Host "KG_INPUT_MAX_CHARS:            $env:KG_INPUT_MAX_CHARS"
 Write-Host "KG_NUM_CTX:                    $env:KG_NUM_CTX"
 Write-Host "KG_MAX_OUTPUT_TOKENS:          $env:KG_MAX_OUTPUT_TOKENS"
 
+# Write-Host "EMBED_DEVICE:                  $env:EMBED_DEVICE"
 
 Write-Host "==============================="
 Write-Host ""
