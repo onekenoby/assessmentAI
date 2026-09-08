@@ -1,7 +1,24 @@
 param(
+    [Parameter(Mandatory = $true)]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int]$OrganizationId,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateSet(
+        "GLOBAL",
+        "ACCOUNT",
+        "GLOBAL,ACCOUNT"
+    )]
+    [string]$Scopes,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Tiers,
+
     [string]$Query = "Quali sono i principali requisiti di sicurezza descritti nei documenti disponibili?",
-    [string]$BaseUrl = "http://127.0.0.1:8013"
+
+    [string]$BaseUrl = "http://127.0.0.1:8000"
 )
+
 
 $ErrorActionPreference = "Stop"
 $base = $BaseUrl.TrimEnd("/")
@@ -22,12 +39,22 @@ $body = @{
     }
 } | ConvertTo-Json -Depth 10
 
-Write-Host "Invio query RAG..." -ForegroundColor Cyan
+$requestId = [guid]::NewGuid().ToString()
+
+Write-Host "Invio query RAG | organization_id=$OrganizationId..." `
+    -ForegroundColor Cyan
+
 $response = Invoke-RestMethod `
     -Method Post `
     -Uri "$base/api/v1/rag/query" `
-    -ContentType "application/json" `
-    -Body $body `
+    -ContentType "application/json; charset=utf-8" `
+    -Headers @{
+        "X-Request-ID" = $requestId
+        "X-RAG-Organization-ID" = [string]$OrganizationId
+        "X-RAG-Scopes" = $Scopes
+        "X-RAG-Tiers" = $Tiers
+    }`
+    -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
     -TimeoutSec 900
 
 $response | ConvertTo-Json -Depth 30

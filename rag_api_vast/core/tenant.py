@@ -30,10 +30,16 @@ from core.config import RagSettings, settings
 
 TenantScope = Literal["GLOBAL", "ACCOUNT"]
 TenantTier = Literal["A", "B", "C", "GRAPH", "USER"]
+TenantRequestTier = Literal["A", "B", "C"]
 
 _ALLOWED_SCOPES: Final[frozenset[str]] = frozenset({"GLOBAL", "ACCOUNT"})
+_ALLOWED_REQUEST_TIERS: Final[frozenset[str]] = frozenset({"A", "B", "C"})
+
 _GLOBAL_TIERS: Final[frozenset[str]] = frozenset({"A"})
 _ACCOUNT_TIERS: Final[frozenset[str]] = frozenset({"B", "C"})
+
+
+
 _GRAPH_TIER: Final[str] = "GRAPH"
 _USER_TIER: Final[str] = "USER"
 _ACTIVE_STATUS: Final[str] = "active"
@@ -65,9 +71,16 @@ class TrustedTenantIdentity(BaseModel):
     organization_id: int = Field(gt=0)
     user_id: str = Field(min_length=1, max_length=256)
     roles: tuple[str, ...] = Field(default_factory=lambda: ("user",))
+    
+    
     allowed_scopes: tuple[TenantScope, ...] = Field(
         default_factory=lambda: ("GLOBAL", "ACCOUNT")
     )
+
+    allowed_tiers: tuple[TenantRequestTier, ...] = Field(
+        default_factory=lambda: ("A", "B", "C")
+    )
+
     is_super_admin: bool = False
 
     @field_validator("roles")
@@ -97,6 +110,39 @@ class TrustedTenantIdentity(BaseModel):
         return normalized  # type: ignore[return-value]
 
 
+@field_validator("allowed_tiers")
+@classmethod
+def normalize_allowed_tiers(
+    cls,
+    value: tuple[TenantRequestTier, ...],
+) -> tuple[TenantRequestTier, ...]:
+
+    normalized = tuple(
+        dict.fromkeys(
+            str(tier).strip().upper()
+            for tier in value
+            if str(tier).strip()
+        )
+    )
+
+    unknown = sorted(
+        set(normalized) - _ALLOWED_REQUEST_TIERS
+    )
+
+    if unknown:
+        raise ValueError(
+            f"tier non validi: {', '.join(unknown)}"
+        )
+
+    if not normalized:
+        raise ValueError(
+            "allowed_tiers non può essere vuoto"
+        )
+    return normalized
+
+
+
+
 class TenantContext(BaseModel):
     """Contesto immutabile associato a una singola richiesta RAG."""
 
@@ -112,9 +158,17 @@ class TenantContext(BaseModel):
     roles: tuple[str, ...] = Field(default_factory=lambda: ("user",))
     request_id: str = Field(min_length=36, max_length=36)
     is_super_admin: bool = False
+    
+    
+    
     allowed_scopes: tuple[TenantScope, ...] = Field(
         default_factory=lambda: ("GLOBAL", "ACCOUNT")
     )
+
+    allowed_tiers: tuple[TenantRequestTier, ...] = Field(
+        default_factory=lambda: ("A", "B", "C")
+    )
+
 
     @field_validator("request_id")
     @classmethod
@@ -149,6 +203,41 @@ class TenantContext(BaseModel):
         if not normalized:
             raise ValueError("allowed_scopes non può essere vuoto")
         return normalized  # type: ignore[return-value]
+
+
+    @field_validator("allowed_tiers")
+    @classmethod
+    def normalize_allowed_tiers(
+        cls,
+        value: tuple[TenantRequestTier, ...],
+    ) -> tuple[TenantRequestTier, ...]:
+
+        normalized = tuple(
+            dict.fromkeys(
+                str(tier).strip().upper()
+                for tier in value
+                if str(tier).strip()
+            )
+        )
+
+        unknown = sorted(
+            set(normalized) - _ALLOWED_REQUEST_TIERS
+        )
+
+        if unknown:
+            raise ValueError(
+                f"tier non validi: {', '.join(unknown)}"
+            )
+
+        if not normalized:
+            raise ValueError(
+                "allowed_tiers non può essere vuoto"
+            )
+
+        return normalized
+
+
+
 
     @model_validator(mode="after")
     def reject_cross_tenant_super_admin_semantics(self) -> "TenantContext":
@@ -192,6 +281,7 @@ def build_poc_identity(config: RagSettings = settings) -> TrustedTenantIdentity:
         user_id=config.default_user_id,
         roles=config.default_user_roles,
         allowed_scopes=config.allowed_scopes,
+        allowed_tiers=config.rag_default_tiers,
         is_super_admin=False,
     )
 
@@ -224,8 +314,8 @@ def resolve_tenant_context(
         request_id=_new_request_id(request_id),
         is_super_admin=trusted_identity.is_super_admin,
         allowed_scopes=trusted_identity.allowed_scopes,
+        allowed_tiers=trusted_identity.allowed_tiers,
     )
-
 
 def get_tenant_context() -> TenantContext:
     """Restituisce il contesto corrente oppure fallisce in modo chiuso."""
@@ -439,7 +529,14 @@ def tenant_record_is_visible(
     if scope_norm not in tenant.allowed_scopes:
         return False
 
+    if (
+        tier_norm in _ALLOWED_REQUEST_TIERS
+        and tier_norm not in tenant.allowed_tiers
+    ):
+        return False
+
     if tier_norm == _USER_TIER:
+             
         return (
             allow_user_tier
             and scope_norm == "ACCOUNT"

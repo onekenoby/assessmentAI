@@ -277,6 +277,40 @@ def _pg_page_condition(
     )
 
 
+def _selected_tiers_by_scope(
+    context: TenantContext,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+
+    global_tiers = (
+        tuple(
+            tier
+            for tier in context.allowed_tiers
+            if tier == "A"
+        )
+        if "GLOBAL" in context.allowed_scopes
+        else ()
+    )
+
+    account_tiers = (
+        tuple(
+            tier
+            for tier in context.allowed_tiers
+            if tier in {"B", "C"}
+        )
+        if "ACCOUNT" in context.allowed_scopes
+        else ()
+    )
+
+    if not global_tiers and not account_tiers:
+        raise RetrievalConfigurationError(
+            "TenantContext senza combinazioni "
+            "scope/tier utilizzabili"
+        )
+
+    return global_tiers, account_tiers
+
+
+
 def _search_tokens(query: str) -> tuple[str, ...]:
     output: list[str] = []
     seen: set[str] = set()
@@ -295,6 +329,44 @@ def _search_tokens(query: str) -> tuple[str, ...]:
         seen.add(token)
         output.append(token)
     return tuple(output)
+
+
+def _pg_visibility_condition(
+    context: TenantContext,
+    *,
+    alias: str = "",
+) -> tuple[str, tuple[Any, ...]]:
+
+    global_tiers, account_tiers = (
+        _selected_tiers_by_scope(context)
+    )
+
+    prefix = f"{alias}." if alias else ""
+
+    sql = f"""(
+        (
+            {prefix}scope = 'GLOBAL'
+            AND {prefix}organization_id IS NULL
+            AND {prefix}tier::text = ANY(%s::text[])
+        )
+        OR
+        (
+            {prefix}scope = 'ACCOUNT'
+            AND {prefix}organization_id = %s
+            AND {prefix}tier::text = ANY(%s::text[])
+        )
+    )"""
+
+    return (
+        sql,
+        (
+            list(global_tiers),
+            context.organization_id,
+            list(account_tiers),
+        ),
+    )
+
+
 
 
 def _threshold_metric_aliases(query: str) -> tuple[str, ...]:
@@ -791,7 +863,7 @@ class HybridRetrievalEngine:
             intent=intent,
             answer_mode=answer_mode,
             wants_evidence=wants_evidence,
-            default_tiers=tuple(self._config.rag_default_tiers),
+            default_tiers=tuple(tenant_context.allowed_tiers),
             qdrant_candidates=effective_qdrant_limit,
             target_document=target_document,
             target_pages=target_pages,
@@ -1314,29 +1386,34 @@ class HybridRetrievalEngine:
         context: TenantContext,
         *,
         target_pages: Sequence[int] = (),
-    ) -> Any:
+    ):
+        global_tiers, account_tiers = _selected_tiers_by_scope(
+            context
+        )
         try:
             from qdrant_client import models
         except ImportError:
             # Import-safe fallback used by isolated unit tests.  A real Qdrant
             # client cannot exist without qdrant-client installed.
             branches: list[dict[str, Any]] = []
-            if "GLOBAL" in context.allowed_scopes:
+        
+            
+            if global_tiers:
                 branches.append(
                     {
                         "must": [
                             {"key": "scope", "match": {"value": "GLOBAL"}},
-                            {"key": "tier", "match": {"value": "A"}},
+                            {"key": "tier", "match": {"any": list(global_tiers)}},
                         ]
                     }
                 )
-            if "ACCOUNT" in context.allowed_scopes:
+            if account_tiers:
                 branches.append(
                     {
                         "must": [
                             {"key": "scope", "match": {"value": "ACCOUNT"}},
                             {"key": "organization_id", "match": {"value": context.organization_id}},
-                            {"key": "tier", "match": {"any": ["B", "C"]}},
+                            {"key": "tier", "match": {"any": list(account_tiers)}},
                         ]
                     }
                 )
@@ -1354,20 +1431,26 @@ class HybridRetrievalEngine:
             return {"must": must, "should": branches}
 
         branches: list[Any] = []
-        if "GLOBAL" in context.allowed_scopes:
+
+        if global_tiers:
             branches.append(
                 models.Filter(
                     must=[
                         models.FieldCondition(
-                            key="scope", match=models.MatchValue(value="GLOBAL")
+                            key="scope",
+                            match=models.MatchValue(value="GLOBAL"),
                         ),
                         models.FieldCondition(
-                            key="tier", match=models.MatchValue(value="A")
+                            key="tier",
+                            match=models.MatchAny(
+                                any=list(global_tiers)
+                            ),
                         ),
                     ]
                 )
             )
-        if "ACCOUNT" in context.allowed_scopes:
+
+        if account_tiers:
             branches.append(
                 models.Filter(
                     must=[
@@ -1379,8 +1462,11 @@ class HybridRetrievalEngine:
                             match=models.MatchValue(value=context.organization_id),
                         ),
                         models.FieldCondition(
-                            key="tier", match=models.MatchAny(any=["B", "C"])
-                        ),
+                            key="tier",
+                            match=models.MatchAny(
+                                any=list(account_tiers)
+                            ),
+                        )
                     ]
                 )
             )
@@ -1435,6 +1521,8 @@ class HybridRetrievalEngine:
         tenant_filter = self._build_qdrant_filter(
             tenant_context, target_pages=target_pages
         )
+        
+         
         if hasattr(client, "query_points"):
             response = client.query_points(
                 collection_name=self._config.qdrant_collection,
@@ -1571,6 +1659,10 @@ class HybridRetrievalEngine:
         page_sql, page_params = _pg_page_condition(
             target_pages, metadata_expr="d.metadata_json"
         )
+        visibility_sql, visibility_params = _pg_visibility_condition(
+            tenant_context,
+            alias="d",
+        )
         sql = """
             WITH q AS (SELECT websearch_to_tsquery('simple', %s) AS tsq)
             SELECT
@@ -1604,20 +1696,19 @@ class HybridRetrievalEngine:
                     COALESCE(d.content_raw, '') || ' ' ||
                     COALESCE(d.metadata_json::text, '')
                   ) @@ q.tsq
-              AND (
-                    (d.scope = 'GLOBAL' AND d.organization_id IS NULL AND d.tier = 'A')
-                    OR
-                    (d.scope = 'ACCOUNT' AND d.organization_id = %s AND d.tier IN ('B', 'C'))
-                  )
+              AND {visibility_sql}
               {page_sql}
             ORDER BY rank DESC
             LIMIT %s
-        """.format(page_sql=page_sql)
+        """.format(
+            visibility_sql=visibility_sql,
+            page_sql=page_sql,
+        )
         with self._resources.postgres_connection(context=tenant_context) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
                     sql,
-                    (pg_query, tenant_context.organization_id, *page_params, int(limit)),
+                    (pg_query, *visibility_params, *page_params, int(limit)),
                 )
                 rows = cursor.fetchall()
         return [
@@ -1642,6 +1733,9 @@ class HybridRetrievalEngine:
         per_phrase = max(3, int(limit) // len(phrases))
         found: dict[str, RetrievalCandidate] = {}
         page_sql, page_params = _pg_page_condition(target_pages)
+        visibility_sql, visibility_params = _pg_visibility_condition(
+            tenant_context
+        )
         sql_template = """
             SELECT
                 chunk_uuid::text,
@@ -1661,11 +1755,7 @@ class HybridRetrievalEngine:
             FROM public.document_chunks
             WHERE status = 'active'
               AND {condition}
-              AND (
-                    (scope = 'GLOBAL' AND organization_id IS NULL AND tier = 'A')
-                    OR
-                    (scope = 'ACCOUNT' AND organization_id = %s AND tier IN ('B', 'C'))
-                  )
+              AND {visibility_sql}
               {page_sql}
             ORDER BY ingestion_ts DESC
             LIMIT %s
@@ -1676,10 +1766,14 @@ class HybridRetrievalEngine:
                 for phrase in phrases:
                     condition, parameters = self._pg_term_condition(phrase)
                     cursor.execute(
-                        sql_template.format(condition=condition, page_sql=page_sql),
+                        sql_template.format(
+                            condition=condition,
+                            visibility_sql=visibility_sql,
+                            page_sql=page_sql,
+                        ),
                         (
                             *parameters,
-                            tenant_context.organization_id,
+                            *visibility_params,
                             *page_params,
                             per_phrase,
                         ),
@@ -1715,6 +1809,10 @@ class HybridRetrievalEngine:
         if not wanted:
             return []
         page_sql, page_params = _pg_page_condition(target_pages)
+        visibility_sql, visibility_params = _pg_visibility_condition(
+            tenant_context,
+            alias="d",
+        )
         sql = """
             WITH q AS (SELECT plainto_tsquery('simple', %s) AS tsq),
             visible AS (
@@ -1745,11 +1843,7 @@ class HybridRetrievalEngine:
                     ) AS rank
                 FROM public.document_chunks d, q
                 WHERE d.status = 'active'
-                  AND (
-                        (d.scope = 'GLOBAL' AND d.organization_id IS NULL AND d.tier = 'A')
-                        OR
-                        (d.scope = 'ACCOUNT' AND d.organization_id = %s AND d.tier IN ('B', 'C'))
-                      )
+                  AND {visibility_sql}
             ),
             ranked AS (
                 SELECT *, row_number() OVER (
@@ -1779,14 +1873,17 @@ class HybridRetrievalEngine:
               {page_sql}
             ORDER BY rank DESC, ingestion_ts DESC
             LIMIT %s
-        """.format(page_sql=page_sql)
+        """.format(
+            visibility_sql=visibility_sql,
+            page_sql=page_sql,
+        )
         with self._resources.postgres_connection(context=tenant_context) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
                     sql,
                     (
                         query,
-                        tenant_context.organization_id,
+                        *visibility_params,
                         wanted,
                         *page_params,
                         int(limit),
@@ -1821,6 +1918,10 @@ class HybridRetrievalEngine:
         if not clauses:
             return []
 
+        visibility_sql, visibility_params = _pg_visibility_condition(
+            tenant_context
+        )
+
         sql = f"""
             SELECT
                 chunk_uuid::text,
@@ -1845,16 +1946,18 @@ class HybridRetrievalEngine:
                     OR lower(coalesce(metadata_json::text, '')) LIKE %s
                   )
               AND ({' OR '.join(clauses)})
-              AND (
-                    (scope = 'GLOBAL' AND organization_id IS NULL AND tier = 'A')
-                    OR
-                    (scope = 'ACCOUNT' AND organization_id = %s AND tier IN ('B', 'C'))
-                  )
+              AND {visibility_sql}
             ORDER BY ingestion_ts DESC
             LIMIT %s
         """
-        params = ["%glossar%", "%glossar%", "%glossar%", *parameters,
-                  tenant_context.organization_id, int(limit)]
+        params = [
+            "%glossar%",
+            "%glossar%",
+            "%glossar%",
+            *parameters,
+            *visibility_params,
+            int(limit),
+        ]
         with self._resources.postgres_connection(context=tenant_context) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(sql, params)
@@ -1988,17 +2091,17 @@ class HybridRetrievalEngine:
         unique_ids = list(dict.fromkeys(str(value) for value in ids if str(value).strip()))
         if not unique_ids:
             return {}
+        visibility_sql, visibility_params = _pg_visibility_condition(
+            tenant_context,
+            alias="d",
+        )
         sql = """
             WITH visible AS (
                 SELECT d.*
                 FROM public.document_chunks d
                 WHERE d.chunk_uuid::text = ANY(%s)
                   AND d.status = 'active'
-                  AND (
-                        (d.scope = 'GLOBAL' AND d.organization_id IS NULL AND d.tier = 'A')
-                        OR
-                        (d.scope = 'ACCOUNT' AND d.organization_id = %s AND d.tier IN ('B', 'C'))
-                      )
+                  AND {visibility_sql}
             ),
             ranked AS (
                 SELECT
@@ -2025,10 +2128,13 @@ class HybridRetrievalEngine:
                 embedding_model
             FROM ranked
             WHERE rn = 1
-        """
+        """.format(visibility_sql=visibility_sql)
         with self._resources.postgres_connection(context=tenant_context) as conn:
             with conn.cursor() as cursor:
-                cursor.execute(sql, (unique_ids, tenant_context.organization_id))
+                cursor.execute(
+                    sql,
+                    (unique_ids, *visibility_params),
+                )
                 rows = cursor.fetchall()
         result: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -2172,13 +2278,16 @@ class HybridRetrievalEngine:
         requested_doc_norm = _normalize_document_name(target_document or "")
         requested_doc_lower = PurePath(str(target_document or "").strip()).name.casefold()
         requested_pages = sorted({int(page) for page in target_pages or () if int(page) > 0})
+        global_tiers, account_tiers = _selected_tiers_by_scope(
+            tenant_context
+        )
         cypher = """
             MATCH (c:Chunk)-[m:MENTIONS|PRESENT_IN|MENTIONED_IN]-(e:Entity)
             WHERE c.status = 'active' AND e.status = 'active' AND m.status = 'active'
               AND (
-                    (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier = 'A')
+                    (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier IN $global_tiers)
                     OR
-                    (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN ['B', 'C'])
+                    (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN $account_tiers)
                   )
               AND (
                     $requested_doc_norm = ''
@@ -2224,6 +2333,8 @@ class HybridRetrievalEngine:
                 cypher,
                 tokens=list(tokens),
                 org_id=tenant_context.organization_id,
+                global_tiers=list(global_tiers),
+                account_tiers=list(account_tiers),
                 requested_doc_norm=requested_doc_norm,
                 requested_doc_lower=requested_doc_lower,
                 requested_pages=requested_pages,
@@ -2275,13 +2386,16 @@ class HybridRetrievalEngine:
         requested_doc_norm = _normalize_document_name(target_document or "")
         requested_doc_lower = PurePath(str(target_document or "").strip()).name.casefold()
         requested_pages = sorted({int(page) for page in target_pages or () if int(page) > 0})
+        global_tiers, account_tiers = _selected_tiers_by_scope(
+            tenant_context
+        )
         cypher = """
             MATCH (c:Chunk)
             WHERE c.status = 'active'
               AND (
-                    (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier = 'A')
+                    (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier IN $global_tiers)
                     OR
-                    (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN ['B', 'C'])
+                    (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN $account_tiers)
                   )
               AND (
                     $requested_doc_norm = ''
@@ -2352,6 +2466,8 @@ class HybridRetrievalEngine:
                 cypher,
                 tokens=list(tokens),
                 org_id=tenant_context.organization_id,
+                global_tiers=list(global_tiers),
+                account_tiers=list(account_tiers),
                 requested_doc_norm=requested_doc_norm,
                 requested_doc_lower=requested_doc_lower,
                 requested_pages=requested_pages,
@@ -2419,6 +2535,9 @@ class HybridRetrievalEngine:
         requested_doc_lower = PurePath(str(target_document or "").strip()).name.casefold()
         requested_doc_norm = _normalize_document_name(target_document or "")
         requested_pages = sorted({int(page) for page in target_pages or () if int(page) > 0})
+        global_tiers, account_tiers = _selected_tiers_by_scope(
+            tenant_context
+        )
         cypher = """
             MATCH (e1:Entity)-[rel]->(e2:Entity)
             WHERE rel.status = 'active'
@@ -2428,17 +2547,17 @@ class HybridRetrievalEngine:
               AND (
                     (
                         rel.scope = 'GLOBAL' AND rel.organization_id IS NULL
-                        AND e1.scope = 'GLOBAL' AND e1.organization_id IS NULL AND e1.tier = 'A'
-                        AND e2.scope = 'GLOBAL' AND e2.organization_id IS NULL AND e2.tier = 'A'
+                        AND e1.scope = 'GLOBAL' AND e1.organization_id IS NULL AND e1.tier IN $global_tiers
+                        AND e2.scope = 'GLOBAL' AND e2.organization_id IS NULL AND e2.tier IN $global_tiers
                     )
                     OR
                     (
                         rel.scope = 'ACCOUNT' AND rel.organization_id = $org_id
-                        AND e1.scope = 'ACCOUNT' AND e1.organization_id = $org_id AND e1.tier IN ['B','C']
+                        AND e1.scope = 'ACCOUNT' AND e1.organization_id = $org_id AND e1.tier IN $account_tiers
                         AND (
-                            (e2.scope = 'ACCOUNT' AND e2.organization_id = $org_id AND e2.tier IN ['B','C'])
+                            (e2.scope = 'ACCOUNT' AND e2.organization_id = $org_id AND e2.tier IN $account_tiers)
                             OR
-                            (e2.scope = 'GLOBAL' AND e2.organization_id IS NULL AND e2.tier = 'A')
+                            (e2.scope = 'GLOBAL' AND e2.organization_id IS NULL AND e2.tier IN $global_tiers)
                         )
                     )
                   )
@@ -2481,6 +2600,8 @@ class HybridRetrievalEngine:
                 cypher,
                 tokens=list(tokens),
                 org_id=tenant_context.organization_id,
+                global_tiers=list(global_tiers),
+                account_tiers=list(account_tiers),
                 allowed_rels=list(self._config.neo4j_allowed_relationships),
                 requested_doc_norm=requested_doc_norm,
                 requested_doc_lower=requested_doc_lower,
@@ -2570,6 +2691,9 @@ class HybridRetrievalEngine:
         requested_doc_norm = _normalize_document_name(target_document or "")
         requested_doc_lower = PurePath(str(target_document or "").strip()).name.casefold()
         requested_pages = sorted({int(page) for page in target_pages or () if int(page) > 0})
+        global_tiers, account_tiers = _selected_tiers_by_scope(
+            tenant_context
+        )
         cypher = """
             MATCH
                 (c1:Chunk)-[r1:MENTIONS|PRESENT_IN|MENTIONED_IN]-(e:Entity)
@@ -2579,19 +2703,19 @@ class HybridRetrievalEngine:
               AND r1.status = 'active' AND r2.status = 'active'
               AND NOT coalesce(c2.chunk_id, c2.id) IN $ids
               AND (
-                    (c1.scope = 'GLOBAL' AND c1.organization_id IS NULL AND c1.tier = 'A')
+                    (c1.scope = 'GLOBAL' AND c1.organization_id IS NULL AND c1.tier IN $global_tiers)
                     OR
-                    (c1.scope = 'ACCOUNT' AND c1.organization_id = $org_id AND c1.tier IN ['B', 'C'])
+                    (c1.scope = 'ACCOUNT' AND c1.organization_id = $org_id AND c1.tier IN $account_tiers)
                   )
               AND (
-                    (c2.scope = 'GLOBAL' AND c2.organization_id IS NULL AND c2.tier = 'A')
+                    (c2.scope = 'GLOBAL' AND c2.organization_id IS NULL AND c2.tier IN $global_tiers)
                     OR
-                    (c2.scope = 'ACCOUNT' AND c2.organization_id = $org_id AND c2.tier IN ['B', 'C'])
+                    (c2.scope = 'ACCOUNT' AND c2.organization_id = $org_id AND c2.tier IN $account_tiers)
                   )
               AND (
-                    (e.scope = 'GLOBAL' AND e.organization_id IS NULL AND e.tier = 'A')
+                    (e.scope = 'GLOBAL' AND e.organization_id IS NULL AND e.tier IN $global_tiers)
                     OR
-                    (e.scope = 'ACCOUNT' AND e.organization_id = $org_id AND e.tier IN ['B', 'C'])
+                    (e.scope = 'ACCOUNT' AND e.organization_id = $org_id AND e.tier IN $account_tiers)
                   )
               AND NOT toUpper(coalesce(e.type, e.category, labels(e)[0], '')) IN ['GENERIC', 'YEAR', 'DATE']
               AND (
@@ -2615,6 +2739,8 @@ class HybridRetrievalEngine:
                 cypher,
                 ids=unique_ids,
                 org_id=tenant_context.organization_id,
+                global_tiers=list(global_tiers),
+                account_tiers=list(account_tiers),
                 requested_doc_norm=requested_doc_norm,
                 requested_doc_lower=requested_doc_lower,
                 requested_pages=requested_pages,
@@ -2636,15 +2762,18 @@ class HybridRetrievalEngine:
         ids = list(dict.fromkeys(str(value) for value in chunk_ids if str(value).strip()))
         if not ids:
             return {}
+        global_tiers, account_tiers = _selected_tiers_by_scope(
+            tenant_context
+        )
         cypher = """
             UNWIND $ids AS target_id
             MATCH (c:Chunk)
             WHERE coalesce(c.chunk_id, c.id) = target_id
               AND c.status = 'active'
               AND (
-                    (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier = 'A')
+                    (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier IN $global_tiers)
                     OR
-                    (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN ['B', 'C'])
+                    (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN $account_tiers)
                   )
             CALL (c) {
                 MATCH (c)-[r:MENTIONS|PRESENT_IN|MENTIONED_IN]-(e:Entity)
@@ -2663,6 +2792,8 @@ class HybridRetrievalEngine:
                 cypher,
                 ids=ids,
                 org_id=tenant_context.organization_id,
+                global_tiers=list(global_tiers),
+                account_tiers=list(account_tiers),
             )
             for row in rows:
                 chunk_id = str(row.get("chunk_id") or "")
@@ -2689,15 +2820,18 @@ class HybridRetrievalEngine:
         ids = list(dict.fromkeys(str(value) for value in chunk_ids if str(value).strip()))
         if not ids:
             return {}
+        global_tiers, account_tiers = _selected_tiers_by_scope(
+            tenant_context
+        )
         cypher = """
             UNWIND $ids AS target_id
             MATCH (c:Chunk)
             WHERE coalesce(c.chunk_id, c.id) = target_id
               AND c.status = 'active'
               AND (
-                    (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier = 'A')
+                    (c.scope = 'GLOBAL' AND c.organization_id IS NULL AND c.tier IN $global_tiers)
                     OR
-                    (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN ['B', 'C'])
+                    (c.scope = 'ACCOUNT' AND c.organization_id = $org_id AND c.tier IN $account_tiers)
                   )
             CALL (c) {
                 MATCH (c)-[rf:HAS_FORMULA|MENTIONS|MENTIONED_IN|PRESENT_IN]-(f)
@@ -2740,6 +2874,8 @@ class HybridRetrievalEngine:
                 cypher,
                 ids=ids,
                 org_id=tenant_context.organization_id,
+                global_tiers=list(global_tiers),
+                account_tiers=list(account_tiers),
                 limit=max(1, int(limit_per_chunk)),
             )
             for row in rows:

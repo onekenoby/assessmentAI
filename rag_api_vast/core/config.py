@@ -287,13 +287,21 @@ class RagSettings(BaseModel):
         default=DEFAULT_NEO4J_ALLOWED_RELATIONSHIPS
     )
 
-    # ------------------------------------------------------------------
+   # ------------------------------------------------------------------
     # Modelli e device
     # ------------------------------------------------------------------
     llm_model_name: str = "gemma4:12b"
-    embedding_model_name: str = "/workspace/models/bge-m3"
-    reranker_model_name: str = "/workspace/models/ms-marco-reranker"
+
+    embedding_provider: str = "remote"
+    embedding_base_url: str = "http://127.0.0.1:18002"
+    embedding_model_name: str = "BAAI/bge-m3"
+    embedding_dimension: int = 1024
+    embedding_timeout_seconds: int = 120
+
+    # Manteniamo i nomi ORIGINALI del progetto
     embedding_device: str = "cpu"
+
+    reranker_model_name: str = "/workspace/models/ms-marco-reranker"
     reranker_device: str = "cpu"
 
     # ------------------------------------------------------------------
@@ -367,7 +375,19 @@ class RagSettings(BaseModel):
     evaluation_strict_block: bool = False
     evaluation_temperature: float = 0.0
     evaluation_repeat_penalty: float = 1.05
+    
+    @field_validator("embedding_provider")
+    @classmethod
+    def validate_embedding_provider(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
 
+        if normalized != "remote":
+            raise ValueError(
+                "EMBEDDING_PROVIDER deve essere 'remote'"
+            )
+
+        return normalized
+ 
     @field_validator(
         "poc_organization_id",
         "pg_port",
@@ -382,6 +402,8 @@ class RagSettings(BaseModel):
         "llm_num_predict",
         "max_concurrent_queries",
         "memory_limit",
+        "embedding_dimension",
+        "embedding_timeout_seconds",
         "history_max_message_chars",
         "history_max_chars",
         "qdrant_candidates",
@@ -585,16 +607,50 @@ def load_settings() -> RagSettings:
             _env_str("NEO4J_PASSWORD", "admin_password"),
         ),
 
+
+
         # Modelli/device
-        llm_model_name=llm_model_name,
+        embedding_provider=_env_str(
+            "EMBEDDING_PROVIDER",
+            "remote",
+        ),
+
+        embedding_base_url=_env_str(
+            "EMBEDDING_BASE_URL",
+            "http://127.0.0.1:18002",
+        ),
+
         embedding_model_name=_env_str(
-            "EMBEDDING_MODEL_NAME", "/workspace/models/bge-m3"
+            "EMBEDDING_MODEL_NAME",
+            "BAAI/bge-m3",
         ),
+
+        embedding_dimension=_env_int(
+            "EMBEDDING_DIMENSION",
+            1024,
+        ),
+
+        embedding_timeout_seconds=_env_int(
+            "EMBEDDING_TIMEOUT_S",
+            120,
+        ),
+
+        embedding_device=_env_str(
+            "EMBED_DEVICE",
+            "cpu",
+        ),
+
         reranker_model_name=_env_str(
-            "RERANKER_MODEL_NAME", "/workspace/models/ms-marco-reranker"
+            "RERANKER_MODEL_NAME",
+            "/workspace/models/ms-marco-reranker",
         ),
-        embedding_device=_env_str("EMBED_DEVICE", "cpu"),
-        reranker_device=_env_str("RERANK_DEVICE", "cpu"),
+
+        reranker_device=_env_str(
+            "RERANKER_DEVICE",
+            "cpu",
+        ),
+
+
 
         # Ollama/generazione
         ollama_base_url=ollama_base_url,

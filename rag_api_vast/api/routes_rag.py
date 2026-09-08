@@ -13,10 +13,12 @@ Responsabilità:
 - gestione uniforme degli errori API e del correlation ID.
 
 Sicurezza:
-- ``organization_id`` e ruoli non vengono mai letti da body o header client;
-- in produzione l'identità deve essere inserita da middleware autenticato in
-  ``request.state.tenant_identity``;
-- il fallback tenant configurato è consentito soltanto con ``POC_MODE=1``;
+- ``organization_id`` non viene mai accettato nel body pubblico;
+- in ``POC_MODE=1`` viene richiesto per singola request tramite
+  ``X-RAG-Organization-ID``;
+- in produzione l'identità tenant resta responsabilità del middleware
+  autenticato tramite ``request.state.tenant_identity``;
+- l'header client non può sovrascrivere un'identità trusted;
 - eventuali dettagli interni delle eccezioni non vengono restituiti al client;
 - tutte le risposte RAG e health usano ``Cache-Control: no-store``.
 """
@@ -83,6 +85,9 @@ logger = logging.getLogger(__name__)
 
 API_VERSION = "1.0.0"
 REQUEST_ID_HEADER = "X-Request-ID"
+ORGANIZATION_ID_HEADER = "X-RAG-Organization-ID"
+SCOPES_HEADER = "X-RAG-Scopes"
+TIERS_HEADER = "X-RAG-Tiers"
 
 # ``include_debug`` espone metriche e audit Markdown. In produzione è limitato
 # a ruoli esplicitamente autorizzati; nel PoC resta disponibile per i test.
@@ -185,6 +190,196 @@ def _parse_request_id(value: str | None) -> UUID:
             ),
         ) from exc
 
+def _parse_organization_id(
+    value: str | None,
+    *,
+    request_id: UUID,
+) -> int:
+    """Valida l'organization_id dinamico usato dalla singola richiesta PoC."""
+
+    if value is None or not value.strip():
+        raise RagApiException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=ApiErrorCode.VALIDATION_ERROR,
+            message=f"L'header {ORGANIZATION_ID_HEADER} è obbligatorio.",
+            request_id=request_id,
+            details=(
+                ApiErrorDetail(
+                    field=ORGANIZATION_ID_HEADER,
+                    message="organization_id obbligatorio",
+                    type="missing",
+                ),
+            ),
+        )
+
+    try:
+        organization_id = int(value.strip())
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise RagApiException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=ApiErrorCode.VALIDATION_ERROR,
+            message=(
+                f"L'header {ORGANIZATION_ID_HEADER} "
+                "deve contenere un intero positivo."
+            ),
+            request_id=request_id,
+            details=(
+                ApiErrorDetail(
+                    field=ORGANIZATION_ID_HEADER,
+                    message="intero positivo non valido",
+                    type="int_parsing",
+                ),
+            ),
+        ) from exc
+
+    if organization_id <= 0:
+        raise RagApiException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=ApiErrorCode.VALIDATION_ERROR,
+            message=(
+                f"L'header {ORGANIZATION_ID_HEADER} "
+                "deve contenere un intero positivo."
+            ),
+            request_id=request_id,
+            details=(
+                ApiErrorDetail(
+                    field=ORGANIZATION_ID_HEADER,
+                    message="il valore deve essere maggiore di zero",
+                    type="greater_than",
+                ),
+            ),
+        )
+
+    return organization_id
+
+
+def _parse_csv_header(
+    value: str | None,
+    *,
+    header_name: str,
+    allowed_values: frozenset[str],
+    request_id: UUID,
+) -> tuple[str, ...]:
+    """Valida un header CSV obbligatorio senza inferire valori mancanti."""
+
+    if value is None or not value.strip():
+        raise RagApiException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=ApiErrorCode.VALIDATION_ERROR,
+            message=f"L'header {header_name} è obbligatorio.",
+            request_id=request_id,
+            details=(
+                ApiErrorDetail(
+                    field=header_name,
+                    message="valore obbligatorio",
+                    type="missing",
+                ),
+            ),
+        )
+
+    items = tuple(
+        dict.fromkeys(
+            item.strip()
+            for item in value.split(",")
+            if item.strip()
+        )
+    )
+
+    if not items:
+        raise RagApiException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=ApiErrorCode.VALIDATION_ERROR,
+            message=f"L'header {header_name} non può essere vuoto.",
+            request_id=request_id,
+            details=(
+                ApiErrorDetail(
+                    field=header_name,
+                    message="lista vuota",
+                    type="value_error",
+                ),
+            ),
+        )
+
+    unknown = tuple(
+        item
+        for item in items
+        if item not in allowed_values
+    )
+
+    if unknown:
+        raise RagApiException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=ApiErrorCode.VALIDATION_ERROR,
+            message=(
+                f"L'header {header_name} contiene valori non validi: "
+                f"{', '.join(unknown)}."
+            ),
+            request_id=request_id,
+            details=(
+                ApiErrorDetail(
+                    field=header_name,
+                    message="valori non ammessi",
+                    type="literal_error",
+                ),
+            ),
+        )
+
+    return items
+
+
+def _validate_scope_tier_selection(
+    *,
+    scopes: tuple[str, ...],
+    tiers: tuple[str, ...],
+    request_id: UUID,
+) -> None:
+
+    has_global_scope = "GLOBAL" in scopes
+    has_account_scope = "ACCOUNT" in scopes
+
+    has_tier_a = "A" in tiers
+    has_account_tier = any(
+        tier in {"B", "C"}
+        for tier in tiers
+    )
+
+    if has_global_scope != has_tier_a:
+        raise RagApiException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=ApiErrorCode.VALIDATION_ERROR,
+            message="Combinazione scope/tier non valida.",
+            request_id=request_id,
+            details=(
+                ApiErrorDetail(
+                    field=f"{SCOPES_HEADER},{TIERS_HEADER}",
+                    message=(
+                        "GLOBAL richiede esattamente "
+                        "la presenza del TIER A"
+                    ),
+                    type="value_error",
+                ),
+            ),
+        )
+
+    if has_account_scope != has_account_tier:
+        raise RagApiException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=ApiErrorCode.VALIDATION_ERROR,
+            message="Combinazione scope/tier non valida.",
+            request_id=request_id,
+            details=(
+                ApiErrorDetail(
+                    field=f"{SCOPES_HEADER},{TIERS_HEADER}",
+                    message=(
+                        "ACCOUNT richiede almeno uno "
+                        "tra TIER B e TIER C"
+                    ),
+                    type="value_error",
+                ),
+            ),
+        )
+
+
 
 def _coerce_trusted_identity(value: Any) -> TrustedTenantIdentity | None:
     """Converte soltanto identità provenienti da ``request.state``.
@@ -211,17 +406,50 @@ def _coerce_trusted_identity(value: Any) -> TrustedTenantIdentity | None:
 
 async def resolve_request_tenant(
     request: Request,
+
     x_request_id: Annotated[
         str | None,
-        Header(alias=REQUEST_ID_HEADER, convert_underscores=False),
+        Header(
+            alias=REQUEST_ID_HEADER,
+            convert_underscores=False,
+        ),
     ] = None,
+
+    x_organization_id: Annotated[
+        str | None,
+        Header(
+            alias=ORGANIZATION_ID_HEADER,
+            convert_underscores=False,
+        ),
+    ] = None,
+
+    x_scopes: Annotated[
+        str | None,
+        Header(
+            alias=SCOPES_HEADER,
+            convert_underscores=False,
+        ),
+    ] = None,
+
+    x_tiers: Annotated[
+        str | None,
+        Header(
+            alias=TIERS_HEADER,
+            convert_underscores=False,
+        ),
+    ] = None,
+
 ) -> TenantContext:
+    
     """Risoluzione fail-closed del tenant della richiesta.
 
     Ordine:
     1. usa un ``TenantContext`` già costruito dal middleware, se presente;
     2. usa ``request.state.tenant_identity`` come identità trusted;
-    3. usa il tenant PoC solo quando ``settings.poc_mode`` è attivo.
+    3. solo in ``POC_MODE=1``, costruisce l'identità PoC usando
+       ``X-RAG-Organization-ID`` della singola richiesta.
+
+    Non esiste fallback API verso ``POC_ORGANIZATION_ID``.
     """
 
     prebuilt = getattr(request.state, "tenant_context", None)
@@ -239,9 +467,115 @@ async def resolve_request_tenant(
     request.state.request_id = str(request_id)
 
     try:
+        
         identity = _coerce_trusted_identity(
             getattr(request.state, "tenant_identity", None)
         )
+
+
+        requested_organization_id = _parse_organization_id(
+            x_organization_id,
+            request_id=request_id,
+        )
+
+
+        requested_scopes = _parse_csv_header(
+            x_scopes,
+            header_name=SCOPES_HEADER,
+            allowed_values=frozenset(
+                {"GLOBAL", "ACCOUNT"}
+            ),
+            request_id=request_id,
+        )
+
+
+        requested_tiers = _parse_csv_header(
+            x_tiers,
+            header_name=TIERS_HEADER,
+            allowed_values=frozenset(
+                {"A", "B", "C"}
+            ),
+            request_id=request_id,
+        )
+
+
+        _validate_scope_tier_selection(
+            scopes=requested_scopes,
+            tiers=requested_tiers,
+            request_id=request_id,
+        )
+
+
+        if identity is None and settings.poc_mode:
+
+            if not set(requested_scopes).issubset(
+                set(settings.allowed_scopes)
+            ):
+                raise TenantAuthorizationError(
+                    "scope richiesto non autorizzato "
+                    "dalla configurazione PoC"
+                )
+
+            if not set(requested_tiers).issubset(
+                set(settings.rag_default_tiers)
+            ):
+                raise TenantAuthorizationError(
+                    "tier richiesto non autorizzato "
+                    "dalla configurazione PoC"
+                )
+
+            identity = TrustedTenantIdentity(
+                organization_id=requested_organization_id,
+                user_id=settings.default_user_id,
+                roles=settings.default_user_roles,
+                allowed_scopes=requested_scopes,
+                allowed_tiers=requested_tiers,
+                is_super_admin=False,
+            )
+
+
+        elif identity is not None:
+
+            if (
+                requested_organization_id
+                != identity.organization_id
+            ):
+                raise TenantAuthorizationError(
+                    "organization_id richiesto non coerente "
+                    "con l'identità trusted"
+                )
+
+            if not set(requested_scopes).issubset(
+                set(identity.allowed_scopes)
+            ):
+                raise TenantAuthorizationError(
+                    "scope richiesto non coerente "
+                    "con l'identità trusted"
+                )
+
+            if not set(requested_tiers).issubset(
+                set(identity.allowed_tiers)
+            ):
+                raise TenantAuthorizationError(
+                    "tier richiesto non coerente "
+                    "con l'identità trusted"
+                )
+
+            identity = TrustedTenantIdentity(
+                organization_id=identity.organization_id,
+                user_id=identity.user_id,
+                roles=identity.roles,
+                allowed_scopes=requested_scopes,
+                allowed_tiers=requested_tiers,
+                is_super_admin=identity.is_super_admin,
+            )
+
+            if requested_organization_id != identity.organization_id:
+                raise TenantAuthorizationError(
+                    "organization_id richiesto non coerente "
+                    "con l'identità trusted"
+                )
+
         context = resolve_tenant_context(
             identity=identity,
             request_id=request_id,
@@ -949,6 +1283,9 @@ def install_rag_exception_handlers(app: FastAPI) -> None:
 __all__ = [
     "API_VERSION",
     "REQUEST_ID_HEADER",
+    "ORGANIZATION_ID_HEADER",
+    "SCOPES_HEADER",
+    "TIERS_HEADER",
     "RagApiException",
     "create_request_capacity_limiter",
     "health_router",

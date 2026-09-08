@@ -36,6 +36,9 @@ from urllib.parse import urlsplit
 from core.config import RagSettings, settings
 from core.tenant import TenantContext, get_tenant_context
 
+import math
+import requests
+
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,194 @@ logger = logging.getLogger(__name__)
 # il ResourceManager registra e propaga.
 logging.getLogger("neo4j").setLevel(logging.ERROR)
 logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+
+
+class RemoteEmbedder:
+    """
+    Adapter sincrono verso il servizio BGE-M3 remoto su Vast.
+
+    Mantiene il contratto SentenceTransformer usato dal retrieval:
+        encode(..., normalize_embeddings=True)
+
+    Nessun fallback locale.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model_name: str,
+        dimension: int,
+        timeout_seconds: int,
+    ) -> None:
+        self._base_url = str(base_url).rstrip("/")
+        self._model_name = str(model_name)
+        self._dimension = int(dimension)
+        self._timeout_seconds = int(timeout_seconds)
+
+        self._session = requests.Session()
+
+    def healthcheck(self) -> dict[str, Any]:
+        response = self._session.get(
+            f"{self._base_url}/health",
+            timeout=(5, self._timeout_seconds),
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+
+        if payload.get("ready") is not True:
+            raise RuntimeError(
+                "Servizio BGE-M3 remoto non ready"
+            )
+
+        remote_model = str(
+            payload.get("model") or ""
+        )
+
+        if remote_model != self._model_name:
+            raise RuntimeError(
+                "Modello BGE remoto inatteso: "
+                f"{remote_model!r}"
+            )
+
+        remote_dimension = int(
+            payload.get("dimension") or 0
+        )
+
+        if remote_dimension != self._dimension:
+            raise RuntimeError(
+                "Dimensione BGE remota inattesa: "
+                f"{remote_dimension}"
+            )
+
+        return payload
+
+    def encode(
+        self,
+        sentences: Any,
+        *,
+        normalize_embeddings: bool = False,
+        **_: Any,
+    ) -> Any:
+        single_input = isinstance(sentences, str)
+
+        if single_input:
+            texts = [sentences]
+        else:
+            texts = list(sentences or ())
+
+        if not texts:
+            raise ValueError(
+                "Nessun testo da vettorializzare"
+            )
+
+        texts = [
+            str(text or "")
+            for text in texts
+        ]
+
+        response = self._session.post(
+            f"{self._base_url}/embed",
+            json={
+                "texts": texts,
+                "batch_size": 1,
+            },
+            timeout=(5, self._timeout_seconds),
+        )
+
+        response.raise_for_status()
+
+        payload = response.json()
+
+        remote_model = str(
+            payload.get("model") or ""
+        )
+
+        if remote_model != self._model_name:
+            raise RuntimeError(
+                "Modello embedding remoto non coerente: "
+                f"{remote_model!r}"
+            )
+
+        remote_dimension = int(
+            payload.get("dimension") or 0
+        )
+
+        if remote_dimension != self._dimension:
+            raise RuntimeError(
+                "Dimensione embedding remota non coerente: "
+                f"{remote_dimension}"
+            )
+
+        vectors = payload.get("vectors")
+
+        if (
+            not isinstance(vectors, list)
+            or len(vectors) != len(texts)
+        ):
+            raise RuntimeError(
+                "Risposta embedding remota non valida"
+            )
+
+        output: list[list[float]] = []
+
+        for vector in vectors:
+
+            if (
+                not isinstance(vector, list)
+                or len(vector) != self._dimension
+            ):
+                raise RuntimeError(
+                    "Vettore embedding remoto non valido"
+                )
+
+            values = [
+                float(value)
+                for value in vector
+            ]
+
+            if any(
+                not math.isfinite(value)
+                for value in values
+            ):
+                raise RuntimeError(
+                    "Embedding remoto contiene valori "
+                    "non finiti"
+                )
+
+            if normalize_embeddings:
+                norm = math.sqrt(
+                    sum(
+                        value * value
+                        for value in values
+                    )
+                )
+
+                if (
+                    norm <= 0.0
+                    or not math.isfinite(norm)
+                ):
+                    raise RuntimeError(
+                        "Norma embedding remota non valida"
+                    )
+
+                values = [
+                    value / norm
+                    for value in values
+                ]
+
+            output.append(values)
+
+        if single_input:
+            return output[0]
+
+        return output
+
+    def close(self) -> None:
+        self._session.close()
+
+
 
 
 class ResourceError(RuntimeError):
@@ -315,18 +506,22 @@ class ResourceManager:
                 ) from exc
 
     def _create_embedder(self) -> Any:
-        from sentence_transformers import SentenceTransformer
-
         logger.info(
-            "Caricamento embedder %s su %s",
+            "Inizializzazione embedder remoto %s su %s",
             self._config.embedding_model_name,
-            self._config.embedding_device,
+            self._config.embedding_base_url,
         )
-        return SentenceTransformer(
-            self._config.embedding_model_name,
-            device=self._config.embedding_device,
-            local_files_only=True,
+
+        embedder = RemoteEmbedder(
+            base_url=self._config.embedding_base_url,
+            model_name=self._config.embedding_model_name,
+            dimension=self._config.embedding_dimension,
+            timeout_seconds=self._config.embedding_timeout_seconds,
         )
+
+        embedder.healthcheck()
+
+        return embedder
 
     def _create_reranker(self) -> Any:
         from sentence_transformers import CrossEncoder
@@ -336,6 +531,7 @@ class ResourceManager:
             self._config.reranker_model_name,
             self._config.reranker_device,
         )
+
         return CrossEncoder(
             self._config.reranker_model_name,
             device=self._config.reranker_device,
@@ -631,15 +827,22 @@ class ResourceManager:
         checked_at = datetime.now(UTC).isoformat()
         dependencies: list[DependencyHealth] = []
 
+
+
+
+
         dependencies.append(
-            self._health_for_object(
-                "embedder",
-                self._embedder,
+            self._probe_dependency(
+                name="embedder",
                 enabled=True,
                 required=True,
                 checked_at=checked_at,
+                deep=deep,
+                present=self._embedder is not None,
+                probe=lambda: self._embedder.healthcheck(),
             )
         )
+        
         dependencies.append(
             self._health_for_object(
                 "reranker",
@@ -649,6 +852,9 @@ class ResourceManager:
                 checked_at=checked_at,
             )
         )
+
+
+
 
         dependencies.append(
             self._probe_dependency(
@@ -941,7 +1147,15 @@ class ResourceManager:
         self._safe_close(self._ollama_session)
         self._ollama_session = None
 
+
+        if (
+            self._embedder is not None
+            and hasattr(self._embedder, "close")
+        ):
+            self._embedder.close()
+
         self._embedder = None
+
         self._reranker = None
         self._dependency_errors = {}
 

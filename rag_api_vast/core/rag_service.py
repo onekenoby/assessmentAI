@@ -991,7 +991,9 @@ class RagService:
             intent=route.intent,
             answer_mode=route.answer_mode,
             wants_evidence=route.wants_evidence,
-            default_tiers=tuple(self._config.rag_default_tiers),
+            default_tiers=tuple(
+                context.allowed_tiers
+            ),
 
             # Numero massimo di candidati richiesto al backend vettoriale.
             qdrant_candidates=route.qdrant_candidates,
